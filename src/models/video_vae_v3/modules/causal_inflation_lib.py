@@ -404,43 +404,73 @@ def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
             return norm_layer(x)
         if x.ndim == 5:
             t = x.size(2)
-            x = rearrange(x, "b c t h w -> (b t) c h w")
-            memory_occupy = x.numel() * x.element_size() / 1024**3
-            if isinstance(norm_layer, nn.GroupNorm) and memory_occupy > get_norm_limit():
-                num_chunks = min(4 if x.element_size() == 2 else 2, norm_layer.num_groups)
-                assert norm_layer.num_groups % num_chunks == 0
-                num_groups_per_chunk = norm_layer.num_groups // num_chunks
+            x_flat = rearrange(x, "b c t h w -> (b t) c h w")
+            memory_occupy = x_flat.numel() * x_flat.element_size() / 1024**3
 
-                x = list(x.chunk(num_chunks, dim=1))
-                weights = norm_layer.weight.chunk(num_chunks, dim=0)
-                biases = norm_layer.bias.chunk(num_chunks, dim=0)
+            # Use dynamic chunking if memory usage is high or above limit
+            # Default limit is infinity, but OOM can happen anyway, so we catch it
+            if isinstance(norm_layer, nn.GroupNorm) and (memory_occupy > get_norm_limit() or memory_occupy > 0.5):  # 0.5 GB threshold for safety
+                # Start with small chunking
+                current_chunks = min(4 if x_flat.element_size() == 2 else 2, norm_layer.num_groups)
 
-                for i, (w, b) in enumerate(zip(weights, biases)):
-                    def apply_group_norm():
-                        return F.group_norm(x[i], num_groups_per_chunk, w, b, norm_layer.eps)
+                while True:
+                    # Ensure valid chunk count (must divide num_groups)
+                    while norm_layer.num_groups % current_chunks != 0 and current_chunks < norm_layer.num_groups:
+                        current_chunks += 1
 
-                    x[i] = retry_on_oom(
-                        apply_group_norm,
-                        debug=getattr(norm_layer, 'debug', None),
-                        operation_name=f"GroupNorm.chunk_{i}"
-                    )
-                    x[i] = x[i]
+                    num_groups_per_chunk = norm_layer.num_groups // current_chunks
 
-                x = retry_on_oom(
-                    torch.cat,
-                    x,
-                    dim=1,
-                    debug=getattr(norm_layer, 'debug', None),
-                    operation_name="GroupNorm.concat_chunks"
-                )
+                    try:
+                        x_chunks = list(x_flat.chunk(current_chunks, dim=1))
+                        weights = norm_layer.weight.chunk(current_chunks, dim=0)
+                        biases = norm_layer.bias.chunk(current_chunks, dim=0)
+
+                        results = []
+                        for i, (chunk, w, b) in enumerate(zip(x_chunks, weights, biases)):
+                            def apply_group_norm():
+                                return F.group_norm(chunk, num_groups_per_chunk, w, b, norm_layer.eps)
+
+                            # Use existing retry logic for micro-retries
+                            res = retry_on_oom(
+                                apply_group_norm,
+                                debug=getattr(norm_layer, 'debug', None),
+                                operation_name=f"GroupNorm.chunk_{i}/{current_chunks}"
+                            )
+                            results.append(res)
+
+                            # Free input chunk early to save memory
+                            x_chunks[i] = None
+
+                        # Concatenate results
+                        x_flat = torch.cat(results, dim=1)
+                        break # Success
+
+                    except torch.OutOfMemoryError:
+                        # If we failed with current_chunks, try doubling
+                        if current_chunks >= norm_layer.num_groups:
+                            # Already at max chunks (1 group per chunk), cannot reduce further
+                            raise
+
+                        old_chunks = current_chunks
+                        current_chunks = min(current_chunks * 2, norm_layer.num_groups)
+
+                        # Clear cache before retrying
+                        torch.cuda.empty_cache()
+                        if hasattr(norm_layer, 'debug') and norm_layer.debug:
+                            norm_layer.debug.log(
+                                f"OOM in GroupNorm with {old_chunks} chunks. Retrying with {current_chunks} chunks.",
+                                level="WARNING", category="memory", force=True
+                            )
+                        continue
             else:
-                x = retry_on_oom(
+                x_flat = retry_on_oom(
                     norm_layer,
-                    x,
+                    x_flat,
                     debug=getattr(norm_layer, 'debug', None),
                     operation_name="GroupNorm.direct"
                 )
-            x = rearrange(x, "(b t) c h w -> b c t h w", t=t)
+
+            x = rearrange(x_flat, "(b t) c h w -> b c t h w", t=t)
             return x
     raise NotImplementedError
 
