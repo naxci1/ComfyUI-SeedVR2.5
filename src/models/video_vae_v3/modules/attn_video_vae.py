@@ -1085,15 +1085,24 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         gradient_checkpoint: bool = False,
         inflation_mode: _inflation_mode_t = "tail",
         time_receptive_field: _receptive_field_t = "full",
-        slicing_sample_min_size: int = 32,
+        slicing_sample_min_size: Optional[int] = None,
         use_quant_conv: bool = True,
         use_post_quant_conv: bool = True,
         *args,
         **kwargs,
     ):
         extra_cond_dim = kwargs.pop("extra_cond_dim") if "extra_cond_dim" in kwargs else None
+
+        # Default to 8 latent frames (e.g. 64 pixel frames) to allow better GPU parallelism
+        # if not explicitly set. This overrides the previous hardcoded default of 32
+        if slicing_sample_min_size is None:
+            # We don't have access to temporal_downsample_factor here easily as it's not passed,
+            # but we know it defaults to 8 (2**temporal_scale_num if scale is 3).
+            # Let's use a safe default of 64 which corresponds to 8 latent frames if factor is 8.
+            slicing_sample_min_size = 64
+
         self.slicing_sample_min_size = slicing_sample_min_size
-        self.slicing_latent_min_size = slicing_sample_min_size // (2**temporal_scale_num)
+        self.slicing_latent_min_size = max(1, slicing_sample_min_size // (2**temporal_scale_num))
 
         super().__init__(
             in_channels=in_channels,
@@ -1710,7 +1719,8 @@ class VideoAutoencoderKLWrapper(VideoAutoencoderKL):
         if split_size is not None:
             self.enable_slicing()
             self.slicing_sample_min_size = split_size
-            self.slicing_latent_min_size = split_size // self.temporal_downsample_factor
+            # Ensure at least 1 latent frame is processed
+            self.slicing_latent_min_size = max(1, split_size // self.temporal_downsample_factor)
         else:
             self.disable_slicing()
         for module in self.modules():

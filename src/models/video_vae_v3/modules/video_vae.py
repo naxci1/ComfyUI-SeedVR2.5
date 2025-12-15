@@ -732,9 +732,10 @@ class VideoAutoencoderKL(nn.Module):
         self.temporal_downsample_factor = temporal_downsample_factor
         self.freeze_encoder = freeze_encoder
         if slicing_sample_min_size is None:
-            slicing_sample_min_size = temporal_downsample_factor
+            # Default to 64 to allow better GPU parallelism (8 latent frames)
+            slicing_sample_min_size = 64
         self.slicing_sample_min_size = slicing_sample_min_size
-        self.slicing_latent_min_size = slicing_sample_min_size // (2**temporal_scale_num)
+        self.slicing_latent_min_size = max(1, slicing_sample_min_size // (2**temporal_scale_num))
 
         # pass init params to Encoder
         self.encoder = Encoder3D(
@@ -887,7 +888,7 @@ class VideoAutoencoderKL(nn.Module):
         if split_size is not None:
             self.enable_slicing()
             self.slicing_sample_min_size = split_size
-            self.slicing_latent_min_size = split_size // self.temporal_downsample_factor
+            self.slicing_latent_min_size = max(1, split_size // self.temporal_downsample_factor)
         else:
             self.disable_slicing()
         for module in self.modules():
