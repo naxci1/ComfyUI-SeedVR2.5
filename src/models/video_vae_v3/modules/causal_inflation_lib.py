@@ -80,19 +80,19 @@ class InflatedCausalConv3d(Conv3d):
 
     def set_memory_device(self, memory_device: _memory_device_t):
         self.memory_device = memory_device
-    
+
     def _conv_forward(self, input, weight, bias, *args, **kwargs):
         """
         Override _conv_forward to work around NVIDIA Conv3d memory bug.
-        
-        Bug: PyTorch 2.9-2.10 with cuDNN >= 91002 uses 3x memory for Conv3d 
+
+        Bug: PyTorch 2.9-2.10 with cuDNN >= 91002 uses 3x memory for Conv3d
         with fp16/bfloat16 weights due to buggy dispatch layer.
-        
+
         Workaround: Call torch.cudnn_convolution directly to bypass buggy layer.
         Status is logged at startup in compatibility.py.
         """
-        if (NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND and 
-            weight.dtype in (torch.float16, torch.bfloat16) and 
+        if (NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND and
+            weight.dtype in (torch.float16, torch.bfloat16) and
             hasattr(torch.backends.cudnn, 'is_available') and
             torch.backends.cudnn.is_available() and
             getattr(torch.backends.cudnn, 'enabled', True)):
@@ -108,7 +108,7 @@ class InflatedCausalConv3d(Conv3d):
             except RuntimeError:
                 # Fallback if direct cuDNN call fails (dev builds, edge cases)
                 pass
-        
+
         # Use standard path for unaffected configurations or if workaround failed
         return super()._conv_forward(input, weight, bias, *args, **kwargs)
 
@@ -136,12 +136,12 @@ class InflatedCausalConv3d(Conv3d):
             x_concat = x
             if prev_cache is not None:
                 x_concat = torch.cat([prev_cache, x], dim=split_dim - 1)
-            
+
             def pad_and_forward():
                 padded = safe_pad_operation(x_concat, padding, mode='constant', value=0.0)
                 with ignore_padding(self):
                     return Conv3d.forward(self, padded)
-            
+
             return retry_on_oom(
                 pad_and_forward,
                 debug=getattr(self, 'debug', None),
@@ -245,6 +245,42 @@ class InflatedCausalConv3d(Conv3d):
             self.memory = memory
             if self.memory_device == "cpu" and self.memory is not None:
                 self.memory = self.memory.to("cpu")
+
+        # Optimization: Use 2D convolution if kernel is effectively 2D (1xKxK)
+        # This is significantly faster on many GPUs than Conv3d with depth 1
+        if (self.kernel_size[0] == 1 and
+            self.stride[0] == 1 and
+            self.dilation[0] == 1 and
+            self.temporal_padding == 0 and
+            input.ndim == 5):
+
+            # Reshape (B, C, T, H, W) -> (B*T, C, H, W)
+            t = input.size(2)
+            x_2d = rearrange(input, "b c t h w -> (b t) c h w")
+
+            # Reshape weights (Out, In, 1, H, W) -> (Out, In, H, W)
+            weight_2d = self.weight.squeeze(2)
+
+            # Extract spatial padding from (0, 0, pH, pH, pW, pW) -> (pH, pW)
+            # self.padding tuple is (0, pH, pW)
+            padding_2d = (self.padding[1], self.padding[2])
+
+            # Extract spatial stride and dilation
+            stride_2d = (self.stride[1], self.stride[2])
+            dilation_2d = (self.dilation[1], self.dilation[2])
+
+            out = F.conv2d(
+                x_2d,
+                weight_2d,
+                self.bias,
+                stride=stride_2d,
+                padding=padding_2d,
+                dilation=dilation_2d,
+                groups=self.groups
+            )
+
+            return rearrange(out, "(b t) c h w -> b c t h w", t=t)
+
         return super().forward(input)
 
     def slicing_forward(
@@ -378,18 +414,18 @@ def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
                 x = list(x.chunk(num_chunks, dim=1))
                 weights = norm_layer.weight.chunk(num_chunks, dim=0)
                 biases = norm_layer.bias.chunk(num_chunks, dim=0)
-                
+
                 for i, (w, b) in enumerate(zip(weights, biases)):
                     def apply_group_norm():
                         return F.group_norm(x[i], num_groups_per_chunk, w, b, norm_layer.eps)
-                    
+
                     x[i] = retry_on_oom(
                         apply_group_norm,
                         debug=getattr(norm_layer, 'debug', None),
                         operation_name=f"GroupNorm.chunk_{i}"
                     )
                     x[i] = x[i]
-                
+
                 x = retry_on_oom(
                     torch.cat,
                     x,
