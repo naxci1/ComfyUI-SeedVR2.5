@@ -158,6 +158,62 @@ class Upsample3D(nn.Module):
             enabled=self.training and self.gradient_checkpointing,
         )
 
+    def _optimized_upsample(self, x: torch.FloatTensor) -> torch.FloatTensor:
+        # Optimization: Use conv_transpose3d instead of 1x1 conv + rearrange
+        # This reduces memory bandwidth by avoiding the large intermediate tensor
+        # which is expanded by a factor of upscale_ratio.
+
+        # Reshape weights: (Out, In, 1, 1, 1) -> (In, Out, Z, X, Y)
+        # upscale_conv weight shape: (C*R, C, 1, 1, 1) where R = X*Y*Z
+        # We need weight for conv_transpose3d: (In, Out, kD, kH, kW)
+        # Since groups=1, it is (C, C, Z, X, Y).
+
+        weight = self.upscale_conv.weight
+        bias = self.upscale_conv.bias
+
+        # (x y z c) i 1 1 1 -> i c z x y
+        # Note: 'i' is input channel (dim 1 of conv weight)
+        # 'x y z c' is output channel (dim 0 of conv weight)
+        w_opt = rearrange(
+            weight.reshape(weight.shape[0], weight.shape[1]),
+            "(x y z c) i -> i c z x y",
+            x=self.spatial_ratio,
+            y=self.spatial_ratio,
+            z=self.temporal_ratio,
+            c=self.channels
+        )
+
+        out = F.conv_transpose3d(
+            x,
+            w_opt,
+            stride=(self.temporal_ratio, self.spatial_ratio, self.spatial_ratio),
+            padding=0
+        )
+
+        if bias is not None:
+            # bias shape: (x y z c)
+            # reshape to: 1 c z x y
+            b_opt = rearrange(
+                bias,
+                "(x y z c) -> 1 c z x y",
+                x=self.spatial_ratio,
+                y=self.spatial_ratio,
+                z=self.temporal_ratio,
+                c=self.channels
+            )
+
+            # Broadcast bias to output
+            # Output is (B, C, T*Z, H*X, W*Y)
+            # View as (B, C, T, Z, H, X, W, Y)
+            b_sz, c_sz, t_z, h_x, w_y = out.shape
+            Z, X, Y = self.temporal_ratio, self.spatial_ratio, self.spatial_ratio
+
+            out_view = out.view(b_sz, c_sz, t_z // Z, Z, h_x // X, X, w_y // Y, Y)
+            out_view = out_view + b_opt.unsqueeze(2).unsqueeze(4).unsqueeze(6)
+            out = out_view.reshape(b_sz, c_sz, t_z, h_x, w_y)
+
+        return out
+
     def custom_forward(
         self,
         hidden_states: torch.FloatTensor,
@@ -173,15 +229,21 @@ class Upsample3D(nn.Module):
         else:
             hidden_states = [hidden_states]
 
+        # Use optimized path on CUDA if possible
+        use_optimized = hidden_states[0].is_cuda
+
         for i in range(len(hidden_states)):
-            hidden_states[i] = self.upscale_conv(hidden_states[i])
-            hidden_states[i] = rearrange(
-                hidden_states[i],
-                "b (x y z c) f h w -> b c (f z) (h x) (w y)",
-                x=self.spatial_ratio,
-                y=self.spatial_ratio,
-                z=self.temporal_ratio,
-            )
+            if use_optimized:
+                hidden_states[i] = self._optimized_upsample(hidden_states[i])
+            else:
+                hidden_states[i] = self.upscale_conv(hidden_states[i])
+                hidden_states[i] = rearrange(
+                    hidden_states[i],
+                    "b (x y z c) f h w -> b c (f z) (h x) (w y)",
+                    x=self.spatial_ratio,
+                    y=self.spatial_ratio,
+                    z=self.temporal_ratio,
+                )
 
         # [Overridden] For causal temporal conv
         if self.temporal_up and memory_state != MemoryState.ACTIVE:
