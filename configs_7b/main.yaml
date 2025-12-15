@@ -48,7 +48,7 @@ vae:
     freeze_encoder: False
     # gradient_checkpoint: True
   slicing:
-    split_size: 4
+    split_size: 64 # Optimized for speed (batch ~8 latent frames). Decrease if VRAM limited.
     memory_device: same
   memory_limit:
     conv_max_mem: 0.5

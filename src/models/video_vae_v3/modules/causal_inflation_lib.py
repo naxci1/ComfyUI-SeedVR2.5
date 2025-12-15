@@ -262,12 +262,12 @@ class InflatedCausalConv3d(Conv3d):
             weight_2d = self.weight.squeeze(2)
 
             # Extract spatial padding from (0, 0, pH, pH, pW, pW) -> (pH, pW)
-            # self.padding tuple is (0, pH, pW)
-            padding_2d = (self.padding[1], self.padding[2])
+            # self.padding tuple is (0, pH, pW). Ensure it's accessed safely.
+            padding_2d = (self.padding[1], self.padding[2]) if isinstance(self.padding, tuple) else (self.padding, self.padding)
 
             # Extract spatial stride and dilation
-            stride_2d = (self.stride[1], self.stride[2])
-            dilation_2d = (self.dilation[1], self.dilation[2])
+            stride_2d = (self.stride[1], self.stride[2]) if isinstance(self.stride, tuple) else (self.stride, self.stride)
+            dilation_2d = (self.dilation[1], self.dilation[2]) if isinstance(self.dilation, tuple) else (self.dilation, self.dilation)
 
             out = F.conv2d(
                 x_2d,
