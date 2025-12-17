@@ -1114,8 +1114,14 @@ def _setup_vae_model(
     elif not hasattr(runner, 'vae') or runner.vae is None:
         # Create new VAE model
         # Configure VAE
-        vae_config_path = os.path.join(script_directory, 
-                                      'src/models/video_vae_v3/s8_c16_t4_inflation_sd3.yaml')
+        if "wan21-vae" in vae_model:
+            vae_config_path = os.path.join(script_directory,
+                                          'src/models/video_vae_v3/wan2_1_vae.yaml')
+            debug.log("Using specialized config for Wan2.1 VAE", category="vae")
+        else:
+            vae_config_path = os.path.join(script_directory,
+                                          'src/models/video_vae_v3/s8_c16_t4_inflation_sd3.yaml')
+
         vae_config = load_config(vae_config_path)
         
         spatial_downsample_factor = vae_config.get('spatial_downsample_factor', 8)
@@ -1135,9 +1141,8 @@ def _setup_vae_model(
             runner.config.vae.model.latent_channels = 4
             debug.log("Optimizing configuration for SDXL VAE (FP16 fix, 4ch)", category="vae")
         elif "wan21-vae" in vae_model:
-            # Wan2.1 VAE optimization
-            runner.config.vae.model.force_upcast = False
-            debug.log("Optimizing configuration for Wan2.1 VAE (FP16)", category="vae")
+            # Wan2.1 VAE additional optimization (config already loaded above)
+            pass
 
         # Set VAE dtype from runner's compute_dtype
         compute_dtype = getattr(runner, '_compute_dtype', torch.bfloat16)

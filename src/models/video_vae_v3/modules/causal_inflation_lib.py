@@ -460,19 +460,25 @@ def inflate_weight(weight_2d: torch.Tensor, weight_3d: torch.Tensor, inflation_m
     """
     assert inflation_mode in ["tail", "replicate", "pad"]
     assert weight_3d.shape[:2] == weight_2d.shape[:2]
-    with torch.no_grad():
-        # Ensure weight_3d matches dtype of source (weight_2d) to preserve BF16/FP16
-        if weight_3d.dtype != weight_2d.dtype:
-            weight_3d.data = weight_3d.data.to(dtype=weight_2d.dtype)
 
+    # Create new 3D tensor on the same device/dtype as the source 2D weights
+    # This prevents issues when weight_3d is on 'meta' device or has incorrect dtype
+    target_weight = torch.empty(
+        weight_3d.shape,
+        device=weight_2d.device,
+        dtype=weight_2d.dtype
+    )
+
+    with torch.no_grad():
         if inflation_mode == "replicate":
             depth = weight_3d.size(2)
-            weight_3d.copy_(weight_2d.unsqueeze(2).repeat(1, 1, depth, 1, 1) / depth)
+            target_weight.copy_(weight_2d.unsqueeze(2).repeat(1, 1, depth, 1, 1) / depth)
         else:
             # tail or pad: use last temporal position (causal)
-            weight_3d.fill_(0.0)
-            weight_3d[:, :, -1].copy_(weight_2d)
-    return weight_3d
+            target_weight.fill_(0.0)
+            target_weight[:, :, -1].copy_(weight_2d)
+
+    return target_weight
 
 
 def inflate_bias(bias_2d: torch.Tensor, bias_3d: torch.Tensor, inflation_mode: str):
@@ -484,13 +490,18 @@ def inflate_bias(bias_2d: torch.Tensor, bias_3d: torch.Tensor, inflation_mode: s
         inflation_mode: Placeholder to align `inflate_weight`.
     """
     assert bias_3d.shape == bias_2d.shape
-    with torch.no_grad():
-        # Ensure bias_3d matches dtype of source (bias_2d) to preserve BF16/FP16
-        if bias_3d.dtype != bias_2d.dtype:
-            bias_3d.data = bias_3d.data.to(dtype=bias_2d.dtype)
 
-        bias_3d.copy_(bias_2d)
-    return bias_3d
+    # Create new bias tensor on the same device/dtype as the source 2D bias
+    target_bias = torch.empty(
+        bias_3d.shape,
+        device=bias_2d.device,
+        dtype=bias_2d.dtype
+    )
+
+    with torch.no_grad():
+        target_bias.copy_(bias_2d)
+
+    return target_bias
 
 
 def modify_state_dict(layer, state_dict, prefix, inflate_weight_fn, inflate_bias_fn):
