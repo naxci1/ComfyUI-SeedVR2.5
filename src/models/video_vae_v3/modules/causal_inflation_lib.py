@@ -334,6 +334,19 @@ class InflatedCausalConv3d(Conv3d):
             error_msgs,
         )
 
+        # Post-loading cleanup: Ensure bias dtype matches weight dtype
+        # This handles cases where bias was missing in checkpoint (phantom bias)
+        # or wasn't converted, preventing runtime errors on CPU/MPS
+        if self.bias is not None and self.weight is not None:
+            if self.bias.dtype != self.weight.dtype:
+                self.bias.data = self.bias.data.to(self.weight.dtype)
+
+            # If bias was missing from checkpoint, it contains random init values
+            # We should zero it out to avoid noise, as the model likely wasn't trained with it
+            bias_key = prefix + "bias"
+            if bias_key in missing_keys:
+                self.bias.data.zero_()
+
 
 def init_causal_conv3d(
     *args,
