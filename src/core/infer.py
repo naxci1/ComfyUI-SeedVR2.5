@@ -127,6 +127,11 @@ class VideoDiffusionInfer():
                 # Fallback if VAE has no parameters (shouldn't happen)
                 device = get_device()
             
+            # If device is meta, fallback to default device (likely CPU/CUDA)
+            # This handles cases where parameters might still be on meta during initialization
+            if device.type == 'meta':
+                device = get_device()
+
             dtype = getattr(torch, self.config.vae.dtype)
             scale = self.config.vae.scaling_factor
             shift = self.config.vae.get("shifting_factor", 0.0)
@@ -166,7 +171,7 @@ class VideoDiffusionInfer():
                         else:
                             latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
                                                 tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
-                    else:
+                    elif device.type != 'meta': # Skip autocast if on meta device (avoid runtime error)
                         with torch.autocast(device.type, sample.dtype, enabled=True):
                             if use_sample:
                                 latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size, 
@@ -174,6 +179,14 @@ class VideoDiffusionInfer():
                             else:
                                 latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
                                                     tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
+                    else:
+                        # Fallback for meta device (should ideally not happen during inference)
+                        if use_sample:
+                            latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
+                                                    tile_overlap=self.encode_tile_overlap).latent
+                        else:
+                            latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
+                                                tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
                 else:
                     if use_sample:
                         latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size, 
@@ -212,6 +225,10 @@ class VideoDiffusionInfer():
                 # Fallback if VAE has no parameters (shouldn't happen)
                 device = get_device()
             
+            # If device is meta, fallback to default device
+            if device.type == 'meta':
+                device = get_device()
+
             dtype = getattr(torch, self.config.vae.dtype)
             scale = self.config.vae.scaling_factor
             shift = self.config.vae.get("shifting_factor", 0.0)
@@ -251,13 +268,19 @@ class VideoDiffusionInfer():
                             tiled=self.decode_tiled, tile_size=self.decode_tile_size,
                             tile_overlap=self.decode_tile_overlap
                         ).sample
-                    else:
+                    elif device.type != 'meta':
                         with torch.autocast(device.type, latent.dtype, enabled=True):
                             sample = self.vae.decode(
                                 latent,
                                 tiled=self.decode_tiled, tile_size=self.decode_tile_size,
                                 tile_overlap=self.decode_tile_overlap
                             ).sample
+                    else:
+                         sample = self.vae.decode(
+                            latent,
+                            tiled=self.decode_tiled, tile_size=self.decode_tile_size,
+                            tile_overlap=self.decode_tile_overlap
+                        ).sample
                 else:
                     sample = self.vae.decode(
                         latent,
