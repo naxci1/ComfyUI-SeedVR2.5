@@ -159,11 +159,11 @@ class VideoDiffusionInfer():
                     vae_dtype = dtype  # Fallback
 
                 # Use autocast if VAE dtype differs from input dtype
-                # Skip autocast on MPS (only supports bf16, unified memory = no benefit)
-                # Instead, explicitly convert input to model dtype
+                # Skip autocast on MPS/CPU to avoid dtype mismatch errors with biases
+                # Instead, explicitly convert input to model dtype for these devices
                 if vae_dtype != sample.dtype:
-                    if device.type == 'mps':
-                        # MPS: explicit dtype conversion instead of autocast
+                    if device.type == 'mps' or device.type == 'cpu':
+                        # MPS/CPU: explicit dtype conversion instead of autocast
                         sample = sample.to(vae_dtype)
                         if use_sample:
                             latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size, 
@@ -258,10 +258,10 @@ class VideoDiffusionInfer():
                     vae_dtype = dtype  # Fallback
 
                 # Use autocast if VAE dtype differs from latent dtype
-                # Skip autocast on MPS (only supports bf16, unified memory = no benefit)
+                # Skip autocast on MPS/CPU to avoid dtype mismatch errors
                 if vae_dtype != latent.dtype:
-                    if device.type == 'mps':
-                        # MPS: explicit dtype conversion instead of autocast
+                    if device.type == 'mps' or device.type == 'cpu':
+                        # MPS/CPU: explicit dtype conversion instead of autocast
                         latent = latent.to(vae_dtype)
                         sample = self.vae.decode(
                             latent,
