@@ -1134,6 +1134,10 @@ def _setup_vae_model(
             # SDXL VAE uses 4 latent channels, unlike the default 16
             runner.config.vae.model.latent_channels = 4
             debug.log("Optimizing configuration for SDXL VAE (FP16 fix, 4ch)", category="vae")
+        elif "wan21-vae" in vae_model:
+            # Wan2.1 VAE optimization
+            runner.config.vae.model.force_upcast = False
+            debug.log("Optimizing configuration for Wan2.1 VAE (FP16)", category="vae")
 
         # Set VAE dtype from runner's compute_dtype
         compute_dtype = getattr(runner, '_compute_dtype', torch.bfloat16)

@@ -58,6 +58,13 @@ def save_validation_cache(cache, cache_dir: Optional[str] = None):
         pass
 
 
+def ensure_directory_exists(filepath: str) -> None:
+    """Ensure the directory for the given filepath exists"""
+    directory = os.path.dirname(filepath)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+
 def is_file_validated_cached(filepath: str, cache_dir: Optional[str] = None) -> bool:
     """
     Check if file is validated using cache (fast).
@@ -139,6 +146,10 @@ def download_with_resume(url: str, filepath: str, debug=None) -> bool:
     headers = {'Range': f'bytes={existing_size}-'} if existing_size > 0 else {}
     
     try:
+        # Ensure target directory exists (for models with subpaths)
+        ensure_directory_exists(filepath)
+        ensure_directory_exists(temp_file)
+
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=30) as response:
             content_length = int(response.headers.get('Content-Length', 0))

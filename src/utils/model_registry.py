@@ -51,6 +51,7 @@ MODEL_REGISTRY = {
     # VAE models
     "ema_vae_fp16.safetensors": ModelInfo(category="vae", precision="fp16", sha256="20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1"),
     "sdxl_vae.safetensors": ModelInfo(repo="madebyollin/sdxl-vae-fp16-fix", category="vae", precision="fp16"),
+    "vae/wan/wan21-vae.safetensors": ModelInfo(repo="wangkanai/wan21-vae", category="vae", precision="fp16"),
 }
 
 # Configuration constants
