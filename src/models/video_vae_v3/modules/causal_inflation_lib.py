@@ -445,13 +445,14 @@ def inflate_weight(weight_2d: torch.Tensor, weight_3d: torch.Tensor, inflation_m
         weight_3d:      The weight matrix of 3D conv to be initialized.
         inflation_mode: the mode of inflation
     """
-    assert inflation_mode in ["tail", "replicate"]
+    assert inflation_mode in ["tail", "replicate", "pad"]
     assert weight_3d.shape[:2] == weight_2d.shape[:2]
     with torch.no_grad():
         if inflation_mode == "replicate":
             depth = weight_3d.size(2)
             weight_3d.copy_(weight_2d.unsqueeze(2).repeat(1, 1, depth, 1, 1) / depth)
         else:
+            # tail or pad: use last temporal position (causal)
             weight_3d.fill_(0.0)
             weight_3d[:, :, -1].copy_(weight_2d)
     return weight_3d
