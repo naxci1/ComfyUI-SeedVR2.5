@@ -511,7 +511,13 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torc
     # Load weights (this materializes from meta to target device)
     model = _load_model_weights(model, checkpoint_path, target_device, True,
                                model_type_upper, offload_reason, debug, override_dtype) 
-   
+
+    # Force cast VAE models to override_dtype if specified
+    # This ensures all parameters (including phantom biases) match the compute dtype
+    if not is_dit and override_dtype is not None:
+        debug.log(f"Enforcing {override_dtype} on VAE model to fix potential dtype mismatches", category="precision")
+        model.to(dtype=override_dtype)
+
     # Apply model-specific configurations (includes BlockSwap and torch.compile)
     # Import here to avoid circular dependency 
     from .model_configuration import apply_model_specific_config
