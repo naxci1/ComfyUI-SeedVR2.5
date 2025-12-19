@@ -1088,6 +1088,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         slicing_sample_min_size: int = 32,
         use_quant_conv: bool = True,
         use_post_quant_conv: bool = True,
+        decoder_in_channels: Optional[int] = None,
         *args,
         **kwargs,
     ):
@@ -1137,7 +1138,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
 
         # pass init params to Decoder
         self.decoder = Decoder3D(
-            in_channels=latent_channels,
+            in_channels=decoder_in_channels if decoder_in_channels is not None else latent_channels,
             out_channels=out_channels,
             up_block_types=up_block_types,
             block_out_channels=block_out_channels,
@@ -1165,7 +1166,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         self.post_quant_conv = (
             init_causal_conv3d(
                 in_channels=latent_channels,
-                out_channels=latent_channels,
+                out_channels=decoder_in_channels if decoder_in_channels is not None else latent_channels,
                 kernel_size=1,
                 inflation_mode=inflation_mode,
             )
@@ -1674,6 +1675,11 @@ class VideoAutoencoderKLWrapper(VideoAutoencoderKL):
                tile_overlap: Tuple[int, int] = (64, 64)) -> CausalEncoderOutput:
         if x.ndim == 4:
             x = x.unsqueeze(2)
+
+        # Handle 3->12 channel patching if needed (e.g. Wan VAE)
+        if hasattr(self.config, 'in_channels') and self.config.in_channels == 12 and x.shape[1] == 3:
+            x = self.patch_input(x)
+
         p = super().encode(x, return_dict=return_dict, tiled=tiled, tile_size=tile_size,
                           tile_overlap=tile_overlap).latent_dist
         # Use deterministic mode for tiled encoding to avoid artifacts
@@ -1687,7 +1693,42 @@ class VideoAutoencoderKLWrapper(VideoAutoencoderKL):
             z = z.unsqueeze(2)
         x = super().decode(z, return_dict=return_dict, tiled=tiled, tile_size=tile_size,
                           tile_overlap=tile_overlap).sample.squeeze(2)
+
+        # Handle 12->3 channel unpatching if needed (e.g. Wan VAE)
+        # Note: We check if output channels is 12 but we expect 3
+        if hasattr(self.config, 'out_channels') and self.config.out_channels == 12 and x.shape[1] == 12:
+            x = self.unpatch_output(x)
+
         return CausalDecoderOutput(x)
+
+    def patch_input(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Patch input from [B, 3, T, H, W] to [B, 12, T, H/2, W/2]
+        """
+        # x: [B, C, T, H, W]
+        b, c, t, h, w = x.shape
+        # Reshape to [B, C, T, H/2, 2, W/2, 2]
+        x = x.view(b, c, t, h // 2, 2, w // 2, 2)
+        # Permute to [B, C, 2, 2, T, H/2, W/2]
+        x = x.permute(0, 1, 4, 6, 2, 3, 5)
+        # Reshape to [B, C*4, T, H/2, W/2]
+        x = x.reshape(b, c * 4, t, h // 2, w // 2)
+        return x
+
+    def unpatch_output(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Unpatch output from [B, 12, T, H/2, W/2] to [B, 3, T, H, W]
+        """
+        # x: [B, 12, T, H_small, W_small]
+        b, c_large, t, h_small, w_small = x.shape
+        c = c_large // 4
+        # Reshape to [B, c, 2, 2, T, h, w]
+        x = x.view(b, c, 2, 2, t, h_small, w_small)
+        # Permute to [B, c, T, h, 2, w, 2]
+        x = x.permute(0, 1, 4, 5, 2, 6, 3)
+        # Reshape to [B, c, T, h*2, w*2]
+        x = x.reshape(b, c, t, h_small * 2, w_small * 2)
+        return x
 
     def preprocess(self, x: torch.Tensor):
         # x should in [B, C, T, H, W], [B, C, H, W]
