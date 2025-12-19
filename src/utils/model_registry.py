@@ -50,6 +50,7 @@ MODEL_REGISTRY = {
     
     # VAE models
     "ema_vae_fp16.safetensors": ModelInfo(category="vae", precision="fp16", sha256="20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1"),
+    "Wan2.1_VAE.pth": ModelInfo(category="vae", precision="fp32", sha256=None),
 }
 
 # Configuration constants
