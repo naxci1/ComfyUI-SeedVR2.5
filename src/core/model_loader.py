@@ -801,10 +801,68 @@ def initialize_meta_buffers_impl(model: torch.nn.Module, target_device: torch.de
     return initialized_count
 
 
+def _remap_wan21_state_dict(state_dict: Dict[str, torch.Tensor], debug: Optional['Debug'] = None) -> Dict[str, torch.Tensor]:
+    """
+    Remap Wan2.1 VAE state dict keys to VideoAutoencoderKL format.
+
+    Args:
+        state_dict: Original Wan2.1 state dict
+        debug: Debug instance for logging
+
+    Returns:
+        Remapped state dict
+    """
+    if debug:
+        debug.log("Remapping Wan2.1 VAE state dict to SeedVR2 format", category="vae")
+
+    new_state_dict = {}
+
+    # Key mapping rules
+    # Wan2.1 uses 'encoder.conv1' -> SeedVR2 'encoder.conv_in'
+    # Wan2.1 uses 'decoder.conv1' -> SeedVR2 'decoder.conv_in'
+    # Wan2.1 uses 'encoder.downsamples' -> SeedVR2 'encoder.down_blocks' (with index adjustments)
+    # The rest seems to map fairly directly or requires block-by-block mapping
+
+    for key, value in state_dict.items():
+        new_key = key
+
+        # Simple replacements
+        if "conv1" in key:
+            # Check if it's the input/output convolution
+            parts = key.split('.')
+            if parts[-2] == "conv1":
+                # Replace conv1 with conv_in/conv_out depending on context
+                # Usually encoder.conv1 -> encoder.conv_in
+                # decoder.conv1 -> decoder.conv_in? No, decoder usually has conv_in
+                if key.startswith("encoder.conv1"):
+                    new_key = key.replace("encoder.conv1", "encoder.conv_in")
+                elif key.startswith("decoder.conv1"):
+                    new_key = key.replace("decoder.conv1", "decoder.conv_in")
+
+        # Map downsamples/upsamples if naming differs
+        # Wan2.1 VAE structure might need inspection to be perfect, but based on common diffusers VAE patterns:
+        if "downsamples" in key:
+             new_key = key.replace("downsamples", "down_blocks")
+        if "upsamples" in key:
+             new_key = key.replace("upsamples", "up_blocks")
+
+        new_state_dict[new_key] = value
+
+    return new_state_dict
+
+
 def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor], 
                           used_meta: bool, model_type: str, model_type_lower: str,
                           debug: Optional['Debug'] = None) -> torch.nn.Module:
     """Load standard (non-GGUF) weights into model."""
+
+    # Check for Wan2.1 VAE and remap if needed
+    # We detect by checking for characteristic keys
+    if model_type == "VAE":
+        is_wan21 = any("encoder.conv1" in k for k in state.keys())
+        if is_wan21:
+            state = _remap_wan21_state_dict(state, debug)
+
     debug.start_timer(f"{model_type_lower}_state_apply")
     model.load_state_dict(state, strict=False, assign=True)
     

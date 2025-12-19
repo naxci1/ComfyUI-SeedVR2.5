@@ -1114,8 +1114,13 @@ def _setup_vae_model(
     elif not hasattr(runner, 'vae') or runner.vae is None:
         # Create new VAE model
         # Configure VAE
-        vae_config_path = os.path.join(script_directory, 
-                                      'src/models/video_vae_v3/s8_c16_t4_inflation_sd3.yaml')
+        if "wan21" in vae_model:
+            vae_config_path = os.path.join(script_directory,
+                                          'src/models/video_vae_v3/wan2_1_vae.yaml')
+        else:
+            vae_config_path = os.path.join(script_directory,
+                                          'src/models/video_vae_v3/s8_c16_t4_inflation_sd3.yaml')
+
         vae_config = load_config(vae_config_path)
         
         spatial_downsample_factor = vae_config.get('spatial_downsample_factor', 8)
