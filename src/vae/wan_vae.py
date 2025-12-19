@@ -547,16 +547,82 @@ class WanVAE_(nn.Module):
         )
 
     def forward(self, x, scale=None):
-        mu, log_var = self.encode(x, scale)
+        """
+        Full VAE forward pass: encode -> reparameterize -> decode.
+        
+        Note: This method is primarily for compatibility. In practice, the WanVAE
+        wrapper class handles encode/decode separately with proper scale handling.
+        
+        Args:
+            x: Input video tensor [B, C, T, H, W]
+            scale: Optional normalization scale [mean, 1/std]
+        
+        Returns:
+            Tuple of (reconstructed video, mu, log_var)
+        """
+        if scale is None:
+            # Default scale (identity transform)
+            scale = [0.0, 1.0]
+        
+        # Encode to get normalized mu
+        mu_normalized = self.encode(x, scale)
+        
+        # We need to get the unnormalized mu and log_var for reparameterization
+        # So we need to reverse the normalization or recompute
+        # For simplicity, we'll recompute the encoding without normalization
+        self.clear_cache()
+        t = x.shape[2]
+        iter_ = 1 + (t - 1) // 4
+        
+        for i in range(iter_):
+            self._enc_conv_idx = [0]
+            if i == 0:
+                out = self.encoder(
+                    x[:, :, :1, :, :],
+                    feat_cache=self._enc_feat_map,
+                    feat_idx=self._enc_conv_idx
+                )
+            else:
+                out_ = self.encoder(
+                    x[:, :, 1 + 4 * (i - 1):1 + 4 * i, :, :],
+                    feat_cache=self._enc_feat_map,
+                    feat_idx=self._enc_conv_idx
+                )
+                out = torch.cat([out, out_], 2)
+        
+        mu, log_var = self.conv1(out).chunk(2, dim=1)
+        self.clear_cache()
+        
+        # Reparameterize using unnormalized values
         z = self.reparameterize(mu, log_var)
+        
+        # Decode
         x_recon = self.decode(z, scale)
-        return x_recon, mu, log_var
+        
+        # Return with normalized mu for consistency
+        if isinstance(scale[0], torch.Tensor):
+            mu_normalized = (mu - scale[0].view(1, self.z_dim, 1, 1, 1)) * scale[1].view(1, self.z_dim, 1, 1, 1)
+        else:
+            mu_normalized = (mu - scale[0]) * scale[1]
+        
+        return x_recon, mu_normalized, log_var
 
     def encode(self, x, scale):
         """
         Encode video to latent space with temporal chunking for memory efficiency.
         Uses 1, 4, 4, 4... frame chunks.
+        
+        Args:
+            x: Input video tensor [B, C, T, H, W]
+            scale: Normalization scale as [mean, 1/std] where mean and 1/std can be
+                   scalars or tensors of shape [z_dim]
+        
+        Returns:
+            Normalized latent tensor mu
         """
+        if scale is None or len(scale) < 2:
+            raise ValueError("scale must be a list/tuple with [mean, 1/std] components")
+        
         self.clear_cache()
         ## cache
         t = x.shape[2]
@@ -590,7 +656,18 @@ class WanVAE_(nn.Module):
     def decode(self, z, scale):
         """
         Decode latent to video, processing frame by frame for memory efficiency.
+        
+        Args:
+            z: Normalized latent tensor [B, C, T, H, W]
+            scale: Normalization scale as [mean, 1/std] where mean and 1/std can be
+                   scalars or tensors of shape [z_dim]
+        
+        Returns:
+            Decoded video tensor [B, 3, T', H', W']
         """
+        if scale is None or len(scale) < 2:
+            raise ValueError("scale must be a list/tuple with [mean, 1/std] components")
+        
         self.clear_cache()
         # z: [b,c,t,h,w]
         if isinstance(scale[0], torch.Tensor):
