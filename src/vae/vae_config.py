@@ -18,8 +18,7 @@ logger = logging.getLogger(__name__)
 
 class VAEModelVersion(Enum):
     """Supported VAE model versions"""
-    WAN2_1 = "wan2.1"
-    WAN2_2 = "wan2.2"
+    WAN_VAE = "wan_vae"  # Wan2.1 VAE
 
 
 class VAEEncodingType(Enum):
@@ -108,49 +107,26 @@ class VAEModelConfig:
 class VAEConfigManager:
     """Manages VAE configurations for different model versions"""
     
-    # Predefined configurations for Wan2.1
-    WAN2_1_DEFAULT = VAEModelConfig(
-        model_version=VAEModelVersion.WAN2_1,
+    # Predefined configuration for Wan2.1 VAE
+    WAN_VAE_DEFAULT = VAEModelConfig(
+        model_version=VAEModelVersion.WAN_VAE,
         model_name="Wan2.1-VAE",
-        model_path="models/vae/wan2.1/vae.safetensors",
+        model_path="models/SEEDVR2/Wan2.1_VAE.pth",
         architecture=VAEArchitectureConfig(
-            latent_channels=4,
+            latent_channels=16,  # z_dim = 16
             latent_height=64,
             latent_width=64,
-            scaling_factor=0.18215,
-            encoder_channels=[3, 64, 128, 256, 512],
-            decoder_channels=[512, 256, 128, 64, 3],
-        ),
-        encoding=VAEEncodingConfig(
-            encoding_type=VAEEncodingType.STANDARD,
-            precision="fp32",
-            use_tiling=False,
-        ),
-        checkpoint_hash=None,
-        enable_flash_attention=True,
-    )
-    
-    # Predefined configurations for Wan2.2
-    WAN2_2_DEFAULT = VAEModelConfig(
-        model_version=VAEModelVersion.WAN2_2,
-        model_name="Wan2.2-VAE",
-        model_path="models/vae/wan2.2/vae.safetensors",
-        architecture=VAEArchitectureConfig(
-            latent_channels=4,
-            latent_height=64,
-            latent_width=64,
-            scaling_factor=0.18215,
-            encoder_channels=[3, 64, 128, 256, 512],
-            decoder_channels=[512, 256, 128, 64, 3],
+            scaling_factor=0.9152,  # Wan2.1 scaling factor
+            encoder_channels=[96, 96, 192, 384, 384],  # dim * dim_mult
+            decoder_channels=[384, 384, 192, 96, 96],
         ),
         encoding=VAEEncodingConfig(
             encoding_type=VAEEncodingType.ADVANCED,
             precision="fp32",
-            use_tiling=False,
-            enable_flash_attention=True,
+            use_tiling=True,
         ),
         checkpoint_hash=None,
-        enable_flash_attention=True,
+        enable_flash_attention=False,  # Wan2.1 uses RMS norm, not flash attention
     )
     
     def __init__(self):
@@ -160,8 +136,7 @@ class VAEConfigManager:
     
     def _register_default_configs(self):
         """Register default configurations"""
-        self.register_config("wan2.1", self.WAN2_1_DEFAULT)
-        self.register_config("wan2.2", self.WAN2_2_DEFAULT)
+        self.register_config("wan_vae", self.WAN_VAE_DEFAULT)
         logger.info("Default VAE configurations registered")
     
     def register_config(self, config_id: str, config: VAEModelConfig):
@@ -439,11 +414,6 @@ def get_vae_config_manager() -> VAEConfigManager:
     return _vae_config_manager
 
 
-def get_wan21_config() -> VAEModelConfig:
-    """Get default Wan2.1 configuration"""
-    return get_vae_config_manager().get_config("wan2.1")
-
-
-def get_wan22_config() -> VAEModelConfig:
-    """Get default Wan2.2 configuration"""
-    return get_vae_config_manager().get_config("wan2.2")
+def get_wan_vae_config() -> VAEModelConfig:
+    """Get default Wan2.1 VAE configuration"""
+    return get_vae_config_manager().get_config("wan_vae")

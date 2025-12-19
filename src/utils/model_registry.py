@@ -50,11 +50,12 @@ MODEL_REGISTRY = {
     
     # VAE models
     "ema_vae_fp16.safetensors": ModelInfo(category="vae", precision="fp16", sha256="20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1"),
+    "Wan2.1_VAE.pth": ModelInfo(repo="Wan-Video/Wan2.1", category="vae", size="16ch", precision="fp32", sha256=None),
 }
 
 # Configuration constants
 DEFAULT_DIT = "seedvr2_ema_3b_fp8_e4m3fn.safetensors"
-DEFAULT_VAE = "ema_vae_fp16.safetensors"
+DEFAULT_VAE = "Wan2.1_VAE.pth"
 
 def get_default_models(category: str) -> List[str]:
     """Get list of default models"""
