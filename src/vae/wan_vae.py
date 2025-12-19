@@ -669,14 +669,16 @@ class WanVAE:
         """
         videos: A list of videos each with shape [C, T, H, W].
         """
-        with amp.autocast('cuda' if self.device.type == 'cuda' else self.device.type, dtype=self.dtype):
+        device_type = 'cuda' if self.device.type == 'cuda' else self.device.type
+        with amp.autocast(device_type=device_type, enabled=True, dtype=self.dtype):
             return [
                 self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
                 for u in videos
             ]
 
     def decode(self, zs):
-        with amp.autocast('cuda' if self.device.type == 'cuda' else self.device.type, dtype=self.dtype):
+        device_type = 'cuda' if self.device.type == 'cuda' else self.device.type
+        with amp.autocast(device_type=device_type, enabled=True, dtype=self.dtype):
             return [
                 self.model.decode(u.unsqueeze(0),
                                   self.scale).float().clamp_(-1, 1).squeeze(0)
