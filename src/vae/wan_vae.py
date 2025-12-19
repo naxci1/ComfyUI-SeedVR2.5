@@ -11,13 +11,26 @@ import torch.cuda.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, NamedTuple
 
 __all__ = [
     'WanVAE',
     'WanVAE_',
     'WanVAEWrapper',
+    'WanVAEEncoderOutput',
+    'WanVAEDecoderOutput',
 ]
+
+
+class WanVAEEncoderOutput(NamedTuple):
+    """Output from WanVAE encoder to maintain compatibility with existing VAE interface"""
+    latent: torch.Tensor
+    posterior: Optional[object] = None
+
+
+class WanVAEDecoderOutput(NamedTuple):
+    """Output from WanVAE decoder to maintain compatibility with existing VAE interface"""
+    sample: torch.Tensor
 
 CACHE_T = 2
 
@@ -701,7 +714,7 @@ class WanVAEWrapper(nn.Module):
     
     def encode(self, x: torch.Tensor, tiled: bool = False, 
                tile_size: Optional[Tuple[int, int]] = None,
-               tile_overlap: Optional[Tuple[int, int]] = None) -> torch.Tensor:
+               tile_overlap: Optional[Tuple[int, int]] = None) -> WanVAEEncoderOutput:
         """
         Encode input tensor to latent space
         
@@ -712,22 +725,25 @@ class WanVAEWrapper(nn.Module):
             tile_overlap: Overlap between tiles (H, W)
             
         Returns:
-            Latent tensor of shape (B, Z, T, H_lat, W_lat)
+            WanVAEEncoderOutput with latent tensor of shape (B, Z, T, H_lat, W_lat)
         """
         if tiled and tile_size is not None:
-            return self.encode_tiled(x, tile_size, tile_overlap)
+            latent = self.encode_tiled(x, tile_size, tile_overlap)
+        else:
+            # Standard encoding
+            # Convert from (B, C, T, H, W) to list of (C, T, H, W) tensors
+            batch_list = [x[i] for i in range(x.shape[0])]
+            latents = self.vae.encode(batch_list)
+            
+            # Stack back to batch
+            latent = torch.stack(latents, dim=0)
         
-        # Standard encoding
-        # Convert from (B, C, T, H, W) to list of (C, T, H, W) tensors
-        batch_list = [x[i] for i in range(x.shape[0])]
-        latents = self.vae.encode(batch_list)
-        
-        # Stack back to batch
-        return torch.stack(latents, dim=0)
+        # Return output compatible with existing VAE interface
+        return WanVAEEncoderOutput(latent=latent, posterior=None)
     
     def decode(self, z: torch.Tensor, tiled: bool = False,
                tile_size: Optional[Tuple[int, int]] = None,
-               tile_overlap: Optional[Tuple[int, int]] = None) -> torch.Tensor:
+               tile_overlap: Optional[Tuple[int, int]] = None) -> WanVAEDecoderOutput:
         """
         Decode latent tensor to pixel space
         
@@ -738,18 +754,21 @@ class WanVAEWrapper(nn.Module):
             tile_overlap: Overlap between tiles (H, W)
             
         Returns:
-            Decoded tensor of shape (B, C, T, H, W)
+            WanVAEDecoderOutput with sample tensor of shape (B, C, T, H, W)
         """
         if tiled and tile_size is not None:
-            return self.decode_tiled(z, tile_size, tile_overlap)
+            sample = self.decode_tiled(z, tile_size, tile_overlap)
+        else:
+            # Standard decoding
+            # Convert from (B, Z, T, H_lat, W_lat) to list of (Z, T, H_lat, W_lat) tensors
+            batch_list = [z[i] for i in range(z.shape[0])]
+            decoded = self.vae.decode(batch_list)
+            
+            # Stack back to batch
+            sample = torch.stack(decoded, dim=0)
         
-        # Standard decoding
-        # Convert from (B, Z, T, H_lat, W_lat) to list of (Z, T, H_lat, W_lat) tensors
-        batch_list = [z[i] for i in range(z.shape[0])]
-        decoded = self.vae.decode(batch_list)
-        
-        # Stack back to batch
-        return torch.stack(decoded, dim=0)
+        # Return output compatible with existing VAE interface
+        return WanVAEDecoderOutput(sample=sample)
     
     def encode_tiled(self, x: torch.Tensor, 
                      tile_size: Tuple[int, int] = (1024, 1024),
