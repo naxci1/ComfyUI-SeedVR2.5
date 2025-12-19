@@ -576,7 +576,7 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
     if checkpoint_path.endswith('.gguf'):
         model = _load_gguf_weights(model, state, used_meta, model_type_lower, debug)
     else:
-        model = _load_standard_weights(model, state, used_meta, model_type, model_type_lower, debug)
+        model = _load_standard_weights(model, state, used_meta, model_type, model_type_lower, debug, override_dtype=override_dtype)
     
     # Clean up state dict
     del state
@@ -862,7 +862,8 @@ def _remap_wan_state_dict(state_dict: Dict[str, torch.Tensor], debug: Optional['
 
 def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor], 
                           used_meta: bool, model_type: str, model_type_lower: str,
-                          debug: Optional['Debug'] = None) -> torch.nn.Module:
+                          debug: Optional['Debug'] = None,
+                          override_dtype: Optional[torch.dtype] = None) -> torch.nn.Module:
     """Load standard (non-GGUF) weights into model."""
 
     # Check for Wan VAE and remap if needed
@@ -900,7 +901,9 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                     except:
                         target_dev = torch.device("cpu")
 
-                    new_param = torch.empty_like(param, device=target_dev)
+                    # Use override_dtype if provided, otherwise fallback to param.dtype
+                    target_dtype = override_dtype if override_dtype is not None else param.dtype
+                    new_param = torch.empty_like(param, device=target_dev, dtype=target_dtype)
 
                     # Initialize
                     if "bias" in name:
@@ -926,11 +929,11 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                         if isinstance(getattr(submodule, param_name), torch.nn.Parameter):
                             new_param = torch.nn.Parameter(new_param, requires_grad=param.requires_grad)
 
-                        setattr(submodule, param_name, new_param.to(dtype=param.dtype))
+                        setattr(submodule, param_name, new_param)
                     else:
                         if isinstance(getattr(model, param_name), torch.nn.Parameter):
                             new_param = torch.nn.Parameter(new_param, requires_grad=param.requires_grad)
-                        setattr(model, param_name, new_param.to(dtype=param.dtype))
+                        setattr(model, param_name, new_param)
 
     action = "materialized" if used_meta else "applied"
     debug.end_timer(f"{model_type_lower}_state_apply", f"{model_type} weights {action}")
