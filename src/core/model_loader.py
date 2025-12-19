@@ -926,11 +926,11 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                         if isinstance(getattr(submodule, param_name), torch.nn.Parameter):
                             new_param = torch.nn.Parameter(new_param, requires_grad=param.requires_grad)
 
-                        setattr(submodule, param_name, new_param.to(param.dtype))
+                        setattr(submodule, param_name, new_param.to(dtype=param.dtype))
                     else:
                         if isinstance(getattr(model, param_name), torch.nn.Parameter):
                             new_param = torch.nn.Parameter(new_param, requires_grad=param.requires_grad)
-                        setattr(model, param_name, new_param.to(param.dtype))
+                        setattr(model, param_name, new_param.to(dtype=param.dtype))
 
     action = "materialized" if used_meta else "applied"
     debug.end_timer(f"{model_type_lower}_state_apply", f"{model_type} weights {action}")

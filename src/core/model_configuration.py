@@ -1182,11 +1182,13 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
     if is_dit:
         # DiT-specific
         # Apply compatibility wrapper with compute_dtype
+        # Get compute_dtype from runner if available, fallback to bfloat16
+        # Need to initialize this before the check below as it is used there
+        compute_dtype = getattr(runner, '_compute_dtype', torch.bfloat16)
+
         if not isinstance(model, CompatibleDiT):
             debug.log("Applying DiT compatibility wrapper", category="setup")
             debug.start_timer("CompatibleDiT")
-            # Get compute_dtype from runner if available, fallback to bfloat16
-            compute_dtype = getattr(runner, '_compute_dtype', torch.bfloat16)
             model = CompatibleDiT(model, debug, compute_dtype=compute_dtype, skip_conversion=False)
             debug.end_timer("CompatibleDiT", "Compatibility wrapper application")
         else:
