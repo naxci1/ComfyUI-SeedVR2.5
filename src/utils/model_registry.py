@@ -53,6 +53,13 @@ MODEL_REGISTRY = {
     "wan2.2_vae.safetensors": ModelInfo(repo="Comfy-Org/Wan_2.2_ComfyUI_Repackaged", category="vae", precision="fp16", sha256=None),
 }
 
+# Mapping for files in subdirectories (remote filename/path override)
+# Key: local filename (same as in MODEL_REGISTRY)
+# Value: remote path relative to repo root (e.g., "split_files/vae/wan2.2_vae.safetensors")
+MODEL_REMOTE_PATHS = {
+    "wan2.2_vae.safetensors": "split_files/vae/wan2.2_vae.safetensors"
+}
+
 # Configuration constants
 DEFAULT_DIT = "seedvr2_ema_3b_fp8_e4m3fn.safetensors"
 DEFAULT_VAE = "ema_vae_fp16.safetensors"

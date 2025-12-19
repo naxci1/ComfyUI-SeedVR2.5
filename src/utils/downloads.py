@@ -11,7 +11,7 @@ from typing import Optional
 from tqdm import tqdm
 import time
 
-from .model_registry import MODEL_REGISTRY, DEFAULT_VAE
+from .model_registry import MODEL_REGISTRY, DEFAULT_VAE, MODEL_REMOTE_PATHS
 from .constants import (
     get_base_cache_dir,
     get_all_model_paths,
@@ -235,7 +235,9 @@ def download_weight(dit_model: str, vae_model: str, model_dir: Optional[str] = N
                     save_validation_cache(cache, cache_dir)
         
         # Download file
-        url = HUGGINGFACE_BASE_URL.format(repo=repo, filename=filename)
+        # Check if there is a remote path override
+        remote_filename = MODEL_REMOTE_PATHS.get(filename, filename)
+        url = HUGGINGFACE_BASE_URL.format(repo=repo, filename=remote_filename)
         temp_file = f"{filepath}.download"
         
         if os.path.exists(temp_file) and debug:
