@@ -486,9 +486,16 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torc
     if model is None:
         debug.log(f"No {model_type_upper} model structure found", level="WARNING", category=model_type, force=True)
         return
+    
+    # Check if this is Wan2.1 VAE (already materialized during setup)
+    if not is_dit and hasattr(model, 'vae') and hasattr(model.vae, 'model'):
+        # This is WanVAEWrapper - already materialized
+        debug.log(f"Wan2.1 VAE already materialized during setup", category=model_type)
+        return
+    
     param_device = next(model.parameters()).device
     if param_device.type != 'meta':
-        debug.log(f"{model_type_upper} already materialized on {model.device}", category=model_type)
+        debug.log(f"{model_type_upper} already materialized on {param_device}", category=model_type)
         return
     
     # Determine target device for materialization

@@ -1113,34 +1113,77 @@ def _setup_vae_model(
         return False
     elif not hasattr(runner, 'vae') or runner.vae is None:
         # Create new VAE model
-        # Configure VAE
-        vae_config_path = os.path.join(script_directory, 
-                                      'src/models/video_vae_v3/s8_c16_t4_inflation_sd3.yaml')
-        vae_config = load_config(vae_config_path)
         
-        spatial_downsample_factor = vae_config.get('spatial_downsample_factor', 8)
-        temporal_downsample_factor = vae_config.get('temporal_downsample_factor', 4)
-        vae_config.spatial_downsample_factor = spatial_downsample_factor
-        vae_config.temporal_downsample_factor = temporal_downsample_factor
+        # Check if this is Wan2.1 VAE
+        if "Wan2.1_VAE" in vae_model:
+            # Special handling for Wan2.1 VAE
+            from ..vae.wan_vae import WanVAE, WanVAEWrapper
+            
+            debug.log("Creating Wan2.1 VAE model structure", category="vae", force=True)
+            
+            vae_checkpoint_path = find_model_file(vae_model, base_cache_dir)
+            
+            # Set VAE device from runner's compute_dtype
+            compute_dtype = getattr(runner, '_compute_dtype', torch.float32)
+            vae_device = getattr(runner, '_vae_device', torch.device('cuda'))
+            vae_offload_device = getattr(runner, '_vae_offload_device', None)
+            if vae_offload_device == "none":
+                vae_offload_device = None
+            elif vae_offload_device:
+                vae_offload_device = torch.device(vae_offload_device)
+            
+            # Create Wan2.1 VAE with wrapper
+            wan_vae = WanVAE(
+                z_dim=16,  # 16 latent channels
+                vae_pth=vae_checkpoint_path,
+                dtype=compute_dtype,
+                device=vae_device
+            )
+            
+            # Wrap with ComfyUI-compatible wrapper
+            runner.vae = WanVAEWrapper(wan_vae, vae_device, vae_offload_device)
+            runner._vae_checkpoint = vae_checkpoint_path
+            
+            # Configure VAE settings for compatibility
+            runner.config.vae.scaling_factor = 0.9152  # Wan2.1 scaling factor
+            runner.config.vae.model.spatial_downsample_factor = 8
+            runner.config.vae.model.temporal_downsample_factor = 4
+            
+            debug.log(
+                f"Wan2.1 VAE loaded with 16-channel latent space "
+                f"(spatial: 8x, temporal: 4x downsample)",
+                category="vae",
+                force=True
+            )
+        else:
+            # Standard VAE loading (existing code)
+            vae_config_path = os.path.join(script_directory, 
+                                          'src/models/video_vae_v3/s8_c16_t4_inflation_sd3.yaml')
+            vae_config = load_config(vae_config_path)
+            
+            spatial_downsample_factor = vae_config.get('spatial_downsample_factor', 8)
+            temporal_downsample_factor = vae_config.get('temporal_downsample_factor', 4)
+            vae_config.spatial_downsample_factor = spatial_downsample_factor
+            vae_config.temporal_downsample_factor = temporal_downsample_factor
 
-        runner.config.vae.model = OmegaConf.merge(runner.config.vae.model, vae_config)
-        
-        # Set VAE dtype from runner's compute_dtype
-        compute_dtype = getattr(runner, '_compute_dtype', torch.bfloat16)
-        vae_dtype_str = str(compute_dtype).split('.')[-1]
-        runner.config.vae.dtype = vae_dtype_str
-        runner._vae_dtype_override = compute_dtype
-        
-        vae_checkpoint_path = find_model_file(vae_model, base_cache_dir)
-        runner = prepare_model_structure(runner, "vae", vae_checkpoint_path, 
-                                        runner.config, debug, None)
-        
-        debug.log(
-            f"VAE downsample factors configured "
-            f"(spatial: {spatial_downsample_factor}x, "
-            f"temporal: {temporal_downsample_factor}x)",
-            category="vae"
-        )
+            runner.config.vae.model = OmegaConf.merge(runner.config.vae.model, vae_config)
+            
+            # Set VAE dtype from runner's compute_dtype
+            compute_dtype = getattr(runner, '_compute_dtype', torch.bfloat16)
+            vae_dtype_str = str(compute_dtype).split('.')[-1]
+            runner.config.vae.dtype = vae_dtype_str
+            runner._vae_dtype_override = compute_dtype
+            
+            vae_checkpoint_path = find_model_file(vae_model, base_cache_dir)
+            runner = prepare_model_structure(runner, "vae", vae_checkpoint_path, 
+                                            runner.config, debug, None)
+            
+            debug.log(
+                f"VAE downsample factors configured "
+                f"(spatial: {spatial_downsample_factor}x, "
+                f"temporal: {temporal_downsample_factor}x)",
+                category="vae"
+            )
 
         runner._vae_model_name = vae_model
         return True
