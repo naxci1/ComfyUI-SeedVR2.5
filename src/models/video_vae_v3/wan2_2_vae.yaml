@@ -24,5 +24,5 @@ up_block_types:
   - UpDecoderBlock3D
 spatial_downsample_factor: 8
 temporal_downsample_factor: 4
-use_quant_conv: False
-use_post_quant_conv: False
+use_quant_conv: True
+use_post_quant_conv: True

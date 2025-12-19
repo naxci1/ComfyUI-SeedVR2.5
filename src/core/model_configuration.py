@@ -1114,9 +1114,9 @@ def _setup_vae_model(
     elif not hasattr(runner, 'vae') or runner.vae is None:
         # Create new VAE model
         # Configure VAE
-        if "wan21" in vae_model:
+        if "wan" in vae_model.lower():
             vae_config_path = os.path.join(script_directory,
-                                          'src/models/video_vae_v3/wan2_1_vae.yaml')
+                                          'src/models/video_vae_v3/wan2_2_vae.yaml')
         else:
             vae_config_path = os.path.join(script_directory,
                                           'src/models/video_vae_v3/s8_c16_t4_inflation_sd3.yaml')

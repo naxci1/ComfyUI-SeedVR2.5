@@ -50,7 +50,7 @@ MODEL_REGISTRY = {
     
     # VAE models
     "ema_vae_fp16.safetensors": ModelInfo(category="vae", precision="fp16", sha256="20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1"),
-    "wan21-vae.safetensors": ModelInfo(repo="wangkanai/wan21-vae", category="vae", precision="fp16", sha256=None),
+    "wan2.2_vae.safetensors": ModelInfo(repo="Comfy-Org/Wan_2.2_ComfyUI_Repackaged", category="vae", precision="fp16", sha256=None),
 }
 
 # Configuration constants
