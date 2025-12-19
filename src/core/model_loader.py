@@ -875,6 +875,63 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
     debug.start_timer(f"{model_type_lower}_state_apply")
     model.load_state_dict(state, strict=False, assign=True)
     
+    # Handle any remaining meta parameters that were missed by load_state_dict
+    # This happens when keys are missing in the checkpoint and strict=False
+    # If we don't materialize them, accessing them later will cause "Cannot copy out of meta tensor" error
+    if used_meta:
+        meta_params = [n for n, p in model.named_parameters() if p.device.type == 'meta']
+        if meta_params:
+            if debug:
+                debug.log(f"Initializing {len(meta_params)} missing parameters (still on meta device)",
+                         level="WARNING", category=model_type_lower, force=True)
+                if len(meta_params) < 10:
+                    debug.log(f"Missing keys: {meta_params}", category=model_type_lower, indent_level=1)
+
+            # Materialize missing parameters
+            # For biases, zero init is usually correct. For weights, we use normal init or zeros if unsure.
+            # Since these are missing from checkpoint, we have to guess or assume they are optional/auxiliary.
+            for name, param in model.named_parameters():
+                if param.device.type == 'meta':
+                    # Create empty tensor on target device
+                    # Note: model.device might fail if model is on mixed devices or meta, so we use a safe fallback
+                    try:
+                        # Try to get device from first parameter that is not meta
+                        target_dev = next((p.device for p in model.parameters() if p.device.type != 'meta'), torch.device("cpu"))
+                    except:
+                        target_dev = torch.device("cpu")
+
+                    new_param = torch.empty_like(param, device=target_dev)
+
+                    # Initialize
+                    if "bias" in name:
+                        torch.nn.init.zeros_(new_param)
+                    elif "weight" in name:
+                        # Use small random values for weights to avoid zeros in computations
+                        if new_param.dim() < 2:
+                            torch.nn.init.normal_(new_param, mean=0.0, std=0.02)
+                        else:
+                            torch.nn.init.xavier_uniform_(new_param)
+                    else:
+                        torch.nn.init.normal_(new_param, mean=0.0, std=0.02)
+
+                    # Replace meta parameter
+                    # We need to find the parent module to set the parameter
+                    module_path, param_name = name.rsplit('.', 1) if '.' in name else ('', name)
+                    if module_path:
+                        submodule = model
+                        for part in module_path.split('.'):
+                            submodule = getattr(submodule, part)
+
+                        # Handle if it's a Parameter
+                        if isinstance(getattr(submodule, param_name), torch.nn.Parameter):
+                            new_param = torch.nn.Parameter(new_param, requires_grad=param.requires_grad)
+
+                        setattr(submodule, param_name, new_param.to(param.dtype))
+                    else:
+                        if isinstance(getattr(model, param_name), torch.nn.Parameter):
+                            new_param = torch.nn.Parameter(new_param, requires_grad=param.requires_grad)
+                        setattr(model, param_name, new_param.to(param.dtype))
+
     action = "materialized" if used_meta else "applied"
     debug.end_timer(f"{model_type_lower}_state_apply", f"{model_type} weights {action}")
     
