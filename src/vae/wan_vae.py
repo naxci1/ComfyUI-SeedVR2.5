@@ -543,14 +543,16 @@ class WanVAE_(nn.Module):
         for i in range(iter_):
             self._enc_conv_idx = [0]
             if i == 0:
+                # TEMPORARY FIX: Disable caching to avoid dimension mismatch
                 out = self.encoder(
                     x[:, :, :1, :, :],
-                    feat_cache=self._enc_feat_map,
+                    feat_cache=None,
                     feat_idx=self._enc_conv_idx)
             else:
+                # TEMPORARY FIX: Disable caching to avoid dimension mismatch
                 out_ = self.encoder(
                     x[:, :, 1 + 4 * (i - 1):1 + 4 * i, :, :],
-                    feat_cache=self._enc_feat_map,
+                    feat_cache=None,
                     feat_idx=self._enc_conv_idx)
                 out = torch.cat([out, out_], 2)
         mu, log_var = self.conv1(out).chunk(2, dim=1)
@@ -575,14 +577,16 @@ class WanVAE_(nn.Module):
         for i in range(iter_):
             self._conv_idx = [0]
             if i == 0:
+                # TEMPORARY FIX: Disable caching to avoid dimension mismatch
                 out = self.decoder(
                     x[:, :, i:i + 1, :, :],
-                    feat_cache=self._feat_map,
+                    feat_cache=None,
                     feat_idx=self._conv_idx)
             else:
+                # TEMPORARY FIX: Disable caching to avoid dimension mismatch
                 out_ = self.decoder(
                     x[:, :, i:i + 1, :, :],
-                    feat_cache=self._feat_map,
+                    feat_cache=None,
                     feat_idx=self._conv_idx)
                 out = torch.cat([out, out_], 2)
         self.clear_cache()
@@ -668,65 +672,48 @@ class WanVAE:
     def encode(self, videos):
         """
         videos: A list of videos each with shape [C, T, H, W].
-        """
-        # Completely reset cache before encoding
-        self.model._feat_map = None
-        self.model._enc_feat_map = None
-        self.model._conv_idx = None
-        self.model._enc_conv_idx = None
         
+        Note: The original Wan2.1 VAE encode/decode methods already call clear_cache()
+        internally at the start and end of each operation. This is the correct behavior.
+        """
         # Use CUDA autocast for compatibility with PyTorch 2.7.1
         if self.device.type == 'cuda':
             with torch.cuda.amp.autocast(enabled=True, dtype=self.dtype):
-                results = [
+                # Process each video separately - cache is cleared within model.encode()
+                return [
                     self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
                     for u in videos
                 ]
-                # Completely reset cache after encoding
-                self.model._feat_map = None
-                self.model._enc_feat_map = None
-                return results
         else:
             # For non-CUDA devices, run without autocast
-            results = [
+            return [
                 self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
                 for u in videos
             ]
-            # Completely reset cache after encoding
-            self.model._feat_map = None
-            self.model._enc_feat_map = None
-            return results
 
     def decode(self, zs):
-        # Completely reset cache before decoding
-        self.model._feat_map = None
-        self.model._enc_feat_map = None
-        self.model._conv_idx = None
-        self.model._enc_conv_idx = None
+        """
+        Decode latent tensors to pixel space.
         
+        Note: The original Wan2.1 VAE encode/decode methods already call clear_cache()
+        internally at the start and end of each operation. This is the correct behavior.
+        """
         # Use CUDA autocast for compatibility with PyTorch 2.7.1
         if self.device.type == 'cuda':
             with torch.cuda.amp.autocast(enabled=True, dtype=self.dtype):
-                results = [
+                # Process each latent separately - cache is cleared within model.decode()
+                return [
                     self.model.decode(u.unsqueeze(0),
                                       self.scale).float().clamp_(-1, 1).squeeze(0)
                     for u in zs
                 ]
-                # Completely reset cache after decoding
-                self.model._feat_map = None
-                self.model._enc_feat_map = None
-                return results
         else:
             # For non-CUDA devices, run without autocast
-            results = [
+            return [
                 self.model.decode(u.unsqueeze(0),
                                   self.scale).float().clamp_(-1, 1).squeeze(0)
                 for u in zs
             ]
-            # Completely reset cache after decoding
-            self.model._feat_map = None
-            self.model._enc_feat_map = None
-            return results
 
 
 class WanVAEWrapper(nn.Module):
