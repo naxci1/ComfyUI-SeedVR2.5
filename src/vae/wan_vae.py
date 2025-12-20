@@ -699,47 +699,59 @@ class WanVAE:
         """
         videos: A list of videos each with shape [C, T, H, W].
         
-        Note: The original Wan2.1 VAE encode/decode methods already call clear_cache()
-        internally at the start and end of each operation. This is the correct behavior.
+        Memory-efficient encoding: processes videos one at a time to avoid OOM.
+        The model.encode() method internally uses temporal chunking (1+4+4+4... frames)
+        and clears cache at start/end of each operation.
         """
+        latents = []
+        
         # Use CUDA autocast for compatibility with PyTorch 2.7.1
         if self.device.type == 'cuda':
             with torch.cuda.amp.autocast(enabled=True, dtype=self.dtype):
-                # Process each video separately - cache is cleared within model.encode()
-                return [
-                    self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
-                    for u in videos
-                ]
+                # Process each video separately to manage memory
+                for u in videos:
+                    latent = self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
+                    latents.append(latent)
+                    # Explicitly free GPU memory after each video
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
         else:
             # For non-CUDA devices, run without autocast
-            return [
-                self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
-                for u in videos
-            ]
+            for u in videos:
+                latent = self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
+                latents.append(latent)
+        
+        return latents
 
     def decode(self, zs):
         """
         Decode latent tensors to pixel space.
         
-        Note: The original Wan2.1 VAE encode/decode methods already call clear_cache()
-        internally at the start and end of each operation. This is the correct behavior.
+        Memory-efficient decoding: processes latents one at a time to avoid OOM.
+        The model.decode() method internally uses frame-by-frame processing
+        and clears cache at start/end of each operation.
         """
+        samples = []
+        
         # Use CUDA autocast for compatibility with PyTorch 2.7.1
         if self.device.type == 'cuda':
             with torch.cuda.amp.autocast(enabled=True, dtype=self.dtype):
-                # Process each latent separately - cache is cleared within model.decode()
-                return [
-                    self.model.decode(u.unsqueeze(0),
-                                      self.scale).float().clamp_(-1, 1).squeeze(0)
-                    for u in zs
-                ]
+                # Process each latent separately to manage memory
+                for u in zs:
+                    sample = self.model.decode(u.unsqueeze(0),
+                                             self.scale).float().clamp_(-1, 1).squeeze(0)
+                    samples.append(sample)
+                    # Explicitly free GPU memory after each latent
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
         else:
             # For non-CUDA devices, run without autocast
-            return [
-                self.model.decode(u.unsqueeze(0),
-                                  self.scale).float().clamp_(-1, 1).squeeze(0)
-                for u in zs
-            ]
+            for u in zs:
+                sample = self.model.decode(u.unsqueeze(0),
+                                         self.scale).float().clamp_(-1, 1).squeeze(0)
+                samples.append(sample)
+        
+        return samples
 
 
 class WanVAEWrapper(nn.Module):
