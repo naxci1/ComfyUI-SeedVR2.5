@@ -55,19 +55,13 @@ from ....optimization.memory_manager import retry_on_oom
 
 logger = get_logger(__name__)  # pylint: disable=invalid-name
 
-# Enable cuDNN benchmarking for faster convolution algorithms
-# This finds the best algorithm for the specific hardware (RTX 5070 Ti)
+# Optimize for Windows + RTX 5070 Ti (16GB VRAM)
+# Only enable settings that don't add overhead
 if torch.cuda.is_available():
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.deterministic = False  # Allow non-deterministic for speed
-    
-# Set optimal memory format for Ampere/Ada GPUs (RTX 5070 Ti is Ada architecture)
-# channels_last format is more efficient for modern GPUs with Tensor Cores
-try:
-    torch.backends.cuda.matmul.allow_tf32 = True  # Enable TF32 for matrix multiplications
-    torch.backends.cudnn.allow_tf32 = True  # Enable TF32 for convolutions
-except AttributeError:
-    pass  # Older PyTorch versions don't have these settings
+    # Enable TF32 for faster matrix operations on Ampere/Ada GPUs (no overhead)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    # Note: NOT enabling cudnn.benchmark as it adds warmup overhead that hurts single-run performance
 
 class Upsample3D(Upsample2D):
     """A 3D upsampling layer with an optional convolution."""
@@ -1310,20 +1304,10 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         r"""
         Encodes an input tensor `x` by splitting it into spatial tiles in latent space. Temporal is handled by `slicing_encode`.
         `tile_size` and `tile_overlap` are interpreted in output-space pixels and converted to latent-space.
-        
-        Optimizations:
-        - Uses contiguous() for optimal memory layout
-        - Pre-allocates result tensor on correct device
-        - Uses in-place operations where safe
-        - Optimized tensor operations for Ampere/Ada GPUs
         """
-        # Ensure 5D [B, C, F, H, W] and optimize memory layout
+        # Ensure 5D [B, C, F, H, W]
         if x.ndim != 5:
             x = x.unsqueeze(2)
-        
-        # Ensure contiguous memory layout for faster operations
-        if not x.is_contiguous():
-            x = x.contiguous()
 
         b, c, f, H, W = x.shape
         tile_h, tile_w = tile_size
@@ -1366,15 +1350,14 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                 category="vae",
             )
 
-        # Pre-compute common ramp values (cache for all tiles)
+        # Pre-compute common ramp values
         ramp_cache = {}
         if latent_overlap_h > 0:
-            # Use vectorized cosine calculation for efficiency
             t_h = torch.linspace(0, 1, steps=latent_overlap_h, device=x.device, dtype=x.dtype)
-            ramp_cache['h'] = (0.5 - 0.5 * torch.cos(t_h * torch.pi)).contiguous()
+            ramp_cache['h'] = 0.5 - 0.5 * torch.cos(t_h * torch.pi)
         if latent_overlap_w > 0:
             t_w = torch.linspace(0, 1, steps=latent_overlap_w, device=x.device, dtype=x.dtype)
-            ramp_cache['w'] = (0.5 - 0.5 * torch.cos(t_w * torch.pi)).contiguous()
+            ramp_cache['w'] = 0.5 - 0.5 * torch.cos(t_w * torch.pi)
 
         tile_id = 0
         for y_lat in range(0, H_lat_total, stride_h):
@@ -1405,7 +1388,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                         'w': x_out_end - x_out
                     })
 
-                tile_sample = x[:, :, :, y_out:y_out_end, x_out:x_out_end].contiguous()
+                tile_sample = x[:, :, :, y_out:y_out_end, x_out:x_out_end]
 
                 # Log progress periodically instead of every tile (at 1, 6, 11, 16, ...)
                 if self.debug and (tile_id % 5 == 1 or tile_id == num_tiles):
@@ -1418,10 +1401,6 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                         self.debug.log(f"Encoding tiles {tile_id}-{end_tile} / {num_tiles}", category="vae", indent_level=1)
 
                 encoded_tile = self.slicing_encode(tile_sample)
-                
-                # Ensure contiguous for optimal memory layout
-                if not encoded_tile.is_contiguous():
-                    encoded_tile = encoded_tile.contiguous()
 
                 # Initialize output size using first encoded tile
                 if result is None:
@@ -1432,87 +1411,71 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                     if device is None or device == encoded_tile.device:
                         device = encoded_tile.device
                     
-                    # Pre-allocate with contiguous memory layout
                     result = torch.zeros(
                         (b_out, c_out, f_lat, H_lat_total, W_lat_total),
                         device=device,
                         dtype=encoded_tile.dtype,
-                    ).contiguous()
-                    count = torch.zeros(
-                        (1, 1, 1, H_lat_total, W_lat_total), 
-                        device=device, 
-                        dtype=encoded_tile.dtype
-                    ).contiguous()
+                    )
+                    count = torch.zeros((1, 1, 1, H_lat_total, W_lat_total), device=device, dtype=encoded_tile.dtype)
 
                 eff_h_lat = min(y_lat_end - y_lat, encoded_tile.shape[3], result.shape[3] - y_lat)
                 eff_w_lat = min(x_lat_end - x_lat, encoded_tile.shape[4], result.shape[4] - x_lat)
 
-                # Slice and ensure contiguous
-                encoded_tile = encoded_tile[:, :, : result.shape[2], :eff_h_lat, :eff_w_lat].contiguous()
+                encoded_tile = encoded_tile[:, :, : result.shape[2], :eff_h_lat, :eff_w_lat]
 
-                # Build faded masks
+                # Build faded masks - reuse cached ramps
                 ov_h = max(0, min(latent_overlap_h, eff_h_lat - 1))
                 ov_w = max(0, min(latent_overlap_w, eff_w_lat - 1))
                 
-                weight_h = torch.ones((eff_h_lat,), device=encoded_tile.device, dtype=encoded_tile.dtype)
-                weight_w = torch.ones((eff_w_lat,), device=encoded_tile.device, dtype=encoded_tile.dtype)
+                # Create weight tensors directly on target device
+                target_device = result.device
+                weight_h = torch.ones((eff_h_lat,), device=target_device, dtype=encoded_tile.dtype)
+                weight_w = torch.ones((eff_w_lat,), device=target_device, dtype=encoded_tile.dtype)
 
                 # Apply fades only on interior edges using cached ramps (avoid fading on outer image borders)
                 if ov_h > 0:
                     if y_lat > 0:  # Not top edge
-                        weight_h[:ov_h] = ramp_cache['h'][:ov_h]
+                        weight_h[:ov_h] = ramp_cache['h'][:ov_h].to(target_device, non_blocking=True)
                     if y_lat_end < H_lat_total:  # Not bottom edge
-                        weight_h[-ov_h:] = 1 - ramp_cache['h'][:ov_h]
+                        weight_h[-ov_h:] = (1 - ramp_cache['h'][:ov_h]).to(target_device, non_blocking=True)
                 if ov_w > 0:
                     if x_lat > 0:  # Not left edge
-                        weight_w[:ov_w] = ramp_cache['w'][:ov_w]
+                        weight_w[:ov_w] = ramp_cache['w'][:ov_w].to(target_device, non_blocking=True)
                     if x_lat_end < W_lat_total:  # Not right edge
-                        weight_w[-ov_w:] = 1 - ramp_cache['w'][:ov_w]
+                        weight_w[-ov_w:] = (1 - ramp_cache['w'][:ov_w]).to(target_device, non_blocking=True)
 
-                # Separable application (no 2D mask to save memory) - in-place operations
+                # Separable application (no 2D mask to save memory)
                 weight_h_5d = weight_h.view(1, 1, 1, eff_h_lat, 1)
                 weight_w_5d = weight_w.view(1, 1, 1, 1, eff_w_lat)
-                encoded_tile.mul_(weight_h_5d).mul_(weight_w_5d)
-
-                # Accumulate (move to result device if different) - use non-blocking transfers
+                
+                # Move encoded tile to result device once if needed
                 if result.device != encoded_tile.device:
                     encoded_tile = encoded_tile.to(result.device, non_blocking=True)
-                    weight_h_5d = weight_h_5d.to(result.device, non_blocking=True)
-                    weight_w_5d = weight_w_5d.to(result.device, non_blocking=True)
                 
-                # In-place add for accumulation (faster)
-                result[:, :, : encoded_tile.shape[2], y_lat : y_lat + eff_h_lat, x_lat : x_lat + eff_w_lat].add_(encoded_tile)
+                # Apply weights in-place
+                encoded_tile.mul_(weight_h_5d).mul_(weight_w_5d)
+                
+                # Accumulate directly
+                result[:, :, : encoded_tile.shape[2], y_lat : y_lat + eff_h_lat, x_lat : x_lat + eff_w_lat] += encoded_tile
                 count[:, :, :, y_lat : y_lat + eff_h_lat, x_lat : x_lat + eff_w_lat].addcmul_(weight_h_5d, weight_w_5d)
 
-        # Move result back to inference device if needed and normalize - use non-blocking transfers
+        # Move result back to inference device if needed and normalize
         if result.device != x.device:
-            result = result.to(x.device, non_blocking=True)
-            count = count.to(x.device, non_blocking=True)
-        # In-place operations for normalization
-        count.clamp_(min=1e-6)
-        result.div_(count)
+            result = result.to(x.device)
+            count = count.to(x.device)
+        result.div_(count.clamp(min=1e-6))
 
         if x.shape[2] == 1:  # single frame
             result = result.squeeze(2)
 
-        return result.contiguous()  # Ensure output is contiguous for downstream operations
+        return result
 
     def tiled_decode(self, z: torch.Tensor, tile_size: Tuple[int, int] = (512, 512), tile_overlap: Tuple[int, int] = (64, 64)) -> torch.Tensor:
         r"""
         Decodes a latent tensor `z` by splitting it into spatial tiles only. Temporal is handled by `slicing_decode`.
-        
-        Optimizations:
-        - Uses contiguous() for optimal memory layout  
-        - Pre-allocates result tensor on correct device
-        - Uses in-place operations where safe
-        - Optimized tensor operations for Ampere/Ada GPUs
         """
         if z.ndim != 5:
             z = z.unsqueeze(2)
-        
-        # Ensure contiguous memory layout for faster operations
-        if not z.is_contiguous():
-            z = z.contiguous()
 
         b, c, f, H, W = z.shape
 
@@ -1553,15 +1516,14 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                 category="vae",
             )
 
-        # Pre-compute common ramp values (cache for all tiles) with optimal memory layout
+        # Pre-compute common ramp values (small memory, big time save)
         ramp_cache = {}
         if overlap_h > 0:
-            # Use vectorized cosine calculation for efficiency
             t_h = torch.linspace(0, 1, steps=overlap_h, device=z.device, dtype=z.dtype)
-            ramp_cache['h'] = (0.5 - 0.5 * torch.cos(t_h * torch.pi)).contiguous()
+            ramp_cache['h'] = 0.5 - 0.5 * torch.cos(t_h * torch.pi)
         if overlap_w > 0:
             t_w = torch.linspace(0, 1, steps=overlap_w, device=z.device, dtype=z.dtype)
-            ramp_cache['w'] = (0.5 - 0.5 * torch.cos(t_w * torch.pi)).contiguous()
+            ramp_cache['w'] = 0.5 - 0.5 * torch.cos(t_w * torch.pi)
 
         tile_id = 0
         for y_lat in range(0, H, stride_h):
@@ -1626,51 +1588,52 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                 h_out = y_out_end - y_out
                 w_out = x_out_end - x_out
 
-                # Build faded masks
+                # Build faded masks - reuse cached ramps to avoid recreating
                 ov_h_out = max(0, min(overlap_h, h_out - 1))
                 ov_w_out = max(0, min(overlap_w, w_out - 1))
                 
-                weight_h = torch.ones((h_out,), device=decoded_tile.device, dtype=decoded_tile.dtype)
-                weight_w = torch.ones((w_out,), device=decoded_tile.device, dtype=decoded_tile.dtype)
+                # Create weight tensors directly on target device to avoid transfers
+                target_device = result.device if result is not None else decoded_tile.device
+                weight_h = torch.ones((h_out,), device=target_device, dtype=decoded_tile.dtype)
+                weight_w = torch.ones((w_out,), device=target_device, dtype=decoded_tile.dtype)
 
                 # Apply fades only on interior edges using cached ramps (avoid fading on outer image borders)
                 if ov_h_out > 0:
                     if y_lat > 0:  # Not top edge
-                        weight_h[:ov_h_out] = ramp_cache['h'][:ov_h_out]
+                        weight_h[:ov_h_out] = ramp_cache['h'][:ov_h_out].to(target_device, non_blocking=True)
                     if y_lat_end < H:  # Not bottom edge
-                        weight_h[-ov_h_out:] = 1 - ramp_cache['h'][:ov_h_out]
+                        weight_h[-ov_h_out:] = (1 - ramp_cache['h'][:ov_h_out]).to(target_device, non_blocking=True)
                 if ov_w_out > 0:
                     if x_lat > 0:  # Not left edge
-                        weight_w[:ov_w_out] = ramp_cache['w'][:ov_w_out]
+                        weight_w[:ov_w_out] = ramp_cache['w'][:ov_w_out].to(target_device, non_blocking=True)
                     if x_lat_end < W:  # Not right edge
-                        weight_w[-ov_w_out:] = 1 - ramp_cache['w'][:ov_w_out]
+                        weight_w[-ov_w_out:] = (1 - ramp_cache['w'][:ov_w_out]).to(target_device, non_blocking=True)
 
                 # Separable application (no 2D mask to save memory)
                 weight_h_5d = weight_h.view(1, 1, 1, h_out, 1)
                 weight_w_5d = weight_w.view(1, 1, 1, 1, w_out)
-                decoded_tile.mul_(weight_h_5d).mul_(weight_w_5d)
-
-                # Accumulate (move to result device if different)
-                if result.device != decoded_tile.device:
-                    decoded_tile = decoded_tile.to(result.device)
-                    weight_h_5d = weight_h_5d.to(result.device)
-                    weight_w_5d = weight_w_5d.to(result.device)
                 
+                # Move decoded tile to result device once if needed
+                if result.device != decoded_tile.device:
+                    decoded_tile = decoded_tile.to(result.device, non_blocking=True)
+                
+                # Apply weights in-place
+                decoded_tile.mul_(weight_h_5d).mul_(weight_w_5d)
+                
+                # Accumulate directly without creating intermediate tensors
                 result[:, :, : decoded_tile.shape[2], y_out:y_out_end, x_out:x_out_end] += decoded_tile
                 count[:, :, :, y_out:y_out_end, x_out:x_out_end].addcmul_(weight_h_5d, weight_w_5d)
 
         # Move result back to inference device if needed and normalize
         if result.device != z.device:
             result = result.to(z.device)
-            count = count.to(z.device, non_blocking=True)
-        # In-place operations for normalization
-        count.clamp_(min=1e-6)
-        result.div_(count)
+            count = count.to(z.device)
+        result.div_(count.clamp(min=1e-6)) # In-place normalize
 
         if z.shape[2] == 1:  # single frame
             result = result.squeeze(2)
 
-        return result.contiguous()  # Ensure output is contiguous for downstream operations
+        return result
 
     def forward(
         self, x: torch.FloatTensor, mode: Literal["encode", "decode", "all"] = "all", **kwargs
