@@ -672,33 +672,48 @@ class WanVAE:
         # Use CUDA autocast for compatibility with PyTorch 2.7.1
         if self.device.type == 'cuda':
             with torch.cuda.amp.autocast(enabled=True, dtype=self.dtype):
-                return [
+                results = [
                     self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
                     for u in videos
                 ]
+                # Ensure cache is cleared after encoding to prevent interference with decoding
+                self.model.clear_cache()
+                return results
         else:
             # For non-CUDA devices, run without autocast
-            return [
+            results = [
                 self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
                 for u in videos
             ]
+            # Ensure cache is cleared after encoding to prevent interference with decoding
+            self.model.clear_cache()
+            return results
 
     def decode(self, zs):
+        # Ensure cache is cleared before decoding to prevent interference from encoding
+        self.model.clear_cache()
+        
         # Use CUDA autocast for compatibility with PyTorch 2.7.1
         if self.device.type == 'cuda':
             with torch.cuda.amp.autocast(enabled=True, dtype=self.dtype):
-                return [
+                results = [
                     self.model.decode(u.unsqueeze(0),
                                       self.scale).float().clamp_(-1, 1).squeeze(0)
                     for u in zs
                 ]
+                # Ensure cache is cleared after decoding
+                self.model.clear_cache()
+                return results
         else:
             # For non-CUDA devices, run without autocast
-            return [
+            results = [
                 self.model.decode(u.unsqueeze(0),
                                   self.scale).float().clamp_(-1, 1).squeeze(0)
                 for u in zs
             ]
+            # Ensure cache is cleared after decoding
+            self.model.clear_cache()
+            return results
 
 
 class WanVAEWrapper(nn.Module):
