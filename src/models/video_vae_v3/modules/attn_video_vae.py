@@ -1281,14 +1281,19 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         Encode with temporal slicing for memory efficiency.
         
         Optimizations:
-        - Use smaller slice sizes to reduce peak memory
+        - Use smaller slice sizes to reduce peak memory (but keep minimum size for kernel)
         - Offload intermediate results to CPU when needed
         - Process slices with optimal batch size
         """
         sp_size = get_sequence_parallel_world_size()
         
         # Optimization: Use smaller slices for better memory efficiency on Windows
-        effective_slice_size = max(1, self.slicing_sample_min_size // 2) if sp_size == 1 else self.slicing_sample_min_size
+        # But ensure minimum size of 4 frames to accommodate 3x3x3 convolution kernels
+        if sp_size == 1:
+            # Reduce by 25% instead of 50% to maintain kernel compatibility
+            effective_slice_size = max(4, int(self.slicing_sample_min_size * 0.75))
+        else:
+            effective_slice_size = self.slicing_sample_min_size
         
         if self.use_slicing and (x.shape[2] - 1) > effective_slice_size * sp_size:
             x_slices = x[:, :, 1:].split(split_size=effective_slice_size * sp_size, dim=2)
@@ -1335,15 +1340,19 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         Decode with temporal slicing for memory efficiency.
         
         Optimizations:
-        - Use smaller slice sizes to reduce peak memory
+        - Use smaller slice sizes to reduce peak memory (but keep minimum size for kernel)
         - Offload intermediate results to CPU when needed
         - Process slices with optimal batch size
         """
         sp_size = get_sequence_parallel_world_size()
         
         # Optimization: Use smaller slices for better memory efficiency on Windows
-        # This reduces peak VRAM usage while maintaining throughput
-        effective_slice_size = max(1, self.slicing_latent_min_size // 2) if sp_size == 1 else self.slicing_latent_min_size
+        # But ensure minimum size of 4 frames to accommodate 3x3x3 convolution kernels
+        if sp_size == 1:
+            # Reduce by 25% instead of 50% to maintain kernel compatibility
+            effective_slice_size = max(4, int(self.slicing_latent_min_size * 0.75))
+        else:
+            effective_slice_size = self.slicing_latent_min_size
         
         if self.use_slicing and (z.shape[2] - 1) > effective_slice_size * sp_size:
             z_slices = z[:, :, 1:].split(split_size=effective_slice_size * sp_size, dim=2)
