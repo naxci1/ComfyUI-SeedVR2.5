@@ -56,20 +56,12 @@ from ....optimization.memory_manager import retry_on_oom
 logger = get_logger(__name__)  # pylint: disable=invalid-name
 
 # Optimize for Windows + RTX 5070 Ti (16GB VRAM)
-# Advanced acceleration techniques for VAE
+# Only enable settings that don't add overhead
 if torch.cuda.is_available():
     # Enable TF32 for faster matrix operations on Ampere/Ada GPUs (no overhead)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    # Note: NOT enabling cudnn.benchmark as it adds warmup overhead
-    
-    # Enable memory-efficient attention if available (PyTorch 2.0+)
-    try:
-        # This uses Flash Attention when available for faster attention operations
-        torch.backends.cuda.enable_flash_sdp(True)
-        torch.backends.cuda.enable_mem_efficient_sdp(True)
-    except AttributeError:
-        pass  # Older PyTorch versions don't have these settings
+    # Note: NOT enabling cudnn.benchmark as it adds warmup overhead that hurts single-run performance
 
 class Upsample3D(Upsample2D):
     """A 3D upsampling layer with an optional convolution."""
@@ -1227,16 +1219,8 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
 
     def _encode(
         self, x: torch.Tensor, memory_state: MemoryState = MemoryState.DISABLED) -> torch.Tensor:
-        """
-        Core encode operation with optimizations.
-        
-        Optimizations:
-        - Use non-blocking transfers for async data movement
-        - Optimize dtype conversions
-        - Enable memory-efficient operations
-        """
-        # Only transfer if not already on correct device (with non-blocking for speed)
-        _x = x if x.device == self.device else x.to(self.device, non_blocking=True)
+        # Only transfer if not already on correct device
+        _x = x if x.device == self.device else x.to(self.device)
         
         _x = causal_conv_slice_inputs(_x, self.slicing_sample_min_size, memory_state=memory_state)
         h = self.encoder(_x, memory_state=memory_state)
@@ -1248,84 +1232,40 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         
         output = causal_conv_gather_outputs(output)
         
-        # Only transfer back if needed (with non-blocking)
-        return output if output.device == x.device else output.to(x.device, non_blocking=True)
+        # Only transfer back if needed
+        return output if output.device == x.device else output.to(x.device)
 
     def _decode(
         self, z: torch.Tensor, memory_state: MemoryState = MemoryState.DISABLED) -> torch.Tensor:
-        """
-        Core decode operation with optimizations.
-        
-        Optimizations:
-        - Use non-blocking transfers for async data movement
-        - Optimize dtype conversions
-        - Enable memory-efficient operations
-        """
-        # Only transfer if not already on correct device (with non-blocking for speed)
-        _z = z if z.device == self.device else z.to(self.device, non_blocking=True)
+        # Only transfer if not already on correct device
+        _z = z if z.device == self.device else z.to(self.device)
         
         _z = causal_conv_slice_inputs(_z, self.slicing_latent_min_size, memory_state=memory_state)
         
         if self.post_quant_conv is not None:
             _z = self.post_quant_conv(_z, memory_state=memory_state)
         
-        # Main decoder operation
         output = self.decoder(_z, memory_state=memory_state)
         output = causal_conv_gather_outputs(output)
         
-        # Only transfer back if needed (with non-blocking)
-        return output if output.device == z.device else output.to(z.device, non_blocking=True)
+        # Only transfer back if needed
+        return output if output.device == z.device else output.to(z.device)
 
     def slicing_encode(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Encode with temporal slicing for memory efficiency.
-        
-        Optimizations:
-        - Use smaller slice sizes to reduce peak memory (but keep minimum size for kernel)
-        - Offload intermediate results to CPU when needed
-        - Process slices with optimal batch size
-        """
         sp_size = get_sequence_parallel_world_size()
-        
-        # Optimization: Use smaller slices for better memory efficiency on Windows
-        # But ensure minimum size of 4 frames to accommodate 3x3x3 convolution kernels
-        if sp_size == 1:
-            # Reduce by 25% instead of 50% to maintain kernel compatibility
-            effective_slice_size = max(4, int(self.slicing_sample_min_size * 0.75))
-        else:
-            effective_slice_size = self.slicing_sample_min_size
-        
-        if self.use_slicing and (x.shape[2] - 1) > effective_slice_size * sp_size:
-            x_slices = x[:, :, 1:].split(split_size=effective_slice_size * sp_size, dim=2)
-            
-            # Process first slice
+        if self.use_slicing and (x.shape[2] - 1) > self.slicing_sample_min_size * sp_size:
+            x_slices = x[:, :, 1:].split(split_size=self.slicing_sample_min_size * sp_size, dim=2)
             encoded_slices = [
                 self._encode(
                     torch.cat((x[:, :, :1], x_slices[0]), dim=2),
                     memory_state=MemoryState.INITIALIZING,
                 )
             ]
-            
-            # Process remaining slices with GPU+CPU hybrid approach
             for x_idx in range(1, len(x_slices)):
-                # Encode slice on GPU
-                encoded_slice = self._encode(x_slices[x_idx], memory_state=MemoryState.ACTIVE)
-                
-                # Optimization: If we have many slices, offload older results to CPU to free VRAM
-                if len(encoded_slices) > 2 and torch.cuda.is_available():
-                    if encoded_slices[0].device.type == 'cuda':
-                        encoded_slices[0] = encoded_slices[0].cpu()
-                        torch.cuda.empty_cache()
-                
-                encoded_slices.append(encoded_slice)
-            
-            # Move all slices back to GPU if needed for concatenation
-            target_device = encoded_slices[-1].device
-            encoded_slices = [s.to(target_device, non_blocking=True) if s.device != target_device else s 
-                            for s in encoded_slices]
-            
+                encoded_slices.append(
+                    self._encode(x_slices[x_idx], memory_state=MemoryState.ACTIVE)
+                )
             out = torch.cat(encoded_slices, dim=2)
-            
             # Clear memory efficiently
             modules_with_memory = [m for m in self.modules() 
                                 if isinstance(m, InflatedCausalConv3d) and m.memory is not None]
@@ -1336,58 +1276,20 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
             return self._encode(x)
 
     def slicing_decode(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        Decode with temporal slicing for memory efficiency.
-        
-        Optimizations:
-        - Use smaller slice sizes to reduce peak memory (but keep minimum size for kernel)
-        - Offload intermediate results to CPU when needed
-        - Process slices with optimal batch size
-        """
         sp_size = get_sequence_parallel_world_size()
-        
-        # Optimization: Use smaller slices for better memory efficiency on Windows
-        # But ensure minimum size of 4 frames to accommodate 3x3x3 convolution kernels
-        if sp_size == 1:
-            # Reduce by 25% instead of 50% to maintain kernel compatibility
-            effective_slice_size = max(4, int(self.slicing_latent_min_size * 0.75))
-        else:
-            effective_slice_size = self.slicing_latent_min_size
-        
-        if self.use_slicing and (z.shape[2] - 1) > effective_slice_size * sp_size:
-            z_slices = z[:, :, 1:].split(split_size=effective_slice_size * sp_size, dim=2)
-            
-            # Process first slice
+        if self.use_slicing and (z.shape[2] - 1) > self.slicing_latent_min_size * sp_size:
+            z_slices = z[:, :, 1:].split(split_size=self.slicing_latent_min_size * sp_size, dim=2)
             decoded_slices = [
                 self._decode(
                     torch.cat((z[:, :, :1], z_slices[0]), dim=2),
-                    memory_state=MemoryState.INITIALIZING,
+                    memory_state=MemoryState.INITIALIZING
                 )
             ]
-            
-            # Process remaining slices with GPU+CPU hybrid approach
             for z_idx in range(1, len(z_slices)):
-                # Decode slice on GPU
-                decoded_slice = self._decode(z_slices[z_idx], memory_state=MemoryState.ACTIVE)
-                
-                # Optimization: If we have many slices, offload older results to CPU to free VRAM
-                # This enables processing of larger videos without OOM
-                if len(decoded_slices) > 2 and torch.cuda.is_available():
-                    # Move oldest decoded slice to CPU (async)
-                    if decoded_slices[0].device.type == 'cuda':
-                        decoded_slices[0] = decoded_slices[0].cpu()
-                        # Clear cache to free memory
-                        torch.cuda.empty_cache()
-                
-                decoded_slices.append(decoded_slice)
-            
-            # Move all slices back to GPU if needed for concatenation
-            target_device = decoded_slices[-1].device
-            decoded_slices = [s.to(target_device, non_blocking=True) if s.device != target_device else s 
-                            for s in decoded_slices]
-            
+                decoded_slices.append(
+                    self._decode(z_slices[z_idx], memory_state=MemoryState.ACTIVE)
+                )
             out = torch.cat(decoded_slices, dim=2)
-            
             # Clear memory efficiently
             modules_with_memory = [m for m in self.modules() 
                                 if isinstance(m, InflatedCausalConv3d) and m.memory is not None]
@@ -1571,11 +1473,6 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
     def tiled_decode(self, z: torch.Tensor, tile_size: Tuple[int, int] = (512, 512), tile_overlap: Tuple[int, int] = (64, 64)) -> torch.Tensor:
         r"""
         Decodes a latent tensor `z` by splitting it into spatial tiles only. Temporal is handled by `slicing_decode`.
-        
-        Performance optimizations:
-        - Uses channels_last memory format for better cache locality
-        - Minimizes memory allocations with pre-computed weights
-        - Uses non-blocking transfers for async operations
         """
         if z.ndim != 5:
             z = z.unsqueeze(2)
@@ -1619,7 +1516,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                 category="vae",
             )
 
-        # Pre-compute common ramp values once and move to GPU
+        # Pre-compute common ramp values (small memory, big time save)
         ramp_cache = {}
         if overlap_h > 0:
             t_h = torch.linspace(0, 1, steps=overlap_h, device=z.device, dtype=z.dtype)
@@ -1695,45 +1592,37 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                 ov_h_out = max(0, min(overlap_h, h_out - 1))
                 ov_w_out = max(0, min(overlap_w, w_out - 1))
                 
-                # Optimization: Only create weight masks if overlap exists
-                if ov_h_out > 0 or ov_w_out > 0:
-                    # Create weight tensors directly on target device to avoid transfers
-                    target_device = result.device if result is not None else decoded_tile.device
-                    weight_h = torch.ones((h_out,), device=target_device, dtype=decoded_tile.dtype)
-                    weight_w = torch.ones((w_out,), device=target_device, dtype=decoded_tile.dtype)
+                # Create weight tensors directly on target device to avoid transfers
+                target_device = result.device if result is not None else decoded_tile.device
+                weight_h = torch.ones((h_out,), device=target_device, dtype=decoded_tile.dtype)
+                weight_w = torch.ones((w_out,), device=target_device, dtype=decoded_tile.dtype)
 
-                    # Apply fades only on interior edges using cached ramps (avoid fading on outer image borders)
-                    if ov_h_out > 0:
-                        if y_lat > 0:  # Not top edge
-                            weight_h[:ov_h_out] = ramp_cache['h'][:ov_h_out].to(target_device, non_blocking=True)
-                        if y_lat_end < H:  # Not bottom edge
-                            weight_h[-ov_h_out:] = (1 - ramp_cache['h'][:ov_h_out]).to(target_device, non_blocking=True)
-                    if ov_w_out > 0:
-                        if x_lat > 0:  # Not left edge
-                            weight_w[:ov_w_out] = ramp_cache['w'][:ov_w_out].to(target_device, non_blocking=True)
-                        if x_lat_end < W:  # Not right edge
-                            weight_w[-ov_w_out:] = (1 - ramp_cache['w'][:ov_w_out]).to(target_device, non_blocking=True)
+                # Apply fades only on interior edges using cached ramps (avoid fading on outer image borders)
+                if ov_h_out > 0:
+                    if y_lat > 0:  # Not top edge
+                        weight_h[:ov_h_out] = ramp_cache['h'][:ov_h_out].to(target_device, non_blocking=True)
+                    if y_lat_end < H:  # Not bottom edge
+                        weight_h[-ov_h_out:] = (1 - ramp_cache['h'][:ov_h_out]).to(target_device, non_blocking=True)
+                if ov_w_out > 0:
+                    if x_lat > 0:  # Not left edge
+                        weight_w[:ov_w_out] = ramp_cache['w'][:ov_w_out].to(target_device, non_blocking=True)
+                    if x_lat_end < W:  # Not right edge
+                        weight_w[-ov_w_out:] = (1 - ramp_cache['w'][:ov_w_out]).to(target_device, non_blocking=True)
 
-                    # Separable application (no 2D mask to save memory)
-                    weight_h_5d = weight_h.view(1, 1, 1, h_out, 1)
-                    weight_w_5d = weight_w.view(1, 1, 1, 1, w_out)
-                    
-                    # Move decoded tile to result device once if needed
-                    if result.device != decoded_tile.device:
-                        decoded_tile = decoded_tile.to(result.device, non_blocking=True)
-                    
-                    # Apply weights in-place
-                    decoded_tile.mul_(weight_h_5d).mul_(weight_w_5d)
-                    
-                    # Accumulate directly without creating intermediate tensors
-                    result[:, :, : decoded_tile.shape[2], y_out:y_out_end, x_out:x_out_end] += decoded_tile
-                    count[:, :, :, y_out:y_out_end, x_out:x_out_end].addcmul_(weight_h_5d, weight_w_5d)
-                else:
-                    # No overlap - direct copy without blending (faster)
-                    if result.device != decoded_tile.device:
-                        decoded_tile = decoded_tile.to(result.device, non_blocking=True)
-                    result[:, :, : decoded_tile.shape[2], y_out:y_out_end, x_out:x_out_end] = decoded_tile
-                    count[:, :, :, y_out:y_out_end, x_out:x_out_end] = 1.0
+                # Separable application (no 2D mask to save memory)
+                weight_h_5d = weight_h.view(1, 1, 1, h_out, 1)
+                weight_w_5d = weight_w.view(1, 1, 1, 1, w_out)
+                
+                # Move decoded tile to result device once if needed
+                if result.device != decoded_tile.device:
+                    decoded_tile = decoded_tile.to(result.device, non_blocking=True)
+                
+                # Apply weights in-place
+                decoded_tile.mul_(weight_h_5d).mul_(weight_w_5d)
+                
+                # Accumulate directly without creating intermediate tensors
+                result[:, :, : decoded_tile.shape[2], y_out:y_out_end, x_out:x_out_end] += decoded_tile
+                count[:, :, :, y_out:y_out_end, x_out:x_out_end].addcmul_(weight_h_5d, weight_w_5d)
 
         # Move result back to inference device if needed and normalize
         if result.device != z.device:
