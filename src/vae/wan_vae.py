@@ -548,21 +548,28 @@ class WanVAE_(nn.Module):
         # DON'T reset conv_idx in loop - it should persist across chunks!
         encode_conv_idx = [0]
         
+        # Collect chunks in list to avoid repeated concatenation (memory efficient)
+        chunks = []
+        
         # Process temporal chunks with isolated caching
         for i in range(iter_):
             if i == 0:
                 # First chunk: 1 frame
-                out = self.encoder(
+                chunk = self.encoder(
                     x[:, :, :1, :, :],
                     feat_cache=encode_feat_map,
                     feat_idx=encode_conv_idx)
             else:
                 # Subsequent chunks: 4 frames each
-                out_ = self.encoder(
+                chunk = self.encoder(
                     x[:, :, 1 + 4 * (i - 1):1 + 4 * i, :, :],
                     feat_cache=encode_feat_map,
                     feat_idx=encode_conv_idx)
-                out = torch.cat([out, out_], 2)
+            chunks.append(chunk)
+        
+        # Concatenate all chunks once at the end (more memory efficient)
+        out = torch.cat(chunks, dim=2)
+        del chunks
         
         # Apply conv1 and split into mean and log_var
         mu, log_var = self.conv1(out).chunk(2, dim=1)
@@ -600,20 +607,20 @@ class WanVAE_(nn.Module):
         decode_conv_idx = [0]
         iter_ = x.shape[2]
         
+        # Collect frames in list to avoid repeated concatenation (memory efficient)
+        frames = []
+        
         for i in range(iter_):
-            if i == 0:
-                # First frame - starts fresh cache
-                out = self.decoder(
-                    x[:, :, i:i + 1, :, :],
-                    feat_cache=decode_feat_map,
-                    feat_idx=decode_conv_idx)
-            else:
-                # Subsequent frames - uses cache from this decode operation only
-                out_ = self.decoder(
-                    x[:, :, i:i + 1, :, :],
-                    feat_cache=decode_feat_map,
-                    feat_idx=decode_conv_idx)
-                out = torch.cat([out, out_], 2)
+            # Decode each latent frame, cache persists across iterations
+            frame = self.decoder(
+                x[:, :, i:i + 1, :, :],
+                feat_cache=decode_feat_map,
+                feat_idx=decode_conv_idx)
+            frames.append(frame)
+        
+        # Concatenate all frames once at the end (more memory efficient)
+        out = torch.cat(frames, dim=2)
+        del frames
         
         self.clear_cache()
         return out
