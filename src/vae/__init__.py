@@ -1,9 +1,29 @@
 """VAE modules for ComfyUI-SeedVR2.5"""
 
-from .wan2_1 import *  # noqa: F401, F403
-from .wan2_2 import *  # noqa: F401, F403
+from .wan2_1_wrapper import Wan21VAEWrapper, wrap_vae_if_wan21, calculate_valid_temporal_size
+from .vae_config import (
+    VAEModelVersion,
+    VAEEncodingType,
+    VAEArchitectureConfig,
+    VAEEncodingConfig,
+    VAEModelConfig,
+    VAEConfigManager,
+    get_vae_config_manager,
+    get_wan21_config,
+    get_wan22_config,
+)
 
 __all__ = [
-    "Wan2_1",
-    "Wan2_2",
+    "Wan21VAEWrapper",
+    "wrap_vae_if_wan21",
+    "calculate_valid_temporal_size",
+    "VAEModelVersion",
+    "VAEEncodingType",
+    "VAEArchitectureConfig",
+    "VAEEncodingConfig",
+    "VAEModelConfig",
+    "VAEConfigManager",
+    "get_vae_config_manager",
+    "get_wan21_config",
+    "get_wan22_config",
 ]
