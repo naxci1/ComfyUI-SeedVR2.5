@@ -706,57 +706,130 @@ class WanVAE:
         """
         videos: A list of videos each with shape [C, T, H, W].
         
-        Memory-efficient encoding: processes videos one at a time to avoid OOM.
-        The model.encode() method internally uses temporal chunking (1+4+4+4... frames)
-        and clears cache at start/end of each operation.
+        Memory-efficient encoding with temporal chunking at wrapper level.
+        For large videos (>32 frames), splits into smaller chunks to prevent OOM.
+        Each chunk is encoded separately, then results are concatenated.
         """
         latents = []
+        max_frames_per_chunk = 32  # Process max 32 frames at a time to avoid OOM
         
         # Use CUDA autocast for compatibility with PyTorch 2.7.1
         if self.device.type == 'cuda':
             with torch.cuda.amp.autocast(enabled=True, dtype=self.dtype):
-                # Process each video separately to manage memory
+                # Process each video separately
                 for u in videos:
-                    latent = self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
-                    latents.append(latent)
-                    # Explicitly free GPU memory after each video
+                    T = u.shape[1]  # Temporal dimension
+                    
+                    if T <= max_frames_per_chunk:
+                        # Small video: process directly
+                        latent = self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
+                        latents.append(latent)
+                    else:
+                        # Large video: split into temporal chunks
+                        chunk_latents = []
+                        for start_idx in range(0, T, max_frames_per_chunk):
+                            end_idx = min(start_idx + max_frames_per_chunk, T)
+                            chunk = u[:, start_idx:end_idx, :, :]
+                            
+                            # Encode chunk
+                            chunk_latent = self.model.encode(chunk.unsqueeze(0), self.scale).float().squeeze(0)
+                            chunk_latents.append(chunk_latent)
+                            
+                            # Free GPU memory immediately after each chunk
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                        
+                        # Concatenate chunks along temporal dimension
+                        latent = torch.cat(chunk_latents, dim=1)  # Concat on T dimension
+                        latents.append(latent)
+                    
+                    # Free GPU memory after each video
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
         else:
-            # For non-CUDA devices, run without autocast
+            # For non-CUDA devices, run without autocast (same chunking logic)
             for u in videos:
-                latent = self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
-                latents.append(latent)
+                T = u.shape[1]
+                
+                if T <= max_frames_per_chunk:
+                    latent = self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
+                    latents.append(latent)
+                else:
+                    chunk_latents = []
+                    for start_idx in range(0, T, max_frames_per_chunk):
+                        end_idx = min(start_idx + max_frames_per_chunk, T)
+                        chunk = u[:, start_idx:end_idx, :, :]
+                        chunk_latent = self.model.encode(chunk.unsqueeze(0), self.scale).float().squeeze(0)
+                        chunk_latents.append(chunk_latent)
+                    latent = torch.cat(chunk_latents, dim=1)
+                    latents.append(latent)
         
         return latents
 
     def decode(self, zs):
         """
-        Decode latent tensors to pixel space.
+        Decode latent tensors to pixel space with temporal chunking.
         
-        Memory-efficient decoding: processes latents one at a time to avoid OOM.
-        The model.decode() method internally uses frame-by-frame processing
-        and clears cache at start/end of each operation.
+        For large latents (>8 temporal frames after 4x downsampling),
+        splits into smaller chunks to prevent OOM during decoding.
         """
         samples = []
+        max_latent_frames_per_chunk = 8  # Process max 8 latent frames at a time (= 32 video frames)
         
         # Use CUDA autocast for compatibility with PyTorch 2.7.1
         if self.device.type == 'cuda':
             with torch.cuda.amp.autocast(enabled=True, dtype=self.dtype):
-                # Process each latent separately to manage memory
+                # Process each latent separately
                 for u in zs:
-                    sample = self.model.decode(u.unsqueeze(0),
-                                             self.scale).float().clamp_(-1, 1).squeeze(0)
-                    samples.append(sample)
-                    # Explicitly free GPU memory after each latent
+                    T = u.shape[1]  # Temporal dimension in latent space
+                    
+                    if T <= max_latent_frames_per_chunk:
+                        # Small latent: decode directly
+                        sample = self.model.decode(u.unsqueeze(0),
+                                                 self.scale).float().clamp_(-1, 1).squeeze(0)
+                        samples.append(sample)
+                    else:
+                        # Large latent: split into temporal chunks
+                        chunk_samples = []
+                        for start_idx in range(0, T, max_latent_frames_per_chunk):
+                            end_idx = min(start_idx + max_latent_frames_per_chunk, T)
+                            chunk = u[:, start_idx:end_idx, :, :]
+                            
+                            # Decode chunk
+                            chunk_sample = self.model.decode(chunk.unsqueeze(0),
+                                                           self.scale).float().clamp_(-1, 1).squeeze(0)
+                            chunk_samples.append(chunk_sample)
+                            
+                            # Free GPU memory immediately after each chunk
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                        
+                        # Concatenate chunks along temporal dimension
+                        sample = torch.cat(chunk_samples, dim=1)  # Concat on T dimension
+                        samples.append(sample)
+                    
+                    # Free GPU memory after each latent
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
         else:
-            # For non-CUDA devices, run without autocast
+            # For non-CUDA devices, run without autocast (same chunking logic)
             for u in zs:
-                sample = self.model.decode(u.unsqueeze(0),
-                                         self.scale).float().clamp_(-1, 1).squeeze(0)
-                samples.append(sample)
+                T = u.shape[1]
+                
+                if T <= max_latent_frames_per_chunk:
+                    sample = self.model.decode(u.unsqueeze(0),
+                                             self.scale).float().clamp_(-1, 1).squeeze(0)
+                    samples.append(sample)
+                else:
+                    chunk_samples = []
+                    for start_idx in range(0, T, max_latent_frames_per_chunk):
+                        end_idx = min(start_idx + max_latent_frames_per_chunk, T)
+                        chunk = u[:, start_idx:end_idx, :, :]
+                        chunk_sample = self.model.decode(chunk.unsqueeze(0),
+                                                       self.scale).float().clamp_(-1, 1).squeeze(0)
+                        chunk_samples.append(chunk_sample)
+                    sample = torch.cat(chunk_samples, dim=1)
+                    samples.append(sample)
         
         return samples
 
