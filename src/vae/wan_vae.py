@@ -669,6 +669,12 @@ class WanVAE:
         """
         videos: A list of videos each with shape [C, T, H, W].
         """
+        # Completely reset cache before encoding
+        self.model._feat_map = None
+        self.model._enc_feat_map = None
+        self.model._conv_idx = None
+        self.model._enc_conv_idx = None
+        
         # Use CUDA autocast for compatibility with PyTorch 2.7.1
         if self.device.type == 'cuda':
             with torch.cuda.amp.autocast(enabled=True, dtype=self.dtype):
@@ -676,8 +682,9 @@ class WanVAE:
                     self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
                     for u in videos
                 ]
-                # Ensure cache is cleared after encoding to prevent interference with decoding
-                self.model.clear_cache()
+                # Completely reset cache after encoding
+                self.model._feat_map = None
+                self.model._enc_feat_map = None
                 return results
         else:
             # For non-CUDA devices, run without autocast
@@ -685,13 +692,17 @@ class WanVAE:
                 self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
                 for u in videos
             ]
-            # Ensure cache is cleared after encoding to prevent interference with decoding
-            self.model.clear_cache()
+            # Completely reset cache after encoding
+            self.model._feat_map = None
+            self.model._enc_feat_map = None
             return results
 
     def decode(self, zs):
-        # Ensure cache is cleared before decoding to prevent interference from encoding
-        self.model.clear_cache()
+        # Completely reset cache before decoding
+        self.model._feat_map = None
+        self.model._enc_feat_map = None
+        self.model._conv_idx = None
+        self.model._enc_conv_idx = None
         
         # Use CUDA autocast for compatibility with PyTorch 2.7.1
         if self.device.type == 'cuda':
@@ -701,8 +712,9 @@ class WanVAE:
                                       self.scale).float().clamp_(-1, 1).squeeze(0)
                     for u in zs
                 ]
-                # Ensure cache is cleared after decoding
-                self.model.clear_cache()
+                # Completely reset cache after decoding
+                self.model._feat_map = None
+                self.model._enc_feat_map = None
                 return results
         else:
             # For non-CUDA devices, run without autocast
@@ -711,8 +723,9 @@ class WanVAE:
                                   self.scale).float().clamp_(-1, 1).squeeze(0)
                 for u in zs
             ]
-            # Ensure cache is cleared after decoding
-            self.model.clear_cache()
+            # Completely reset cache after decoding
+            self.model._feat_map = None
+            self.model._enc_feat_map = None
             return results
 
 
