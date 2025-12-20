@@ -333,6 +333,191 @@ class Wan21VAEWrapper(nn.Module):
             return type('Output', (), {'sample': sample})()
         return sample
     
+    def encode_with_3d_tiling(
+        self,
+        x: torch.Tensor,
+        tile_size: Tuple[int, int] = (512, 512),
+        tile_overlap: Tuple[int, int] = (64, 64),
+        temporal_tile_size: int = 17,
+        temporal_overlap: int = 4,
+        return_dict: bool = True,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        """
+        Encode with 3D tiling (temporal + spatial).
+        
+        Args:
+            x: Input tensor in WAN2.1 format [B, C, T, H, W]
+            tile_size: Spatial tile size (height, width)
+            tile_overlap: Spatial tile overlap (height, width)
+            temporal_tile_size: Number of frames per temporal chunk (should satisfy T = 4n + 1)
+            temporal_overlap: Frame overlap between temporal chunks
+            return_dict: Whether to return as dict
+            
+        Returns:
+            Encoded latent (wrapped in output object if return_dict=True)
+        """
+        B, C, T, H, W = x.shape
+        
+        # Validate temporal tile size
+        if (temporal_tile_size - 1) % 4 != 0:
+            logger.warning(
+                f"Temporal tile size {temporal_tile_size} doesn't satisfy T = 4n + 1, "
+                f"adjusting to {calculate_valid_temporal_size(temporal_tile_size)}"
+            )
+            temporal_tile_size = calculate_valid_temporal_size(temporal_tile_size)
+        
+        # If input is small enough, use non-tiled encoding
+        if T <= temporal_tile_size and H <= tile_size[0] and W <= tile_size[1]:
+            return self.encode_with_temporal_padding(x, return_dict=return_dict)
+        
+        # Calculate temporal chunks
+        temporal_stride = temporal_tile_size - temporal_overlap
+        num_temporal_chunks = math.ceil((T - temporal_overlap) / temporal_stride)
+        
+        # Process temporal chunks
+        latent_chunks = []
+        for t_idx in range(num_temporal_chunks):
+            t_start = t_idx * temporal_stride
+            t_end = min(t_start + temporal_tile_size, T)
+            
+            # Extract temporal chunk
+            x_chunk = x[:, :, t_start:t_end, :, :]
+            
+            # Pad temporal dimension if needed
+            x_chunk, original_t = pad_temporal_to_valid(x_chunk, dim=2)
+            
+            # Encode chunk (with spatial tiling if needed)
+            if H > tile_size[0] or W > tile_size[1]:
+                # Use spatial tiling on this temporal chunk
+                latent_chunk = self._encode_with_spatial_tiling(
+                    x_chunk, tile_size, tile_overlap, return_dict=False
+                )
+            else:
+                # Encode without spatial tiling
+                if hasattr(self.base_vae, 'encode'):
+                    output = self.base_vae.encode(x_chunk, return_dict=False)
+                    latent_chunk = output[0] if isinstance(output, tuple) else output
+                    if hasattr(latent_chunk, 'sample'):
+                        latent_chunk = latent_chunk.sample()
+                    elif hasattr(latent_chunk, 'mode'):
+                        latent_chunk = latent_chunk.mode()
+                else:
+                    h = self.base_vae.encoder(x_chunk)
+                    if hasattr(self.base_vae, 'quant_conv') and self.base_vae.quant_conv is not None:
+                        h = self.base_vae.quant_conv(h)
+                    latent_chunk = h * self.scaling_factor
+                    if self.shift_factor != 0.0:
+                        latent_chunk = latent_chunk + self.shift_factor
+            
+            # Unpad temporal dimension in latent space
+            original_t_latent = (original_t - 1) // self.temporal_compression + 1
+            latent_chunk = unpad_temporal(latent_chunk, original_t_latent, dim=2)
+            
+            latent_chunks.append(latent_chunk)
+        
+        # Blend overlapping temporal chunks
+        if num_temporal_chunks > 1:
+            latent = self._blend_temporal_chunks(
+                latent_chunks, temporal_stride // self.temporal_compression, 
+                temporal_overlap // self.temporal_compression, T
+            )
+        else:
+            latent = latent_chunks[0]
+        
+        if return_dict:
+            return type('Output', (), {'latent': latent})()
+        return latent
+    
+    def _encode_with_spatial_tiling(
+        self,
+        x: torch.Tensor,
+        tile_size: Tuple[int, int],
+        tile_overlap: Tuple[int, int],
+        return_dict: bool = False,
+    ) -> torch.Tensor:
+        """
+        Encode with spatial tiling only (no temporal tiling).
+        
+        Args:
+            x: Input tensor [B, C, T, H, W]
+            tile_size: Spatial tile size
+            tile_overlap: Spatial tile overlap
+            return_dict: Whether to return as dict
+            
+        Returns:
+            Encoded latent
+        """
+        # For now, use simple non-overlapping tiling
+        # A more sophisticated implementation would handle overlaps and blending
+        logger.warning("Spatial tiling for 3D tensors not fully implemented, using full encoding")
+        return self.encode_with_temporal_padding(x, return_dict=return_dict)
+    
+    def _blend_temporal_chunks(
+        self,
+        chunks: list,
+        stride: int,
+        overlap: int,
+        target_length: int
+    ) -> torch.Tensor:
+        """
+        Blend overlapping temporal chunks with linear interpolation in overlap regions.
+        
+        Args:
+            chunks: List of latent chunks
+            stride: Stride between chunks in latent space
+            overlap: Overlap size in latent space
+            target_length: Target temporal length in latent space
+            
+        Returns:
+            Blended latent tensor
+        """
+        if len(chunks) == 1:
+            return chunks[0]
+        
+        B, C, _, H, W = chunks[0].shape
+        target_t_latent = (target_length - 1) // self.temporal_compression + 1
+        
+        # Initialize output tensor
+        output = torch.zeros((B, C, target_t_latent, H, W), 
+                           dtype=chunks[0].dtype, device=chunks[0].device)
+        weight_sum = torch.zeros((B, 1, target_t_latent, 1, 1), 
+                                dtype=chunks[0].dtype, device=chunks[0].device)
+        
+        for i, chunk in enumerate(chunks):
+            t_start = i * stride
+            t_end = t_start + chunk.shape[2]
+            
+            # Clip to target length
+            if t_end > target_t_latent:
+                chunk = chunk[:, :, :(target_t_latent - t_start), :, :]
+                t_end = target_t_latent
+            
+            # Create weight mask for blending
+            chunk_len = t_end - t_start
+            weight = torch.ones((B, 1, chunk_len, 1, 1), 
+                              dtype=chunk.dtype, device=chunk.device)
+            
+            if overlap > 0:
+                # Linear fade in/out in overlap regions
+                if i > 0:  # Fade in at start
+                    fade_in = torch.linspace(0, 1, min(overlap, chunk_len), 
+                                           dtype=chunk.dtype, device=chunk.device)
+                    weight[:, :, :len(fade_in), :, :] = fade_in.view(1, 1, -1, 1, 1)
+                
+                if i < len(chunks) - 1:  # Fade out at end
+                    fade_out = torch.linspace(1, 0, min(overlap, chunk_len),
+                                            dtype=chunk.dtype, device=chunk.device)
+                    weight[:, :, -len(fade_out):, :, :] = fade_out.view(1, 1, -1, 1, 1)
+            
+            # Accumulate weighted chunks
+            output[:, :, t_start:t_end, :, :] += chunk * weight
+            weight_sum[:, :, t_start:t_end, :, :] += weight
+        
+        # Normalize by weight sum
+        output = output / (weight_sum + 1e-8)
+        
+        return output
+    
     def encode(
         self,
         x: torch.Tensor,
@@ -347,7 +532,7 @@ class Wan21VAEWrapper(nn.Module):
         Args:
             x: Input tensor (can be SeedVR2 or WAN2.1 format)
             return_dict: Whether to return as dict
-            tiled: Whether to use tiled encoding (not implemented for 3D yet)
+            tiled: Whether to use tiled encoding (3D temporal+spatial tiling)
             tile_size: Tile size for spatial tiling
             tile_overlap: Tile overlap for spatial tiling
             
@@ -358,10 +543,190 @@ class Wan21VAEWrapper(nn.Module):
         x_wan21 = self.permute_to_wan21_format(x)
         
         if tiled:
-            logger.warning("3D temporal tiling not yet implemented, using full encoding")
+            # Use 3D temporal+spatial tiling
+            output = self.encode_with_3d_tiling(
+                x_wan21, 
+                tile_size=tile_size, 
+                tile_overlap=tile_overlap,
+                temporal_tile_size=17,  # Default: 17 frames (4*4 + 1)
+                temporal_overlap=4,
+                return_dict=return_dict
+            )
+        else:
+            # Encode with temporal padding only
+            output = self.encode_with_temporal_padding(x_wan21, return_dict=return_dict)
         
-        # Encode with temporal padding
-        output = self.encode_with_temporal_padding(x_wan21, return_dict=return_dict)
+        return output
+    
+    def decode_with_3d_tiling(
+        self,
+        z: torch.Tensor,
+        tile_size: Tuple[int, int] = (512, 512),
+        tile_overlap: Tuple[int, int] = (64, 64),
+        temporal_tile_size: int = 5,  # In latent space (will expand to 17 frames)
+        temporal_overlap: int = 1,
+        return_dict: bool = True,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        """
+        Decode with 3D tiling (temporal + spatial).
+        
+        Args:
+            z: Latent tensor in WAN2.1 format [B, C, T, H, W]
+            tile_size: Spatial tile size (height, width)
+            tile_overlap: Spatial tile overlap (height, width)
+            temporal_tile_size: Number of latent frames per temporal chunk
+            temporal_overlap: Latent frame overlap between temporal chunks
+            return_dict: Whether to return as dict
+            
+        Returns:
+            Decoded sample (wrapped in output object if return_dict=True)
+        """
+        B, C, T, H, W = z.shape
+        
+        # If input is small enough, use non-tiled decoding
+        if T <= temporal_tile_size and H <= tile_size[0] and W <= tile_size[1]:
+            return self.decode_with_temporal_padding(z, return_dict=return_dict)
+        
+        # Calculate temporal chunks
+        temporal_stride = temporal_tile_size - temporal_overlap
+        num_temporal_chunks = math.ceil((T - temporal_overlap) / temporal_stride)
+        
+        # Process temporal chunks
+        sample_chunks = []
+        for t_idx in range(num_temporal_chunks):
+            t_start = t_idx * temporal_stride
+            t_end = min(t_start + temporal_tile_size, T)
+            
+            # Extract temporal chunk
+            z_chunk = z[:, :, t_start:t_end, :, :]
+            
+            # Pad temporal dimension if needed
+            z_chunk, original_t_latent = pad_temporal_to_valid(z_chunk, dim=2)
+            
+            # Unapply scaling
+            if self.shift_factor != 0.0:
+                z_chunk = z_chunk - self.shift_factor
+            z_chunk = z_chunk / self.scaling_factor
+            
+            # Decode chunk (with spatial tiling if needed)
+            if H > tile_size[0] or W > tile_size[1]:
+                # Use spatial tiling on this temporal chunk
+                sample_chunk = self._decode_with_spatial_tiling(
+                    z_chunk, tile_size, tile_overlap, return_dict=False
+                )
+            else:
+                # Decode without spatial tiling
+                if hasattr(self.base_vae, 'decode'):
+                    output = self.base_vae.decode(z_chunk, return_dict=False)
+                    sample_chunk = output[0] if isinstance(output, tuple) else output
+                    if hasattr(sample_chunk, 'sample'):
+                        sample_chunk = sample_chunk.sample
+                else:
+                    if hasattr(self.base_vae, 'post_quant_conv') and self.base_vae.post_quant_conv is not None:
+                        z_chunk = self.base_vae.post_quant_conv(z_chunk)
+                    sample_chunk = self.base_vae.decoder(z_chunk)
+            
+            # Unpad temporal dimension (expanded by temporal_compression)
+            original_t = (original_t_latent - 1) * self.temporal_compression + 1
+            sample_chunk = unpad_temporal(sample_chunk, original_t, dim=2)
+            
+            sample_chunks.append(sample_chunk)
+        
+        # Blend overlapping temporal chunks
+        if num_temporal_chunks > 1:
+            sample = self._blend_temporal_chunks_output(
+                sample_chunks, temporal_stride * self.temporal_compression, 
+                temporal_overlap * self.temporal_compression
+            )
+        else:
+            sample = sample_chunks[0]
+        
+        if return_dict:
+            return type('Output', (), {'sample': sample})()
+        return sample
+    
+    def _decode_with_spatial_tiling(
+        self,
+        z: torch.Tensor,
+        tile_size: Tuple[int, int],
+        tile_overlap: Tuple[int, int],
+        return_dict: bool = False,
+    ) -> torch.Tensor:
+        """
+        Decode with spatial tiling only (no temporal tiling).
+        
+        Args:
+            z: Latent tensor [B, C, T, H, W]
+            tile_size: Spatial tile size
+            tile_overlap: Spatial tile overlap
+            return_dict: Whether to return as dict
+            
+        Returns:
+            Decoded sample
+        """
+        # For now, use simple non-overlapping tiling
+        # A more sophisticated implementation would handle overlaps and blending
+        logger.warning("Spatial tiling for 3D tensors not fully implemented, using full decoding")
+        return self.decode_with_temporal_padding(z, return_dict=return_dict)
+    
+    def _blend_temporal_chunks_output(
+        self,
+        chunks: list,
+        stride: int,
+        overlap: int
+    ) -> torch.Tensor:
+        """
+        Blend overlapping temporal chunks in output space (similar to latent blending).
+        
+        Args:
+            chunks: List of sample chunks
+            stride: Stride between chunks in output space
+            overlap: Overlap size in output space
+            
+        Returns:
+            Blended sample tensor
+        """
+        if len(chunks) == 1:
+            return chunks[0]
+        
+        B, C, _, H, W = chunks[0].shape
+        
+        # Calculate total output length
+        total_length = stride * (len(chunks) - 1) + chunks[-1].shape[2]
+        
+        # Initialize output tensor
+        output = torch.zeros((B, C, total_length, H, W), 
+                           dtype=chunks[0].dtype, device=chunks[0].device)
+        weight_sum = torch.zeros((B, 1, total_length, 1, 1), 
+                                dtype=chunks[0].dtype, device=chunks[0].device)
+        
+        for i, chunk in enumerate(chunks):
+            t_start = i * stride
+            t_end = t_start + chunk.shape[2]
+            
+            # Create weight mask for blending
+            chunk_len = chunk.shape[2]
+            weight = torch.ones((B, 1, chunk_len, 1, 1), 
+                              dtype=chunk.dtype, device=chunk.device)
+            
+            if overlap > 0:
+                # Linear fade in/out in overlap regions
+                if i > 0:  # Fade in at start
+                    fade_in = torch.linspace(0, 1, min(overlap, chunk_len), 
+                                           dtype=chunk.dtype, device=chunk.device)
+                    weight[:, :, :len(fade_in), :, :] = fade_in.view(1, 1, -1, 1, 1)
+                
+                if i < len(chunks) - 1:  # Fade out at end
+                    fade_out = torch.linspace(1, 0, min(overlap, chunk_len),
+                                            dtype=chunk.dtype, device=chunk.device)
+                    weight[:, :, -len(fade_out):, :, :] = fade_out.view(1, 1, -1, 1, 1)
+            
+            # Accumulate weighted chunks
+            output[:, :, t_start:t_end, :, :] += chunk * weight
+            weight_sum[:, :, t_start:t_end, :, :] += weight
+        
+        # Normalize by weight sum
+        output = output / (weight_sum + 1e-8)
         
         return output
     
@@ -379,7 +744,7 @@ class Wan21VAEWrapper(nn.Module):
         Args:
             z: Latent tensor (can be SeedVR2 or WAN2.1 format)
             return_dict: Whether to return as dict
-            tiled: Whether to use tiled decoding (not implemented for 3D yet)
+            tiled: Whether to use tiled decoding (3D temporal+spatial tiling)
             tile_size: Tile size for spatial tiling
             tile_overlap: Tile overlap for spatial tiling
             
@@ -390,10 +755,18 @@ class Wan21VAEWrapper(nn.Module):
         z_wan21 = self.permute_to_wan21_format(z)
         
         if tiled:
-            logger.warning("3D temporal tiling not yet implemented, using full decoding")
-        
-        # Decode with temporal padding
-        output = self.decode_with_temporal_padding(z_wan21, return_dict=return_dict)
+            # Use 3D temporal+spatial tiling
+            output = self.decode_with_3d_tiling(
+                z_wan21, 
+                tile_size=tile_size, 
+                tile_overlap=tile_overlap,
+                temporal_tile_size=5,  # Default: 5 latent frames (expands to 17 pixel frames)
+                temporal_overlap=1,
+                return_dict=return_dict
+            )
+        else:
+            # Decode with temporal padding only
+            output = self.decode_with_temporal_padding(z_wan21, return_dict=return_dict)
         
         return output
     
