@@ -880,15 +880,60 @@ def wrap_vae_if_wan21(
         
         scaling_factor = 0.18215
         shift_factor = 0.0
+        temporal_compression = 4
+        spatial_compression = 8
         
         if config is not None:
+            # Extract scaling factors from config
             scaling_factor = config.get('scaling_factor', scaling_factor)
             shift_factor = config.get('shift_factor', shift_factor)
+            
+            # Extract compression ratios
+            architecture = config.get('architecture', {})
+            temporal_compression = architecture.get('temporal_compression', temporal_compression)
+            spatial_compression = architecture.get('spatial_compression', spatial_compression)
         
         return Wan21VAEWrapper(
             base_vae=vae,
             scaling_factor=scaling_factor,
             shift_factor=shift_factor,
+            temporal_compression=temporal_compression,
+            spatial_compression=spatial_compression,
         )
     
     return vae
+
+
+def load_vae_config_json(config_path: str) -> Dict[str, Any]:
+    """
+    Load VAE configuration from a config.json file.
+    
+    This is useful for loading WAN2.1 models that include a config.json
+    file alongside the checkpoint with model-specific parameters like
+    scaling_factor, temporal_compression, etc.
+    
+    Args:
+        config_path: Path to config.json file
+        
+    Returns:
+        Configuration dictionary
+        
+    Example:
+        >>> config = load_vae_config_json("/path/to/wan2.1/config.json")
+        >>> scaling_factor = config.get('scaling_factor', 0.18215)
+    """
+    import json
+    import os
+    
+    if not os.path.exists(config_path):
+        logger.warning(f"Config file not found: {config_path}")
+        return {}
+    
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        logger.info(f"Loaded VAE config from {config_path}")
+        return config
+    except Exception as e:
+        logger.error(f"Error loading config from {config_path}: {e}")
+        return {}
