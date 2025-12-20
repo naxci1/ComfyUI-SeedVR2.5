@@ -535,28 +535,32 @@ class WanVAE_(nn.Module):
         return x_recon, mu, log_var
 
     def encode(self, x, scale):
-        # Restore original Wan2.1 temporal chunking for memory efficiency
-        # Process in chunks: 1 + 4 + 4 + 4... frames
+        # Fixed: Use isolated cache for each encode operation
+        # The cache mechanism is designed for temporal consistency WITHIN an encode operation,
+        # not ACROSS encode/decode operations
         self.clear_cache()
         
         t = x.shape[2]
         iter_ = 1 + (t - 1) // 4
         
-        # Process temporal chunks with caching for consistency
+        # CRITICAL FIX: Initialize fresh cache list for this encode operation
+        encode_feat_map = [None] * len(list(self.encoder.modules()))
+        
+        # Process temporal chunks with isolated caching
         for i in range(iter_):
-            self._enc_conv_idx = [0]
+            encode_conv_idx = [0]
             if i == 0:
                 # First chunk: 1 frame
                 out = self.encoder(
                     x[:, :, :1, :, :],
-                    feat_cache=self._enc_feat_map,
-                    feat_idx=self._enc_conv_idx)
+                    feat_cache=encode_feat_map,
+                    feat_idx=encode_conv_idx)
             else:
                 # Subsequent chunks: 4 frames each
                 out_ = self.encoder(
                     x[:, :, 1 + 4 * (i - 1):1 + 4 * i, :, :],
-                    feat_cache=self._enc_feat_map,
-                    feat_idx=self._enc_conv_idx)
+                    feat_cache=encode_feat_map,
+                    feat_idx=encode_conv_idx)
                 out = torch.cat([out, out_], 2)
         
         # Apply conv1 and split into mean and log_var
@@ -573,8 +577,9 @@ class WanVAE_(nn.Module):
         return mu
 
     def decode(self, z, scale):
-        # Restore original Wan2.1 frame-by-frame decoding
-        # Each latent frame is decoded separately with caching
+        # Fixed: Decode using fresh cache for each decode operation
+        # The cache mechanism is designed for temporal consistency WITHIN a decode operation,
+        # not ACROSS encode/decode operations
         self.clear_cache()
         
         # Apply reverse scaling
@@ -587,22 +592,25 @@ class WanVAE_(nn.Module):
         # Apply conv2
         x = self.conv2(z)
         
-        # Decode frame-by-frame (iterate over latent frames, not original frames)
+        # Decode frame-by-frame with isolated cache (iterate over latent frames)
+        # CRITICAL FIX: Initialize fresh cache list for this decode operation
+        decode_feat_map = [None] * len(list(self.decoder.modules()))
         iter_ = x.shape[2]
+        
         for i in range(iter_):
-            self._conv_idx = [0]
+            decode_conv_idx = [0]
             if i == 0:
-                # First frame
+                # First frame - starts fresh cache
                 out = self.decoder(
                     x[:, :, i:i + 1, :, :],
-                    feat_cache=self._feat_map,
-                    feat_idx=self._conv_idx)
+                    feat_cache=decode_feat_map,
+                    feat_idx=decode_conv_idx)
             else:
-                # Subsequent frames
+                # Subsequent frames - uses cache from this decode operation only
                 out_ = self.decoder(
                     x[:, :, i:i + 1, :, :],
-                    feat_cache=self._feat_map,
-                    feat_idx=self._conv_idx)
+                    feat_cache=decode_feat_map,
+                    feat_idx=decode_conv_idx)
                 out = torch.cat([out, out_], 2)
         
         self.clear_cache()
