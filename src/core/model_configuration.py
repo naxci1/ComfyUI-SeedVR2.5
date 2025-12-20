@@ -1141,7 +1141,10 @@ def _setup_vae_model(
         
         # Use WanVAEWrapper if applicable
         if is_wan:
-             runner.config.vae.model.target = "src.models.video_vae_v3.modules.wan_vae.WanVAEWrapper"
+             # Update __object__ to point to WanVAEWrapper
+             # Path must be importable by import_item
+             runner.config.vae.model.__object__.path = "src.models.video_vae_v3.modules.wan_vae"
+             runner.config.vae.model.__object__.name = "WanVAEWrapper"
 
         # Set VAE dtype from runner's compute_dtype
         compute_dtype = getattr(runner, '_compute_dtype', torch.bfloat16)

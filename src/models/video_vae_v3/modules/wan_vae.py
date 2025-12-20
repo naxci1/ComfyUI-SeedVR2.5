@@ -13,8 +13,6 @@ logger = get_logger(__name__)
 
 class WanVAEWrapper(VideoAutoencoderKLWrapper):
     def __init__(self, *args, **kwargs):
-        # Consume 'target' argument if present (used for config instantiation but not needed here)
-        kwargs.pop("target", None)
         super().__init__(*args, **kwargs)
         # Wan2.1 scaling factor
         self._scaling_factor = 0.18215
