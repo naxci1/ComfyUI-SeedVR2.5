@@ -535,12 +535,29 @@ class WanVAE_(nn.Module):
         return x_recon, mu, log_var
 
     def encode(self, x, scale):
-        # Simplified encode: process entire tensor at once without chunking
-        # This avoids cache-related dimension mismatches
+        # Restore original Wan2.1 temporal chunking for memory efficiency
+        # Process in chunks: 1 + 4 + 4 + 4... frames
         self.clear_cache()
         
-        # Process entire video through encoder without chunking
-        out = self.encoder(x, feat_cache=None, feat_idx=[0])
+        t = x.shape[2]
+        iter_ = 1 + (t - 1) // 4
+        
+        # Process temporal chunks with caching for consistency
+        for i in range(iter_):
+            self._enc_conv_idx = [0]
+            if i == 0:
+                # First chunk: 1 frame
+                out = self.encoder(
+                    x[:, :, :1, :, :],
+                    feat_cache=self._enc_feat_map,
+                    feat_idx=self._enc_conv_idx)
+            else:
+                # Subsequent chunks: 4 frames each
+                out_ = self.encoder(
+                    x[:, :, 1 + 4 * (i - 1):1 + 4 * i, :, :],
+                    feat_cache=self._enc_feat_map,
+                    feat_idx=self._enc_conv_idx)
+                out = torch.cat([out, out_], 2)
         
         # Apply conv1 and split into mean and log_var
         mu, log_var = self.conv1(out).chunk(2, dim=1)
@@ -556,8 +573,8 @@ class WanVAE_(nn.Module):
         return mu
 
     def decode(self, z, scale):
-        # Simplified decode: process entire tensor at once without frame-by-frame iteration
-        # This avoids cache-related dimension mismatches
+        # Restore original Wan2.1 frame-by-frame decoding
+        # Each latent frame is decoded separately with caching
         self.clear_cache()
         
         # Apply reverse scaling
@@ -570,8 +587,23 @@ class WanVAE_(nn.Module):
         # Apply conv2
         x = self.conv2(z)
         
-        # Process entire latent through decoder without frame-by-frame iteration
-        out = self.decoder(x, feat_cache=None, feat_idx=[0])
+        # Decode frame-by-frame (iterate over latent frames, not original frames)
+        iter_ = x.shape[2]
+        for i in range(iter_):
+            self._conv_idx = [0]
+            if i == 0:
+                # First frame
+                out = self.decoder(
+                    x[:, :, i:i + 1, :, :],
+                    feat_cache=self._feat_map,
+                    feat_idx=self._conv_idx)
+            else:
+                # Subsequent frames
+                out_ = self.decoder(
+                    x[:, :, i:i + 1, :, :],
+                    feat_cache=self._feat_map,
+                    feat_idx=self._conv_idx)
+                out = torch.cat([out, out_], 2)
         
         self.clear_cache()
         return out
