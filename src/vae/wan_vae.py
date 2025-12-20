@@ -535,60 +535,44 @@ class WanVAE_(nn.Module):
         return x_recon, mu, log_var
 
     def encode(self, x, scale):
+        # Simplified encode: process entire tensor at once without chunking
+        # This avoids cache-related dimension mismatches
         self.clear_cache()
-        ## cache
-        t = x.shape[2]
-        iter_ = 1 + (t - 1) // 4
-        ## Split encode input x by time: 1, 4, 4, 4...
-        for i in range(iter_):
-            self._enc_conv_idx = [0]
-            if i == 0:
-                # TEMPORARY FIX: Disable caching to avoid dimension mismatch
-                out = self.encoder(
-                    x[:, :, :1, :, :],
-                    feat_cache=None,
-                    feat_idx=self._enc_conv_idx)
-            else:
-                # TEMPORARY FIX: Disable caching to avoid dimension mismatch
-                out_ = self.encoder(
-                    x[:, :, 1 + 4 * (i - 1):1 + 4 * i, :, :],
-                    feat_cache=None,
-                    feat_idx=self._enc_conv_idx)
-                out = torch.cat([out, out_], 2)
+        
+        # Process entire video through encoder without chunking
+        out = self.encoder(x, feat_cache=None, feat_idx=[0])
+        
+        # Apply conv1 and split into mean and log_var
         mu, log_var = self.conv1(out).chunk(2, dim=1)
+        
+        # Apply scaling
         if isinstance(scale[0], torch.Tensor):
             mu = (mu - scale[0].view(1, self.z_dim, 1, 1, 1)) * scale[1].view(
                 1, self.z_dim, 1, 1, 1)
         else:
             mu = (mu - scale[0]) * scale[1]
+        
         self.clear_cache()
         return mu
 
     def decode(self, z, scale):
+        # Simplified decode: process entire tensor at once without frame-by-frame iteration
+        # This avoids cache-related dimension mismatches
         self.clear_cache()
-        # z: [b,c,t,h,w]
+        
+        # Apply reverse scaling
         if isinstance(scale[0], torch.Tensor):
             z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
                 1, self.z_dim, 1, 1, 1)
         else:
             z = z / scale[1] + scale[0]
-        iter_ = z.shape[2]
+        
+        # Apply conv2
         x = self.conv2(z)
-        for i in range(iter_):
-            self._conv_idx = [0]
-            if i == 0:
-                # TEMPORARY FIX: Disable caching to avoid dimension mismatch
-                out = self.decoder(
-                    x[:, :, i:i + 1, :, :],
-                    feat_cache=None,
-                    feat_idx=self._conv_idx)
-            else:
-                # TEMPORARY FIX: Disable caching to avoid dimension mismatch
-                out_ = self.decoder(
-                    x[:, :, i:i + 1, :, :],
-                    feat_cache=None,
-                    feat_idx=self._conv_idx)
-                out = torch.cat([out, out_], 2)
+        
+        # Process entire latent through decoder without frame-by-frame iteration
+        out = self.decoder(x, feat_cache=None, feat_idx=[0])
+        
         self.clear_cache()
         return out
 
