@@ -545,10 +545,11 @@ class WanVAE_(nn.Module):
         
         # CRITICAL FIX: Initialize fresh cache list for this encode operation
         encode_feat_map = [None] * len(list(self.encoder.modules()))
+        # DON'T reset conv_idx in loop - it should persist across chunks!
+        encode_conv_idx = [0]
         
         # Process temporal chunks with isolated caching
         for i in range(iter_):
-            encode_conv_idx = [0]
             if i == 0:
                 # First chunk: 1 frame
                 out = self.encoder(
@@ -595,10 +596,11 @@ class WanVAE_(nn.Module):
         # Decode frame-by-frame with isolated cache (iterate over latent frames)
         # CRITICAL FIX: Initialize fresh cache list for this decode operation
         decode_feat_map = [None] * len(list(self.decoder.modules()))
+        # DON'T reset conv_idx in loop - it should persist across frames!
+        decode_conv_idx = [0]
         iter_ = x.shape[2]
         
         for i in range(iter_):
-            decode_conv_idx = [0]
             if i == 0:
                 # First frame - starts fresh cache
                 out = self.decoder(
