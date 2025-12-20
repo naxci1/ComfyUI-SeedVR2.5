@@ -789,22 +789,20 @@ class Wan21VAEWrapper(nn.Module):
         Returns:
             True if state dict appears to be from WAN2.1 model
         """
-        # Check for 3D convolution keys
-        has_conv3d = any('conv3d' in k.lower() for k in state_dict.keys())
+        # WAN2.1 has very specific markers - be conservative to avoid false positives
         
-        # Check for causal/temporal markers
-        has_temporal = any(
-            any(marker in k.lower() for marker in ['temporal', 'causal', 'time'])
-            for k in state_dict.keys()
-        )
+        # Check for WAN2.1-specific block structure (v_blocks is unique to WAN2.1)
+        has_v_blocks = any('v_blocks' in k or 'v_block' in k for k in state_dict.keys())
         
-        # Check for WAN2.1-specific patterns
-        has_wan21_pattern = any(
-            'v_blocks' in k or 'temporal_conv' in k or 'inflation' in k
-            for k in state_dict.keys()
-        )
+        # Check for explicit WAN2.1 naming in keys
+        has_wan21_naming = any('wan2' in k.lower() or 'wan_2' in k.lower() for k in state_dict.keys())
         
-        return has_conv3d and (has_temporal or has_wan21_pattern)
+        # If either of these specific markers exist, it's WAN2.1
+        if has_v_blocks or has_wan21_naming:
+            return True
+        
+        # Otherwise, NOT WAN2.1 (avoids false positives with standard VAE that has inflation)
+        return False
     
     @staticmethod
     def from_pretrained(
