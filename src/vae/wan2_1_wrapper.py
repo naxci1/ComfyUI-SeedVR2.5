@@ -152,7 +152,10 @@ class Wan21VAEWrapper(nn.Module):
         """
         super().__init__()
         
-        self.base_vae = base_vae
+        # Register base_vae as a submodule so it moves with the wrapper
+        # Using add_module ensures proper device movement and parameter tracking
+        self.add_module('base_vae', base_vae)
+        
         self.scaling_factor = scaling_factor
         self.shift_factor = shift_factor
         self.temporal_compression = temporal_compression
@@ -180,8 +183,9 @@ class Wan21VAEWrapper(nn.Module):
         return next(self.base_vae.parameters()).dtype
     
     def to(self, *args, **kwargs):
-        """Override to() to move base VAE."""
-        self.base_vae = self.base_vae.to(*args, **kwargs)
+        """Override to() to move wrapper and base VAE together."""
+        # Call parent to() which will automatically move all submodules including base_vae
+        super().to(*args, **kwargs)
         return self
     
     def permute_to_wan21_format(self, x: torch.Tensor) -> torch.Tensor:
