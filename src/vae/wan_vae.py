@@ -765,10 +765,12 @@ class WanVAEWrapper(nn.Module):
     """
     Wrapper for Wan2.1 VAE with ComfyUI integration
     
+    Based on FlashVSR's approach: uses Wan2.1 VAE as-is without spatial tiling.
+    The VAE's internal temporal chunking (1+4+4+4 frames) handles memory efficiently.
+    
     Provides:
-    - Tiled encoding/decoding for memory efficiency
     - Device management (device, offload_device)
-    - Cache mechanism support
+    - Sequential batch processing
     - Compatible interface with existing VAE loaders
     """
     
@@ -795,25 +797,24 @@ class WanVAEWrapper(nn.Module):
         """
         Encode input tensor to latent space
         
+        FlashVSR approach: no spatial tiling, use Wan2.1 VAE's internal temporal chunking.
+        
         Args:
             x: Input tensor of shape (B, C, T, H, W)
-            tiled: Whether to use tiled encoding
-            tile_size: Size of tiles (H, W) for tiled encoding
-            tile_overlap: Overlap between tiles (H, W)
+            tiled: Ignored - kept for API compatibility
+            tile_size: Ignored - kept for API compatibility
+            tile_overlap: Ignored - kept for API compatibility
             
         Returns:
-            WanVAEEncoderOutput with latent tensor of shape (B, Z, T, H_lat, W_lat)
+            WanVAEEncoderOutput with latent tensor of shape (B, Z, T//4, H//8, W//8)
         """
-        if tiled and tile_size is not None:
-            latent = self.encode_tiled(x, tile_size, tile_overlap)
-        else:
-            # Standard encoding
-            # Convert from (B, C, T, H, W) to list of (C, T, H, W) tensors
-            batch_list = [x[i] for i in range(x.shape[0])]
-            latents = self.vae.encode(batch_list)
-            
-            # Stack back to batch
-            latent = torch.stack(latents, dim=0)
+        # Convert from (B, C, T, H, W) to list of (C, T, H, W) tensors
+        # Wan2.1 VAE handles each video with internal temporal chunking
+        batch_list = [x[i] for i in range(x.shape[0])]
+        latents = self.vae.encode(batch_list)
+        
+        # Stack back to batch
+        latent = torch.stack(latents, dim=0)
         
         # Return output compatible with existing VAE interface
         return WanVAEEncoderOutput(latent=latent, posterior=None)
@@ -824,193 +825,27 @@ class WanVAEWrapper(nn.Module):
         """
         Decode latent tensor to pixel space
         
+        FlashVSR approach: no spatial tiling, use Wan2.1 VAE's internal frame-by-frame processing.
+        
         Args:
-            z: Latent tensor of shape (B, Z, T, H_lat, W_lat)
-            tiled: Whether to use tiled decoding
-            tile_size: Size of tiles (H, W) for tiled decoding
-            tile_overlap: Overlap between tiles (H, W)
+            z: Latent tensor of shape (B, Z, T//4, H//8, W//8)
+            tiled: Ignored - kept for API compatibility
+            tile_size: Ignored - kept for API compatibility
+            tile_overlap: Ignored - kept for API compatibility
             
         Returns:
             WanVAEDecoderOutput with sample tensor of shape (B, C, T, H, W)
         """
-        if tiled and tile_size is not None:
-            sample = self.decode_tiled(z, tile_size, tile_overlap)
-        else:
-            # Standard decoding
-            # Convert from (B, Z, T, H_lat, W_lat) to list of (Z, T, H_lat, W_lat) tensors
-            batch_list = [z[i] for i in range(z.shape[0])]
-            decoded = self.vae.decode(batch_list)
-            
-            # Stack back to batch
-            sample = torch.stack(decoded, dim=0)
+        # Convert from (B, Z, T, H_lat, W_lat) to list of (Z, T, H_lat, W_lat) tensors
+        # Wan2.1 VAE handles each latent with internal frame-by-frame decoding
+        batch_list = [z[i] for i in range(z.shape[0])]
+        decoded = self.vae.decode(batch_list)
+        
+        # Stack back to batch
+        sample = torch.stack(decoded, dim=0)
         
         # Return output compatible with existing VAE interface
         return WanVAEDecoderOutput(sample=sample)
-    
-    def encode_tiled(self, x: torch.Tensor, 
-                     tile_size: Tuple[int, int] = (1024, 1024),
-                     tile_overlap: Tuple[int, int] = (128, 128)) -> torch.Tensor:
-        """
-        Encode with tiling for memory efficiency
-        
-        Memory-optimized: doesn't pre-allocate full output tensor, builds incrementally on CPU
-        
-        Args:
-            x: Input tensor (B, C, T, H, W)
-            tile_size: Tile size (H, W)
-            tile_overlap: Overlap size (H, W)
-            
-        Returns:
-            Latent tensor (B, Z, T, H_lat, W_lat)
-        """
-        B, C, T, H, W = x.shape
-        tile_h, tile_w = tile_size
-        overlap_h, overlap_w = tile_overlap
-        stride_h = tile_h - overlap_h
-        stride_w = tile_w - overlap_w
-        
-        # Calculate output dimensions (8x downsampling)
-        latent_h = H // 8
-        latent_w = W // 8
-        
-        # MEMORY FIX: Build output on CPU to avoid OOM, accumulate tiles
-        latents_cpu = torch.zeros((B, 16, T // 4, latent_h, latent_w), 
-                                  device='cpu', dtype=torch.float32)
-        weights_cpu = torch.zeros((B, 16, T // 4, latent_h, latent_w), 
-                                  device='cpu', dtype=torch.float32)
-        
-        # Process tiles
-        for i in range(0, H, stride_h):
-            for j in range(0, W, stride_w):
-                # Extract tile
-                tile_x = x[:, :, :, i:min(i+tile_h, H), j:min(j+tile_w, W)]
-                
-                # Pad if necessary
-                pad_h = tile_h - tile_x.shape[3]
-                pad_w = tile_w - tile_x.shape[4]
-                if pad_h > 0 or pad_w > 0:
-                    tile_x = F.pad(tile_x, (0, pad_w, 0, pad_h), mode='reflect')
-                
-                # Encode tile - process ONE tile at a time for memory efficiency
-                tile_latents_list = []
-                for b in range(B):
-                    # Process single video tile
-                    single_tile = tile_x[b:b+1]  # Keep batch dimension
-                    single_latent = self.vae.model.encode(single_tile, self.vae.scale).float()
-                    
-                    # Move to CPU immediately to free VRAM
-                    single_latent_cpu = single_latent.cpu()
-                    tile_latents_list.append(single_latent_cpu)
-                    
-                    # Free GPU memory after each tile
-                    del single_latent
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                
-                # Stack on CPU
-                tile_latents_cpu = torch.cat(tile_latents_list, dim=0)
-                del tile_latents_list
-                
-                # Calculate positions in latent space
-                lat_i = i // 8
-                lat_j = j // 8
-                lat_h = tile_latents_cpu.shape[3]
-                lat_w = tile_latents_cpu.shape[4]
-                
-                # Add to output with blending weights
-                weight = torch.ones_like(tile_latents_cpu)
-                latents_cpu[:, :, :, lat_i:lat_i+lat_h, lat_j:lat_j+lat_w] += tile_latents_cpu * weight
-                weights_cpu[:, :, :, lat_i:lat_i+lat_h, lat_j:lat_j+lat_w] += weight
-        
-        # Normalize by weights
-        latents_cpu = latents_cpu / (weights_cpu + 1e-8)
-        
-        # Move back to device only at the end
-        return latents_cpu.to(x.device)
-    
-    def decode_tiled(self, z: torch.Tensor,
-                     tile_size: Tuple[int, int] = (1024, 1024),
-                     tile_overlap: Tuple[int, int] = (128, 128)) -> torch.Tensor:
-        """
-        Decode with tiling for memory efficiency
-        
-        Memory-optimized: doesn't pre-allocate full output tensor, builds incrementally on CPU
-        
-        Args:
-            z: Latent tensor (B, Z, T, H_lat, W_lat)
-            tile_size: Output tile size (H, W) in pixel space
-            tile_overlap: Overlap size (H, W) in pixel space
-            
-        Returns:
-            Decoded tensor (B, C, T, H, W)
-        """
-        B, Z, T, H_lat, W_lat = z.shape
-        
-        # Convert to pixel space dimensions
-        tile_h_lat = tile_size[0] // 8
-        tile_w_lat = tile_size[1] // 8
-        overlap_h_lat = tile_overlap[0] // 8
-        overlap_w_lat = tile_overlap[1] // 8
-        stride_h = tile_h_lat - overlap_h_lat
-        stride_w = tile_w_lat - overlap_w_lat
-        
-        # Calculate output dimensions (8x upsampling, 4x temporal upsampling)
-        H = H_lat * 8
-        W = W_lat * 8
-        T_out = T * 4
-        
-        # MEMORY FIX: Build output on CPU to avoid OOM, accumulate tiles
-        decoded_cpu = torch.zeros((B, 3, T_out, H, W), device='cpu', dtype=torch.float32)
-        weights_cpu = torch.zeros((B, 3, T_out, H, W), device='cpu', dtype=torch.float32)
-        
-        # Process tiles
-        for i in range(0, H_lat, stride_h):
-            for j in range(0, W_lat, stride_w):
-                # Extract tile
-                tile_z = z[:, :, :, i:min(i+tile_h_lat, H_lat), j:min(j+tile_w_lat, W_lat)]
-                
-                # Pad if necessary
-                pad_h = tile_h_lat - tile_z.shape[3]
-                pad_w = tile_w_lat - tile_z.shape[4]
-                if pad_h > 0 or pad_w > 0:
-                    tile_z = F.pad(tile_z, (0, pad_w, 0, pad_h), mode='reflect')
-                
-                # Decode tile - process ONE tile at a time for memory efficiency
-                tile_decoded_list = []
-                for b in range(B):
-                    # Process single latent tile
-                    single_tile_z = tile_z[b:b+1]  # Keep batch dimension
-                    single_decoded = self.vae.model.decode(single_tile_z, self.vae.scale).float()
-                    
-                    # Move to CPU immediately to free VRAM
-                    single_decoded_cpu = single_decoded.cpu()
-                    tile_decoded_list.append(single_decoded_cpu)
-                    
-                    # Free GPU memory after each tile
-                    del single_decoded
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                
-                # Stack on CPU
-                tile_decoded_cpu = torch.cat(tile_decoded_list, dim=0)
-                del tile_decoded_list
-                
-                # Calculate positions in pixel space
-                pix_i = i * 8
-                pix_j = j * 8
-                pix_h = tile_decoded_cpu.shape[3]
-                pix_w = tile_decoded_cpu.shape[4]
-                
-                # Add to output with blending weights
-                weight = torch.ones_like(tile_decoded_cpu)
-                decoded_cpu[:, :, :, pix_i:pix_i+pix_h, pix_j:pix_j+pix_w] += tile_decoded_cpu * weight
-                weights_cpu[:, :, :, pix_i:pix_i+pix_h, pix_j:pix_j+pix_w] += weight
-        
-        # Normalize by weights
-        decoded_cpu = decoded_cpu / (weights_cpu + 1e-8)
-        
-        # Move back to device only at the end
-        return decoded_cpu.to(z.device)
     
     def clear_cache(self):
         """Clear internal cache"""
