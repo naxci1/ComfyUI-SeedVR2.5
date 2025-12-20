@@ -50,6 +50,8 @@ MODEL_REGISTRY = {
     
     # VAE models
     "ema_vae_fp16.safetensors": ModelInfo(category="vae", precision="fp16", sha256="20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1"),
+    "wan2.1_vae_fp16.safetensors": ModelInfo(category="vae", precision="fp16", variant="wan2.1"),
+    "wan2.1_vae_bf16.safetensors": ModelInfo(category="vae", precision="bf16", variant="wan2.1"),
 }
 
 # Configuration constants
@@ -86,6 +88,24 @@ def get_available_dit_models() -> List[str]:
     return model_list
 
 def get_available_vae_models() -> List[str]:
-    """Get all available VAE models from the registry"""
+    """Get all available VAE models including those discovered on disk"""
     model_list = get_default_models("vae")
+    
+    try:
+        # Get all model files from all paths
+        model_files = get_all_model_files()
+        
+        # Filter for VAE-like files (safetensors, pth, gguf in vae-related names)
+        vae_keywords = ['vae', 'autoencoder', 'wan2', 'encoder']
+        discovered_vae_models = [
+            filename for filename in model_files
+            if filename not in MODEL_REGISTRY and 
+            any(keyword in filename.lower() for keyword in vae_keywords)
+        ]
+        
+        # Add discovered VAE models to the list
+        model_list.extend(sorted(discovered_vae_models))
+    except:
+        pass
+    
     return model_list
