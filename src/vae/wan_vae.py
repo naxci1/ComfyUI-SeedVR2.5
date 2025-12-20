@@ -891,16 +891,25 @@ class WanVAEWrapper(nn.Module):
                 if pad_h > 0 or pad_w > 0:
                     tile_x = F.pad(tile_x, (0, pad_w, 0, pad_h), mode='reflect')
                 
-                # Encode tile
-                batch_list = [tile_x[b] for b in range(B)]
-                tile_latents = self.vae.encode(batch_list)
-                tile_latents = torch.stack(tile_latents, dim=0)
+                # Encode tile - process ONE tile at a time for memory efficiency
+                tile_latents_list = []
+                for b in range(B):
+                    # Process single video tile
+                    single_tile = tile_x[b:b+1]  # Keep batch dimension
+                    single_latent = self.vae.model.encode(single_tile, self.vae.scale).float()
+                    
+                    # Move to CPU immediately to free VRAM
+                    single_latent_cpu = single_latent.cpu()
+                    tile_latents_list.append(single_latent_cpu)
+                    
+                    # Free GPU memory after each tile
+                    del single_latent
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                 
-                # Move to CPU immediately to free VRAM
-                tile_latents_cpu = tile_latents.cpu()
-                del tile_latents
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                # Stack on CPU
+                tile_latents_cpu = torch.cat(tile_latents_list, dim=0)
+                del tile_latents_list
                 
                 # Calculate positions in latent space
                 lat_i = i // 8
@@ -966,16 +975,25 @@ class WanVAEWrapper(nn.Module):
                 if pad_h > 0 or pad_w > 0:
                     tile_z = F.pad(tile_z, (0, pad_w, 0, pad_h), mode='reflect')
                 
-                # Decode tile
-                batch_list = [tile_z[b] for b in range(B)]
-                tile_decoded = self.vae.decode(batch_list)
-                tile_decoded = torch.stack(tile_decoded, dim=0)
+                # Decode tile - process ONE tile at a time for memory efficiency
+                tile_decoded_list = []
+                for b in range(B):
+                    # Process single latent tile
+                    single_tile_z = tile_z[b:b+1]  # Keep batch dimension
+                    single_decoded = self.vae.model.decode(single_tile_z, self.vae.scale).float()
+                    
+                    # Move to CPU immediately to free VRAM
+                    single_decoded_cpu = single_decoded.cpu()
+                    tile_decoded_list.append(single_decoded_cpu)
+                    
+                    # Free GPU memory after each tile
+                    del single_decoded
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                 
-                # Move to CPU immediately to free VRAM
-                tile_decoded_cpu = tile_decoded.cpu()
-                del tile_decoded
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                # Stack on CPU
+                tile_decoded_cpu = torch.cat(tile_decoded_list, dim=0)
+                del tile_decoded_list
                 
                 # Calculate positions in pixel space
                 pix_i = i * 8
