@@ -864,60 +864,284 @@ class WanVAEWrapper(nn.Module):
         self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
         return self
     
+    def _encode_single(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode a single video (no batch dimension) using VAE's internal temporal chunking"""
+        # x shape: (C, T, H, W)
+        # Returns: (Z, T//4, H//8, W//8)
+        batch_list = [x]
+        latents = self.vae.encode(batch_list)
+        return latents[0]
+    
     def encode(self, x: torch.Tensor, tiled: bool = False, 
                tile_size: Optional[Tuple[int, int]] = None,
                tile_overlap: Optional[Tuple[int, int]] = None) -> WanVAEEncoderOutput:
         """
-        Encode input tensor to latent space
-        
-        FlashVSR approach: no spatial tiling, use Wan2.1 VAE's internal temporal chunking.
+        Encode input tensor to latent space with spatial tiling support (like SeedVR2 VAE)
         
         Args:
             x: Input tensor of shape (B, C, T, H, W)
-            tiled: Ignored - kept for API compatibility
-            tile_size: Ignored - kept for API compatibility
-            tile_overlap: Ignored - kept for API compatibility
+            tiled: Whether to use spatial tiling
+            tile_size: Tile size (H, W) in pixel space
+            tile_overlap: Overlap size (H, W) in pixel space
             
         Returns:
             WanVAEEncoderOutput with latent tensor of shape (B, Z, T//4, H//8, W//8)
         """
-        # Convert from (B, C, T, H, W) to list of (C, T, H, W) tensors
-        # Wan2.1 VAE handles each video with internal temporal chunking
-        batch_list = [x[i] for i in range(x.shape[0])]
-        latents = self.vae.encode(batch_list)
+        B, C, T, H, W = x.shape
         
-        # Stack back to batch
-        latent = torch.stack(latents, dim=0)
+        # If not tiled or small enough, encode directly
+        if not tiled or (tile_size and H <= tile_size[0] and W <= tile_size[1]):
+            batch_list = [x[i] for i in range(B)]
+            latents = self.vae.encode(batch_list)
+            latent = torch.stack(latents, dim=0)
+            return WanVAEEncoderOutput(latent=latent, posterior=None)
         
-        # Return output compatible with existing VAE interface
+        # Spatial tiling implementation (matching SeedVR2 VAE pattern)
+        tile_size = tile_size or (512, 512)
+        tile_overlap = tile_overlap or (64, 64)
+        
+        scale_factor = 8  # Wan2.1 VAE spatial downsampling
+        tile_h, tile_w = tile_size
+        overlap_h, overlap_w = tile_overlap
+        
+        # Convert to latent space
+        latent_tile_h = max(1, tile_h // scale_factor)
+        latent_tile_w = max(1, tile_w // scale_factor)
+        latent_overlap_h = max(0, min(overlap_h // scale_factor, latent_tile_h - 1))
+        latent_overlap_w = max(0, min(overlap_w // scale_factor, latent_tile_w - 1))
+        
+        stride_h = max(1, latent_tile_h - latent_overlap_h)
+        stride_w = max(1, latent_tile_w - latent_overlap_w)
+        
+        H_lat_total = (H + scale_factor - 1) // scale_factor
+        W_lat_total = (W + scale_factor - 1) // scale_factor
+        
+        # Pre-compute blending ramps
+        ramp_h = None
+        ramp_w = None
+        if latent_overlap_h > 0:
+            t_h = torch.linspace(0, 1, steps=latent_overlap_h, device=x.device, dtype=x.dtype)
+            ramp_h = 0.5 - 0.5 * torch.cos(t_h * torch.pi)
+        if latent_overlap_w > 0:
+            t_w = torch.linspace(0, 1, steps=latent_overlap_w, device=x.device, dtype=x.dtype)
+            ramp_w = 0.5 - 0.5 * torch.cos(t_w * torch.pi)
+        
+        # Process each batch item separately
+        batch_latents = []
+        for b in range(B):
+            result = None
+            count = None
+            
+            # Tile the spatial dimensions
+            for y_lat in range(0, H_lat_total, stride_h):
+                y_lat_end = min(y_lat + latent_tile_h, H_lat_total)
+                for x_lat in range(0, W_lat_total, stride_w):
+                    x_lat_end = min(x_lat + latent_tile_w, W_lat_total)
+                    
+                    # Skip tiny overlap tiles
+                    if (y_lat > 0 and (y_lat_end - y_lat) <= latent_overlap_h) or \
+                       (x_lat > 0 and (x_lat_end - x_lat) <= latent_overlap_w):
+                        continue
+                    
+                    # Map to pixel space
+                    y_out = y_lat * scale_factor
+                    x_out = x_lat * scale_factor
+                    y_out_end = min(y_lat_end * scale_factor, H)
+                    x_out_end = min(x_lat_end * scale_factor, W)
+                    
+                    # Extract tile
+                    tile_sample = x[b:b+1, :, :, y_out:y_out_end, x_out:x_out_end]
+                    
+                    # Encode tile
+                    tile_latent = self._encode_single(tile_sample[0])
+                    
+                    # Initialize result on first tile
+                    if result is None:
+                        Z, T_lat, _, _ = tile_latent.shape
+                        result = torch.zeros((Z, T_lat, H_lat_total, W_lat_total), 
+                                           device=tile_latent.device, dtype=tile_latent.dtype)
+                        count = torch.zeros((Z, T_lat, H_lat_total, W_lat_total), 
+                                          device=tile_latent.device, dtype=tile_latent.dtype)
+                    
+                    # Compute blending weights
+                    tile_h_actual = tile_latent.shape[2]
+                    tile_w_actual = tile_latent.shape[3]
+                    weight = torch.ones((Z, T_lat, tile_h_actual, tile_w_actual), 
+                                       device=tile_latent.device, dtype=tile_latent.dtype)
+                    
+                    # Apply blending ramps
+                    if latent_overlap_h > 0 and y_lat > 0:
+                        blend_h = min(latent_overlap_h, tile_h_actual)
+                        weight[:, :, :blend_h, :] *= ramp_h[:blend_h].view(1, 1, -1, 1)
+                    if latent_overlap_h > 0 and y_lat_end < H_lat_total:
+                        blend_h = min(latent_overlap_h, tile_h_actual)
+                        weight[:, :, -blend_h:, :] *= (1.0 - ramp_h[:blend_h]).view(1, 1, -1, 1)
+                    
+                    if latent_overlap_w > 0 and x_lat > 0:
+                        blend_w = min(latent_overlap_w, tile_w_actual)
+                        weight[:, :, :, :blend_w] *= ramp_w[:blend_w].view(1, 1, 1, -1)
+                    if latent_overlap_w > 0 and x_lat_end < W_lat_total:
+                        blend_w = min(latent_overlap_w, tile_w_actual)
+                        weight[:, :, :, -blend_w:] *= (1.0 - ramp_w[:blend_w]).view(1, 1, 1, -1)
+                    
+                    # Accumulate weighted tile
+                    result[:, :, y_lat:y_lat+tile_h_actual, x_lat:x_lat+tile_w_actual] += tile_latent * weight
+                    count[:, :, y_lat:y_lat+tile_h_actual, x_lat:x_lat+tile_w_actual] += weight
+                    
+                    # Free memory
+                    del tile_latent, weight
+                    torch.cuda.empty_cache()
+            
+            # Normalize by weights
+            latent_item = result / count.clamp(min=1e-8)
+            batch_latents.append(latent_item)
+            
+            # Free memory
+            del result, count
+            torch.cuda.empty_cache()
+        
+        # Stack batch
+        latent = torch.stack(batch_latents, dim=0)
         return WanVAEEncoderOutput(latent=latent, posterior=None)
+    
+    def _decode_single(self, z: torch.Tensor) -> torch.Tensor:
+        """Decode a single latent (no batch dimension) using VAE's internal frame-by-frame processing"""
+        # z shape: (Z, T//4, H//8, W//8)
+        # Returns: (C, T, H, W)
+        batch_list = [z]
+        decoded = self.vae.decode(batch_list)
+        return decoded[0]
     
     def decode(self, z: torch.Tensor, tiled: bool = False,
                tile_size: Optional[Tuple[int, int]] = None,
                tile_overlap: Optional[Tuple[int, int]] = None) -> WanVAEDecoderOutput:
         """
-        Decode latent tensor to pixel space
-        
-        FlashVSR approach: no spatial tiling, use Wan2.1 VAE's internal frame-by-frame processing.
+        Decode latent tensor to pixel space with spatial tiling support (like SeedVR2 VAE)
         
         Args:
             z: Latent tensor of shape (B, Z, T//4, H//8, W//8)
-            tiled: Ignored - kept for API compatibility
-            tile_size: Ignored - kept for API compatibility
-            tile_overlap: Ignored - kept for API compatibility
+            tiled: Whether to use spatial tiling
+            tile_size: Tile size (H, W) in pixel space
+            tile_overlap: Overlap size (H, W) in pixel space
             
         Returns:
             WanVAEDecoderOutput with sample tensor of shape (B, C, T, H, W)
         """
-        # Convert from (B, Z, T, H_lat, W_lat) to list of (Z, T, H_lat, W_lat) tensors
-        # Wan2.1 VAE handles each latent with internal frame-by-frame decoding
-        batch_list = [z[i] for i in range(z.shape[0])]
-        decoded = self.vae.decode(batch_list)
+        B, Z, T_lat, H_lat, W_lat = z.shape
         
-        # Stack back to batch
-        sample = torch.stack(decoded, dim=0)
+        # If not tiled or small enough, decode directly
+        if not tiled or (tile_size and H_lat * 8 <= tile_size[0] and W_lat * 8 <= tile_size[1]):
+            batch_list = [z[i] for i in range(B)]
+            decoded = self.vae.decode(batch_list)
+            sample = torch.stack(decoded, dim=0)
+            return WanVAEDecoderOutput(sample=sample)
         
-        # Return output compatible with existing VAE interface
+        # Spatial tiling implementation (matching SeedVR2 VAE pattern)
+        tile_size = tile_size or (512, 512)
+        tile_overlap = tile_overlap or (64, 64)
+        
+        scale_factor = 8  # Wan2.1 VAE spatial upsampling
+        tile_h, tile_w = tile_size
+        overlap_h, overlap_w = tile_overlap
+        
+        # Convert to latent space
+        latent_tile_h = max(1, tile_h // scale_factor)
+        latent_tile_w = max(1, tile_w // scale_factor)
+        latent_overlap_h = max(0, min(overlap_h // scale_factor, latent_tile_h - 1))
+        latent_overlap_w = max(0, min(overlap_w // scale_factor, latent_tile_w - 1))
+        
+        stride_h = max(1, latent_tile_h - latent_overlap_h)
+        stride_w = max(1, latent_tile_w - latent_overlap_w)
+        
+        H_out = H_lat * scale_factor
+        W_out = W_lat * scale_factor
+        
+        # Pre-compute blending ramps
+        ramp_h = None
+        ramp_w = None
+        if overlap_h > 0:
+            t_h = torch.linspace(0, 1, steps=overlap_h, device=z.device, dtype=z.dtype)
+            ramp_h = 0.5 - 0.5 * torch.cos(t_h * torch.pi)
+        if overlap_w > 0:
+            t_w = torch.linspace(0, 1, steps=overlap_w, device=z.device, dtype=z.dtype)
+            ramp_w = 0.5 - 0.5 * torch.cos(t_w * torch.pi)
+        
+        # Process each batch item separately
+        batch_samples = []
+        for b in range(B):
+            result = None
+            count = None
+            
+            # Tile the spatial dimensions in latent space
+            for y_lat in range(0, H_lat, stride_h):
+                y_lat_end = min(y_lat + latent_tile_h, H_lat)
+                for x_lat in range(0, W_lat, stride_w):
+                    x_lat_end = min(x_lat + latent_tile_w, W_lat)
+                    
+                    # Skip tiny overlap tiles
+                    if (y_lat > 0 and (y_lat_end - y_lat) <= latent_overlap_h) or \
+                       (x_lat > 0 and (x_lat_end - x_lat) <= latent_overlap_w):
+                        continue
+                    
+                    # Extract latent tile
+                    tile_latent = z[b:b+1, :, :, y_lat:y_lat_end, x_lat:x_lat_end]
+                    
+                    # Decode tile
+                    tile_sample = self._decode_single(tile_latent[0])
+                    
+                    # Map to pixel space
+                    y_out = y_lat * scale_factor
+                    x_out = x_lat * scale_factor
+                    y_out_end = min(y_lat_end * scale_factor, H_out)
+                    x_out_end = min(x_lat_end * scale_factor, W_out)
+                    
+                    # Initialize result on first tile
+                    if result is None:
+                        C, T, _, _ = tile_sample.shape
+                        result = torch.zeros((C, T, H_out, W_out), 
+                                           device=tile_sample.device, dtype=tile_sample.dtype)
+                        count = torch.zeros((C, T, H_out, W_out), 
+                                          device=tile_sample.device, dtype=tile_sample.dtype)
+                    
+                    # Compute blending weights
+                    tile_h_actual = tile_sample.shape[2]
+                    tile_w_actual = tile_sample.shape[3]
+                    weight = torch.ones((C, T, tile_h_actual, tile_w_actual), 
+                                       device=tile_sample.device, dtype=tile_sample.dtype)
+                    
+                    # Apply blending ramps in pixel space
+                    if overlap_h > 0 and y_out > 0:
+                        blend_h = min(overlap_h, tile_h_actual)
+                        weight[:, :, :blend_h, :] *= ramp_h[:blend_h].view(1, 1, -1, 1)
+                    if overlap_h > 0 and y_out_end < H_out:
+                        blend_h = min(overlap_h, tile_h_actual)
+                        weight[:, :, -blend_h:, :] *= (1.0 - ramp_h[:blend_h]).view(1, 1, -1, 1)
+                    
+                    if overlap_w > 0 and x_out > 0:
+                        blend_w = min(overlap_w, tile_w_actual)
+                        weight[:, :, :, :blend_w] *= ramp_w[:blend_w].view(1, 1, 1, -1)
+                    if overlap_w > 0 and x_out_end < W_out:
+                        blend_w = min(overlap_w, tile_w_actual)
+                        weight[:, :, :, -blend_w:] *= (1.0 - ramp_w[:blend_w]).view(1, 1, 1, -1)
+                    
+                    # Accumulate weighted tile
+                    result[:, :, y_out:y_out+tile_h_actual, x_out:x_out+tile_w_actual] += tile_sample * weight
+                    count[:, :, y_out:y_out+tile_h_actual, x_out:x_out+tile_w_actual] += weight
+                    
+                    # Free memory
+                    del tile_sample, weight
+                    torch.cuda.empty_cache()
+            
+            # Normalize by weights
+            sample_item = result / count.clamp(min=1e-8)
+            batch_samples.append(sample_item)
+            
+            # Free memory
+            del result, count
+            torch.cuda.empty_cache()
+        
+        # Stack batch
+        sample = torch.stack(batch_samples, dim=0)
         return WanVAEDecoderOutput(sample=sample)
     
     def clear_cache(self):
