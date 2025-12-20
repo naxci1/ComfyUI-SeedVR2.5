@@ -669,16 +669,31 @@ class WanVAE:
         """
         videos: A list of videos each with shape [C, T, H, W].
         """
-        device_type = 'cuda' if self.device.type == 'cuda' else self.device.type
-        with amp.autocast(device_type=device_type, enabled=True, dtype=self.dtype):
+        # Use CUDA autocast for compatibility with PyTorch 2.7.1
+        if self.device.type == 'cuda':
+            with torch.cuda.amp.autocast(enabled=True, dtype=self.dtype):
+                return [
+                    self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
+                    for u in videos
+                ]
+        else:
+            # For non-CUDA devices, run without autocast
             return [
                 self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
                 for u in videos
             ]
 
     def decode(self, zs):
-        device_type = 'cuda' if self.device.type == 'cuda' else self.device.type
-        with amp.autocast(device_type=device_type, enabled=True, dtype=self.dtype):
+        # Use CUDA autocast for compatibility with PyTorch 2.7.1
+        if self.device.type == 'cuda':
+            with torch.cuda.amp.autocast(enabled=True, dtype=self.dtype):
+                return [
+                    self.model.decode(u.unsqueeze(0),
+                                      self.scale).float().clamp_(-1, 1).squeeze(0)
+                    for u in zs
+                ]
+        else:
+            # For non-CUDA devices, run without autocast
             return [
                 self.model.decode(u.unsqueeze(0),
                                   self.scale).float().clamp_(-1, 1).squeeze(0)
