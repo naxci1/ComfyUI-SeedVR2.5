@@ -853,6 +853,8 @@ class WanVAEWrapper(nn.Module):
         """
         Encode with tiling for memory efficiency
         
+        Memory-optimized: doesn't pre-allocate full output tensor, builds incrementally on CPU
+        
         Args:
             x: Input tensor (B, C, T, H, W)
             tile_size: Tile size (H, W)
@@ -871,11 +873,11 @@ class WanVAEWrapper(nn.Module):
         latent_h = H // 8
         latent_w = W // 8
         
-        # Initialize output tensor
-        latents = torch.zeros((B, 16, T, latent_h, latent_w), 
-                             device=x.device, dtype=x.dtype)
-        weights = torch.zeros((B, 16, T, latent_h, latent_w), 
-                            device=x.device, dtype=x.dtype)
+        # MEMORY FIX: Build output on CPU to avoid OOM, accumulate tiles
+        latents_cpu = torch.zeros((B, 16, T // 4, latent_h, latent_w), 
+                                  device='cpu', dtype=torch.float32)
+        weights_cpu = torch.zeros((B, 16, T // 4, latent_h, latent_w), 
+                                  device='cpu', dtype=torch.float32)
         
         # Process tiles
         for i in range(0, H, stride_h):
@@ -894,27 +896,36 @@ class WanVAEWrapper(nn.Module):
                 tile_latents = self.vae.encode(batch_list)
                 tile_latents = torch.stack(tile_latents, dim=0)
                 
+                # Move to CPU immediately to free VRAM
+                tile_latents_cpu = tile_latents.cpu()
+                del tile_latents
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
                 # Calculate positions in latent space
                 lat_i = i // 8
                 lat_j = j // 8
-                lat_h = tile_latents.shape[3]
-                lat_w = tile_latents.shape[4]
+                lat_h = tile_latents_cpu.shape[3]
+                lat_w = tile_latents_cpu.shape[4]
                 
                 # Add to output with blending weights
-                weight = torch.ones_like(tile_latents)
-                latents[:, :, :, lat_i:lat_i+lat_h, lat_j:lat_j+lat_w] += tile_latents * weight
-                weights[:, :, :, lat_i:lat_i+lat_h, lat_j:lat_j+lat_w] += weight
+                weight = torch.ones_like(tile_latents_cpu)
+                latents_cpu[:, :, :, lat_i:lat_i+lat_h, lat_j:lat_j+lat_w] += tile_latents_cpu * weight
+                weights_cpu[:, :, :, lat_i:lat_i+lat_h, lat_j:lat_j+lat_w] += weight
         
         # Normalize by weights
-        latents = latents / (weights + 1e-8)
+        latents_cpu = latents_cpu / (weights_cpu + 1e-8)
         
-        return latents
+        # Move back to device only at the end
+        return latents_cpu.to(x.device)
     
     def decode_tiled(self, z: torch.Tensor,
                      tile_size: Tuple[int, int] = (1024, 1024),
                      tile_overlap: Tuple[int, int] = (128, 128)) -> torch.Tensor:
         """
         Decode with tiling for memory efficiency
+        
+        Memory-optimized: doesn't pre-allocate full output tensor, builds incrementally on CPU
         
         Args:
             z: Latent tensor (B, Z, T, H_lat, W_lat)
@@ -934,13 +945,14 @@ class WanVAEWrapper(nn.Module):
         stride_h = tile_h_lat - overlap_h_lat
         stride_w = tile_w_lat - overlap_w_lat
         
-        # Calculate output dimensions (8x upsampling)
+        # Calculate output dimensions (8x upsampling, 4x temporal upsampling)
         H = H_lat * 8
         W = W_lat * 8
+        T_out = T * 4
         
-        # Initialize output tensor
-        decoded = torch.zeros((B, 3, T, H, W), device=z.device, dtype=z.dtype)
-        weights = torch.zeros((B, 3, T, H, W), device=z.device, dtype=z.dtype)
+        # MEMORY FIX: Build output on CPU to avoid OOM, accumulate tiles
+        decoded_cpu = torch.zeros((B, 3, T_out, H, W), device='cpu', dtype=torch.float32)
+        weights_cpu = torch.zeros((B, 3, T_out, H, W), device='cpu', dtype=torch.float32)
         
         # Process tiles
         for i in range(0, H_lat, stride_h):
@@ -959,21 +971,28 @@ class WanVAEWrapper(nn.Module):
                 tile_decoded = self.vae.decode(batch_list)
                 tile_decoded = torch.stack(tile_decoded, dim=0)
                 
+                # Move to CPU immediately to free VRAM
+                tile_decoded_cpu = tile_decoded.cpu()
+                del tile_decoded
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
                 # Calculate positions in pixel space
                 pix_i = i * 8
                 pix_j = j * 8
-                pix_h = tile_decoded.shape[3]
-                pix_w = tile_decoded.shape[4]
+                pix_h = tile_decoded_cpu.shape[3]
+                pix_w = tile_decoded_cpu.shape[4]
                 
                 # Add to output with blending weights
-                weight = torch.ones_like(tile_decoded)
-                decoded[:, :, :, pix_i:pix_i+pix_h, pix_j:pix_j+pix_w] += tile_decoded * weight
-                weights[:, :, :, pix_i:pix_i+pix_h, pix_j:pix_j+pix_w] += weight
+                weight = torch.ones_like(tile_decoded_cpu)
+                decoded_cpu[:, :, :, pix_i:pix_i+pix_h, pix_j:pix_j+pix_w] += tile_decoded_cpu * weight
+                weights_cpu[:, :, :, pix_i:pix_i+pix_h, pix_j:pix_j+pix_w] += weight
         
         # Normalize by weights
-        decoded = decoded / (weights + 1e-8)
+        decoded_cpu = decoded_cpu / (weights_cpu + 1e-8)
         
-        return decoded
+        # Move back to device only at the end
+        return decoded_cpu.to(z.device)
     
     def clear_cache(self):
         """Clear internal cache"""
