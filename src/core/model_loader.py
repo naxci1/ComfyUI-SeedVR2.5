@@ -517,6 +517,12 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torc
     from .model_configuration import apply_model_specific_config
     model = apply_model_specific_config(model, runner, config, is_dit, debug)
     
+    # Assign the (possibly wrapped) model back to runner
+    if is_dit:
+        runner.dit = model
+    else:
+        runner.vae = model
+    
     debug.end_timer(f"{model_type}_materialize", f"{model_type_upper} materialized")
     
     # Clean up checkpoint paths (no longer needed after weights are loaded)
