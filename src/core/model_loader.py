@@ -517,6 +517,12 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torc
     from .model_configuration import apply_model_specific_config
     model = apply_model_specific_config(model, runner, config, is_dit, debug)
     
+    # Assign the (possibly wrapped) model back to runner
+    if is_dit:
+        runner.dit = model
+    else:
+        runner.vae = model
+    
     debug.end_timer(f"{model_type}_materialize", f"{model_type_upper} materialized")
     
     # Clean up checkpoint paths (no longer needed after weights are loaded)
@@ -806,6 +812,15 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                           debug: Optional['Debug'] = None) -> torch.nn.Module:
     """Load standard (non-GGUF) weights into model."""
     debug.start_timer(f"{model_type_lower}_state_apply")
+    
+    # Check if this is a VAE and if it's WAN2.1
+    is_vae = model_type.lower() == "vae"
+    if is_vae:
+        from ..vae.wan2_1_wrapper import Wan21VAEWrapper
+        is_wan21 = Wan21VAEWrapper.detect_wan21_state_dict(state)
+        if is_wan21:
+            debug.log("Detected WAN2.1 VAE model, will wrap after loading", category=model_type_lower)
+    
     model.load_state_dict(state, strict=False, assign=True)
     
     action = "materialized" if used_meta else "applied"
@@ -815,6 +830,11 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
         debug.log(f"{model_type} materialized directly from meta with loaded weights", category=model_type_lower)
     else:
         debug.log(f"{model_type} weights applied", category=model_type_lower)
+    
+    # Wrap with WAN2.1 wrapper if detected
+    if is_vae and is_wan21:
+        from ..vae.wan2_1_wrapper import wrap_vae_if_wan21
+        model = wrap_vae_if_wan21(model, state_dict=state, config=None)
     
     return model
 

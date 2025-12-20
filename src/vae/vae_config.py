@@ -114,20 +114,26 @@ class VAEConfigManager:
         model_name="Wan2.1-VAE",
         model_path="models/vae/wan2.1/vae.safetensors",
         architecture=VAEArchitectureConfig(
-            latent_channels=4,
+            latent_channels=16,  # WAN2.1 uses 16-channel latent space
             latent_height=64,
             latent_width=64,
-            scaling_factor=0.18215,
+            scaling_factor=0.18215,  # WAN2.1-specific scaling factor
             encoder_channels=[3, 64, 128, 256, 512],
             decoder_channels=[512, 256, 128, 64, 3],
         ),
         encoding=VAEEncodingConfig(
             encoding_type=VAEEncodingType.STANDARD,
-            precision="fp32",
-            use_tiling=False,
+            precision="bf16",  # Prefer bfloat16 for WAN2.1
+            use_tiling=True,  # Enable tiling by default for memory efficiency
         ),
         checkpoint_hash=None,
         enable_flash_attention=True,
+        custom_params={
+            'temporal_compression': 4,  # 4x temporal compression
+            'spatial_compression': 8,   # 8x spatial compression
+            'causal': True,              # Causal temporal convolution
+            'frame_constraint': '4n+1',  # T = 4n + 1 constraint
+        }
     )
     
     # Predefined configurations for Wan2.2
