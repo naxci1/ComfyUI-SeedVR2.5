@@ -157,7 +157,14 @@ class VideoDiffusionInfer():
                 # Skip autocast on MPS (only supports bf16, unified memory = no benefit)
                 # Instead, explicitly convert input to model dtype
                 if vae_dtype != sample.dtype:
-                    if device.type == 'mps':
+                    # Determine autocast device type - handle 'meta' device fallback
+                    # If model is on 'meta', we can't infer anyway, but let's assume it might be materialized
+                    # or this is a dry run. If 'meta', fallback to get_device().type or 'cuda'/'cpu'
+                    autocast_device_type = device.type
+                    if autocast_device_type == 'meta':
+                        autocast_device_type = get_device().type
+
+                    if autocast_device_type == 'mps':
                         # MPS: explicit dtype conversion instead of autocast
                         sample = sample.to(vae_dtype)
                         if use_sample:
@@ -167,7 +174,7 @@ class VideoDiffusionInfer():
                             latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
                                                 tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
                     else:
-                        with torch.autocast(device.type, sample.dtype, enabled=True):
+                        with torch.autocast(autocast_device_type, sample.dtype, enabled=True):
                             if use_sample:
                                 latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size, 
                                                         tile_overlap=self.encode_tile_overlap).latent
@@ -243,7 +250,12 @@ class VideoDiffusionInfer():
                 # Use autocast if VAE dtype differs from latent dtype
                 # Skip autocast on MPS (only supports bf16, unified memory = no benefit)
                 if vae_dtype != latent.dtype:
-                    if device.type == 'mps':
+                    # Determine autocast device type - handle 'meta' device fallback
+                    autocast_device_type = device.type
+                    if autocast_device_type == 'meta':
+                        autocast_device_type = get_device().type
+
+                    if autocast_device_type == 'mps':
                         # MPS: explicit dtype conversion instead of autocast
                         latent = latent.to(vae_dtype)
                         sample = self.vae.decode(
@@ -252,7 +264,7 @@ class VideoDiffusionInfer():
                             tile_overlap=self.decode_tile_overlap
                         ).sample
                     else:
-                        with torch.autocast(device.type, latent.dtype, enabled=True):
+                        with torch.autocast(autocast_device_type, latent.dtype, enabled=True):
                             sample = self.vae.decode(
                                 latent,
                                 tiled=self.decode_tiled, tile_size=self.decode_tile_size,
