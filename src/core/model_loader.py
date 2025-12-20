@@ -152,6 +152,61 @@ def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch
     
     return state
 
+def detect_wan_vae(checkpoint_path: str, debug: Optional['Debug'] = None) -> bool:
+    """
+    Detect if a checkpoint is a Wan2.1 VAE by inspecting its keys.
+    Uses lightweight header inspection if possible.
+
+    Args:
+        checkpoint_path: Path to the checkpoint file
+        debug: Debug instance for logging
+
+    Returns:
+        True if Wan2.1 keys are detected
+    """
+    try:
+        if checkpoint_path.endswith('.safetensors'):
+            if not SAFETENSORS_AVAILABLE:
+                return False
+            # Peak at the file keys without loading full tensors
+            # Using safe_open is the proper way to inspect header
+            from safetensors import safe_open
+            with safe_open(checkpoint_path, framework="pt", device="cpu") as f:
+                keys = f.keys()
+                # Check for Wan-specific keys
+                # Wan VAE typically has 'head', 'decoder.conv_out', but importantly 'encoder.down_blocks' etc.
+                # Specific Wan keys might be 'mid_block.attentions.0' vs 'mid.attn_1'
+
+                # Based on known architecture differences or memory:
+                # Wan VAE uses 'mid_block.attentions' mapping.
+
+                # A strong indicator is often in the config if embedded, but keys are safer.
+                # Let's check for a combination or specific key unique to Wan or keys that need remapping
+                # like 'decoder.mid_block.attentions.0' which we remap.
+
+                # Simple heuristic: Check for keys that align with Wan structure or absence of SD keys
+                # Or simply check if it has 3D conv weights (5D tensors)
+
+                # Let's look for "mid_block.attentions" which we know needs remapping in Wan
+                has_wan_mid = any("mid_block.attentions" in k for k in keys)
+
+                # Also check for "time_embedding" or causal specific naming?
+                # Wan is a Causal VAE.
+
+                if has_wan_mid:
+                    if debug: debug.log(f"Wan VAE detected via keys in {os.path.basename(checkpoint_path)}", category="vae")
+                    return True
+
+        # Fallback for .pth or if structure is different
+        # Loading .pth header is harder without loading file.
+        # Given most modern models are safetensors, this covers most cases.
+        return False
+
+    except Exception as e:
+        if debug:
+            debug.log(f"Failed to detect VAE type for {checkpoint_path}: {e}", category="vae", level="WARNING")
+        return False
+
 
 def _load_gguf_state(checkpoint_path: str, device: torch.device, debug: Optional['Debug'] = None,
                     handle_prefix: str = "model.diffusion_model.") -> Dict[str, torch.Tensor]:

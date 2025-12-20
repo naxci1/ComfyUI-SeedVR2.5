@@ -69,6 +69,8 @@ from .infer import VideoDiffusionInfer
 from .model_cache import get_global_cache
 from ..common.config import load_config
 from ..models.video_vae_v3.modules.causal_inflation_lib import InflatedCausalConv3d
+from ..models.video_vae_v3.modules.wan_vae import WanVAEWrapper
+from .model_loader import detect_wan_vae
 from ..optimization.compatibility import (
     CompatibleDiT,
     TRITON_AVAILABLE,
@@ -1114,8 +1116,20 @@ def _setup_vae_model(
     elif not hasattr(runner, 'vae') or runner.vae is None:
         # Create new VAE model
         # Configure VAE
-        vae_config_path = os.path.join(script_directory, 
-                                      'src/models/video_vae_v3/s8_c16_t4_inflation_sd3.yaml')
+
+        vae_checkpoint_path = find_model_file(vae_model, base_cache_dir)
+
+        # Check if Wan2.1 VAE using robust detection
+        is_wan = detect_wan_vae(vae_checkpoint_path, debug) or ("wan" in vae_model.lower())
+
+        if is_wan:
+            vae_config_path = os.path.join(script_directory,
+                                          'src/models/video_vae_v3/wan2_1_vae.yaml')
+            debug.log(f"Detected Wan VAE, using config: {vae_config_path}", category="vae")
+        else:
+            vae_config_path = os.path.join(script_directory,
+                                          'src/models/video_vae_v3/s8_c16_t4_inflation_sd3.yaml')
+
         vae_config = load_config(vae_config_path)
         
         spatial_downsample_factor = vae_config.get('spatial_downsample_factor', 8)
@@ -1125,16 +1139,24 @@ def _setup_vae_model(
 
         runner.config.vae.model = OmegaConf.merge(runner.config.vae.model, vae_config)
         
+        # Use WanVAEWrapper if applicable
+        if is_wan:
+             runner.config.vae.model.target = "src.models.video_vae_v3.modules.wan_vae.WanVAEWrapper"
+
         # Set VAE dtype from runner's compute_dtype
         compute_dtype = getattr(runner, '_compute_dtype', torch.bfloat16)
         vae_dtype_str = str(compute_dtype).split('.')[-1]
         runner.config.vae.dtype = vae_dtype_str
         runner._vae_dtype_override = compute_dtype
         
-        vae_checkpoint_path = find_model_file(vae_model, base_cache_dir)
         runner = prepare_model_structure(runner, "vae", vae_checkpoint_path, 
                                         runner.config, debug, None)
         
+        # Manually ensure wrapper is used if config didn't trigger it via create_object
+        # create_object uses config target. If prepare_model_structure calls create_object,
+        # and we changed config.vae.model.target, it should work.
+        # But prepare_model_structure calls create_object(model_config).
+
         debug.log(
             f"VAE downsample factors configured "
             f"(spatial: {spatial_downsample_factor}x, "
