@@ -6,7 +6,7 @@ Central registry for model definitions, repositories, and metadata
 import os
 from typing import List, Optional
 from dataclasses import dataclass
-from .constants import get_all_model_files
+from .constants import get_all_model_files, get_base_cache_dir, is_supported_model_file
 
 # Model class imports using relative imports
 from ..models.dit_3b.nadit import NaDiT as NaDiT3B
@@ -27,8 +27,9 @@ class ModelInfo:
     category: str = "dit" # 'model' or 'vae'
     precision: str = "fp16" # 'fp16', 'fp8_e4m3fn', 'Q4_K_M', etc.
     size: str = "3B" # '3B', '7B', etc.
-    variant: Optional[str] = None # 'sharp', etc.
+    variant: Optional[str] = None # 'sharp', 'wan2.2', etc.
     sha256: Optional[str] = None # Cached hash
+    description: Optional[str] = None # Human-readable description
 
 # Model registry with metadata
 MODEL_REGISTRY = {
@@ -48,8 +49,26 @@ MODEL_REGISTRY = {
     "seedvr2_ema_7b_sharp_fp8_e4m3fn_mixed_block35_fp16.safetensors": ModelInfo(repo="AInVFX/SeedVR2_comfyUI", size="7B", precision="fp8_e4m3fn_mixed_block35_fp16", variant="sharp", sha256="0d2c5b8be0fda94351149c5115da26aef4f4932a7a2a928c6f184dda9186e0be"),
     "seedvr2_ema_7b_sharp_fp16.safetensors": ModelInfo(size="7B", precision="fp16", variant="sharp", sha256="20a93e01ff24beaeebc5de4e4e5be924359606c356c9c51509fba245bd2d77dd"),
     
-    # VAE models
-    "ema_vae_fp16.safetensors": ModelInfo(category="vae", precision="fp16", sha256="20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1"),
+    # VAE models - Standard SeedVR2 VAE
+    "ema_vae_fp16.safetensors": ModelInfo(category="vae", precision="fp16", sha256="20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1", description="SeedVR2 VAE - FP16"),
+    
+    # VAE models - Wan2.2 3D Causal VAE
+    "wan2.2_vae_fp16.safetensors": ModelInfo(
+        repo="Wan-AI/Wan2.2-VAE",
+        category="vae",
+        precision="fp16",
+        variant="wan2.2",
+        sha256=None,  # Will be set once official model is available
+        description="Wan2.2 3D Causal VAE - FP16 (Auto-download supported)"
+    ),
+    "wan2.2_vae_bf16.safetensors": ModelInfo(
+        repo="Wan-AI/Wan2.2-VAE",
+        category="vae",
+        precision="bf16",
+        variant="wan2.2",
+        sha256=None,
+        description="Wan2.2 3D Causal VAE - BF16 (Auto-download supported)"
+    ),
 }
 
 # Configuration constants
@@ -86,6 +105,67 @@ def get_available_dit_models() -> List[str]:
     return model_list
 
 def get_available_vae_models() -> List[str]:
-    """Get all available VAE models from the registry"""
+    """
+    Get all available VAE models from the registry and discovered on disk.
+    
+    This function:
+    1. Returns all VAE models from MODEL_REGISTRY
+    2. Scans the model directories for additional VAE files
+    3. Returns a combined list for the dropdown menu
+    """
+    # Start with registry models
     model_list = get_default_models("vae")
-    return model_list
+    
+    try:
+        # Get all model files from all paths
+        model_files = get_all_model_files()
+        
+        # Find VAE-like files that aren't in registry
+        # VAE files typically have 'vae' in the name
+        for filename in model_files:
+            if filename not in model_list:
+                # Check if it looks like a VAE file
+                lower_name = filename.lower()
+                if 'vae' in lower_name:
+                    model_list.append(filename)
+                elif filename in MODEL_REGISTRY:
+                    # Only add if it's a VAE in the registry
+                    info = MODEL_REGISTRY.get(filename)
+                    if info and info.category == "vae":
+                        model_list.append(filename)
+        
+        # Also check cache directory for downloaded Wan2.2 VAE
+        cache_dir = get_base_cache_dir()
+        if os.path.exists(cache_dir):
+            for filename in os.listdir(cache_dir):
+                if is_supported_model_file(filename):
+                    if filename not in model_list:
+                        lower_name = filename.lower()
+                        if 'vae' in lower_name:
+                            model_list.append(filename)
+    except Exception:
+        pass
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_list = []
+    for model in model_list:
+        if model not in seen:
+            seen.add(model)
+            unique_list.append(model)
+    
+    return unique_list
+
+
+def get_model_info(model_name: str) -> Optional[ModelInfo]:
+    """Get model info from registry"""
+    return MODEL_REGISTRY.get(model_name)
+
+
+def is_wan22_vae(model_name: str) -> bool:
+    """Check if a model is a Wan2.2 VAE"""
+    info = MODEL_REGISTRY.get(model_name)
+    if info and info.variant == "wan2.2":
+        return True
+    # Also check by filename pattern
+    return "wan2.2" in model_name.lower()

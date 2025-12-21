@@ -17,6 +17,17 @@ from .wan22_handler import (  # noqa: F401
     create_wan22_causal_vae,
     load_wan22_vae_gguf,
 )
+from .wan22_downloader import (  # noqa: F401
+    ensure_wan22_vae_exists,
+    get_wan22_vae_models,
+    get_wan22_vae_info,
+    check_wan22_vae_status,
+    get_or_download_wan22_vae,
+    WAN22_VAE_MODELS,
+    DEFAULT_WAN22_VAE,
+    Wan22VAEVariant,
+    Wan22VAEModel,
+)
 
 __all__ = [
     # Wan2.1 VAE
@@ -32,6 +43,16 @@ __all__ = [
     "Wan22PrecisionMode",
     "create_wan22_causal_vae",
     "load_wan22_vae_gguf",
+    # Wan2.2 Auto-Download
+    "ensure_wan22_vae_exists",
+    "get_wan22_vae_models",
+    "get_wan22_vae_info",
+    "check_wan22_vae_status",
+    "get_or_download_wan22_vae",
+    "WAN22_VAE_MODELS",
+    "DEFAULT_WAN22_VAE",
+    "Wan22VAEVariant",
+    "Wan22VAEModel",
     # Configuration
     "VAEConfigManager",
     "VAEModelConfig",
