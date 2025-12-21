@@ -4,6 +4,7 @@ Includes patchify/unpatchify operations, spatial downsampling/upsampling,
 and the main Wan2_2_VAE wrapper class with proper normalization.
 """
 
+import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -322,8 +323,11 @@ class Wan2_2_VAE(nn.Module):
         if x.device.type == "cpu" and torch.cuda.is_available():
             try:
                 x = x.pin_memory()
-            except (RuntimeError, AttributeError):
-                pass
+            except RuntimeError as err:
+                warnings.warn(
+                    f"Pinning VAE input failed; continuing without pinned memory: {err}",
+                    RuntimeWarning
+                )
         if x.dim() >= 4:
             x = x.contiguous(memory_format=torch.channels_last)
         

@@ -104,6 +104,8 @@ class FlashAttentionVarlen(nn.Module):
         self.attention_mode = attention_mode
         self.compute_dtype = compute_dtype
         self._compiled_forward = None
+        self._compile_checked = False
+        self._maybe_compile()
 
     def tflops(self, args, kwargs, output) -> float:
         cu_seqlens_q = kwargs["cu_seqlens_q"]
@@ -114,36 +116,47 @@ class FlashAttentionVarlen(nn.Module):
         return h * (4 * d * (seqlens_q * seqlens_k).sum())
 
     def forward(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs):
-        if self._compiled_forward is None and hasattr(torch, "compile") and os.environ.get("SEEDVR2_COMPILE_ATTENTION") == "1":
-            try:
-                self._compiled_forward = torch.compile(self._forward_impl, mode="max-autotune")
-            except Exception:
-                self._compiled_forward = False
-        impl = self._forward_impl if self._compiled_forward in (None, False) else self._compiled_forward
+        impl = self._forward_impl
+        if self._compiled_forward not in (None, False):
+            impl = self._compiled_forward
         return impl(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs)
 
-    def _over_budget(self) -> bool:
-        """Simple VRAM budget check for SageAttention paths."""
-        budget_mb = float(os.environ.get("SEEDVR2_VRAM_BUDGET_MB", "0") or 0)
+    def _maybe_compile(self):
+        if self._compile_checked:
+            return
+        self._compile_checked = True
+        if hasattr(torch, "compile") and os.environ.get("SEEDVR2_COMPILE_ATTENTION") == "1":
+            try:
+                self._compiled_forward = torch.compile(self._forward_impl, mode="max-autotune")
+            except (RuntimeError, TypeError):
+                self._compiled_forward = False
+
+    def _low_memory(self) -> bool:
+        """Return True when free VRAM drops below the configured budget threshold."""
+        raw_budget = os.environ.get("SEEDVR2_VRAM_BUDGET_MB") or "0"
+        try:
+            budget_mb = float(raw_budget)
+        except ValueError:
+            budget_mb = 0.0
         if budget_mb <= 0 or not torch.cuda.is_available():
             return False
         try:
             free, _ = torch.cuda.mem_get_info()
             return (free / (1024 ** 2)) < budget_mb
-        except Exception:
+        except (RuntimeError, torch.cuda.CudaError):
             return False
 
-    def _fallback_from_sage(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs):
+    def _fallback_from_sage(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, try_sa2: bool, **kwargs):
         """Fallback chain: SA2 -> FlashAttn2 -> PyTorch SDPA."""
-        try:
-            if self.attention_mode != 'sageattn_2':
+        if try_sa2:
+            try:
                 return call_sage_attn_2_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs)
-        except Exception:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            except (RuntimeError, ValueError, torch.cuda.OutOfMemoryError):
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         try:
             return call_flash_attn_2_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs)
-        except Exception:
+        except (RuntimeError, ValueError, torch.cuda.OutOfMemoryError):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         return pytorch_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs)
@@ -163,7 +176,7 @@ class FlashAttentionVarlen(nn.Module):
                     q, k, v, cu_seqlens_q, cu_seqlens_k, 
                     max_seqlen_q, max_seqlen_k, **kwargs
                 )
-            except Exception:
+            except (RuntimeError, ValueError, torch.cuda.OutOfMemoryError):
                 return pytorch_varlen_attention(
                     q, k, v, cu_seqlens_q, cu_seqlens_k,
                     max_seqlen_q, max_seqlen_k, **kwargs
@@ -174,35 +187,35 @@ class FlashAttentionVarlen(nn.Module):
                     q, k, v, cu_seqlens_q, cu_seqlens_k, 
                     max_seqlen_q, max_seqlen_k, **kwargs
                 )
-            except Exception:
+            except (RuntimeError, ValueError, torch.cuda.OutOfMemoryError):
                 return pytorch_varlen_attention(
                     q, k, v, cu_seqlens_q, cu_seqlens_k,
                     max_seqlen_q, max_seqlen_k, **kwargs
                 )
         elif self.attention_mode == 'sageattn_3':
-            if self._over_budget():
-                return self._fallback_from_sage(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs)
+            if self._low_memory():
+                return self._fallback_from_sage(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, True, **kwargs)
             try:
                 return call_sage_attn_3_varlen(
                     q, k, v, cu_seqlens_q, cu_seqlens_k,
                     max_seqlen_q, max_seqlen_k, **kwargs
                 )
-            except RuntimeError:
+            except (RuntimeError, ValueError, torch.cuda.OutOfMemoryError):
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                return self._fallback_from_sage(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs)
+                return self._fallback_from_sage(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, True, **kwargs)
         elif self.attention_mode == 'sageattn_2':
-            if self._over_budget():
-                return self._fallback_from_sage(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs)
+            if self._low_memory():
+                return self._fallback_from_sage(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, False, **kwargs)
             try:
                 return call_sage_attn_2_varlen(
                     q, k, v, cu_seqlens_q, cu_seqlens_k,
                     max_seqlen_q, max_seqlen_k, **kwargs
                 )
-            except RuntimeError:
+            except (RuntimeError, ValueError, torch.cuda.OutOfMemoryError):
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                return self._fallback_from_sage(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs)
+                return self._fallback_from_sage(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, False, **kwargs)
         else:
             # PyTorch SDPA
             return pytorch_varlen_attention(
