@@ -48,8 +48,8 @@ WAN22_VAE_MODELS: Dict[str, Wan22VAEModel] = {
         repo="Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
         remote_path="split_files/vae/wan2.2_vae.safetensors",
         precision="fp16",
-        sha256=None,  # Can be added for integrity check
-        description="Wan2.2 3D Causal VAE - Official ComfyUI Repackaged",
+        sha256=None,
+        description="Wan2.2 3D Causal VAE",
         file_size_gb=0.335,
     ),
 }

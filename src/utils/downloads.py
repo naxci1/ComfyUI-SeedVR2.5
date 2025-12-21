@@ -234,8 +234,9 @@ def download_weight(dit_model: str, vae_model: str, model_dir: Optional[str] = N
                     del cache[filename]
                     save_validation_cache(cache, cache_dir)
         
-        # Download file
-        url = HUGGINGFACE_BASE_URL.format(repo=repo, filename=filename)
+        # Download file - use remote_path if available, otherwise use filename
+        remote_filename = getattr(model_info, 'remote_path', None) or filename
+        url = HUGGINGFACE_BASE_URL.format(repo=repo, filename=remote_filename)
         temp_file = f"{filepath}.download"
         
         if os.path.exists(temp_file) and debug:

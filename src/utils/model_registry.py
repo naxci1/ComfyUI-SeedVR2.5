@@ -53,14 +53,14 @@ MODEL_REGISTRY = {
     # VAE models - Standard SeedVR2 VAE
     "ema_vae_fp16.safetensors": ModelInfo(category="vae", precision="fp16", sha256="20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1", description="SeedVR2 VAE - FP16"),
     
-    # VAE models - Wan2.2 3D Causal VAE (Official ComfyUI Repackaged)
+    # VAE models - Wan2.2 3D Causal VAE (Official Comfy-Org repository)
     "wan2.2_vae.safetensors": ModelInfo(
         repo="Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
         category="vae",
         precision="fp16",
         variant="wan2.2",
         sha256=None,
-        description="Wan2.2 3D Causal VAE - Official ComfyUI Repackaged",
+        description="Wan2.2 3D Causal VAE",
         remote_path="split_files/vae/wan2.2_vae.safetensors"
     ),
 }
