@@ -25,6 +25,11 @@ from einops import rearrange
 
 logger = logging.getLogger(__name__)
 
+# Constants
+EPSILON = 1e-8  # Small value to prevent division by zero
+DEFAULT_LATENT_SCALE_FACTOR = 4  # Default spatial downsampling factor for latent space
+MIN_LATENT_TILE_SIZE = 16  # Minimum tile size in latent space
+
 
 class Wan22PrecisionMode(Enum):
     """Supported precision modes for Wan2.2 VAE"""
@@ -796,7 +801,7 @@ class Wan22CausalVAE3D(nn.Module):
                 weight_sum[:, :, :, lh_start:lh_end, lw_start:lw_end] += tile_weight
         
         # Normalize by weights
-        latent = latent_sum / (weight_sum + 1e-8)
+        latent = latent_sum / (weight_sum + EPSILON)
         
         return {
             "latent": latent,
@@ -867,9 +872,9 @@ class Wan22CausalVAE3D(nn.Module):
         b, c, f, h, w = z.shape
         config = self.tiling_config
         
-        # Calculate spatial tile size in latent space
-        latent_spatial_tile = max(16, config.spatial_tile_size // 4)  # Rough estimate
-        latent_spatial_overlap = max(4, config.spatial_overlap // 4)
+        # Calculate spatial tile size in latent space using configurable scale factor
+        latent_spatial_tile = max(MIN_LATENT_TILE_SIZE, config.spatial_tile_size // DEFAULT_LATENT_SCALE_FACTOR)
+        latent_spatial_overlap = max(MIN_LATENT_TILE_SIZE // 4, config.spatial_overlap // DEFAULT_LATENT_SCALE_FACTOR)
         
         if h <= latent_spatial_tile and w <= latent_spatial_tile:
             # Input is small enough, use direct decoding
@@ -934,7 +939,7 @@ class Wan22CausalVAE3D(nn.Module):
                 weight_sum[:, :, :, oh_start:oh_end, ow_start:ow_end] += tile_weight
         
         # Normalize by weights
-        sample = output_sum / (weight_sum + 1e-8)
+        sample = output_sum / (weight_sum + EPSILON)
         
         return {"sample": sample}
     
@@ -1036,6 +1041,8 @@ def load_wan22_vae_gguf(
     
     # Load and dequantize tensors
     loaded_count = 0
+    failed_tensors = []
+    
     for tensor in reader.tensors:
         tensor_name = tensor.name
         
@@ -1045,22 +1052,38 @@ def load_wan22_vae_gguf(
         if param_name not in model_state:
             continue
         
-        # Convert GGUF tensor to PyTorch
-        torch_tensor = torch.from_numpy(tensor.data)
-        
-        # Dequantize if needed
-        if tensor.tensor_type not in {gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16}:
-            # Use GGUF's built-in dequantization
-            dequantized = gguf.quants.dequantize(tensor.data, tensor.tensor_type)
-            torch_tensor = torch.from_numpy(dequantized)
-        
-        # Reshape and convert dtype
-        target_shape = model_state[param_name].shape
-        torch_tensor = torch_tensor.view(target_shape).to(dtype)
-        
-        # Set parameter
-        model_state[param_name] = torch_tensor
-        loaded_count += 1
+        try:
+            # Convert GGUF tensor to PyTorch
+            torch_tensor = torch.from_numpy(tensor.data)
+            
+            # Dequantize if needed
+            if tensor.tensor_type not in {gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16}:
+                try:
+                    # Use GGUF's built-in dequantization
+                    dequantized = gguf.quants.dequantize(tensor.data, tensor.tensor_type)
+                    torch_tensor = torch.from_numpy(dequantized)
+                except Exception as dequant_error:
+                    logger.warning(
+                        f"Failed to dequantize tensor '{param_name}' with type {tensor.tensor_type}: {dequant_error}. "
+                        "Falling back to raw tensor data."
+                    )
+                    # Fallback: use raw tensor data and hope for the best
+                    torch_tensor = torch.from_numpy(tensor.data).float()
+            
+            # Reshape and convert dtype
+            target_shape = model_state[param_name].shape
+            torch_tensor = torch_tensor.view(target_shape).to(dtype)
+            
+            # Set parameter
+            model_state[param_name] = torch_tensor
+            loaded_count += 1
+            
+        except Exception as e:
+            failed_tensors.append((param_name, str(e)))
+            logger.warning(f"Failed to load tensor '{param_name}': {e}")
+    
+    if failed_tensors:
+        logger.warning(f"Failed to load {len(failed_tensors)} tensors. First few: {failed_tensors[:5]}")
     
     # Load state dict
     model.load_state_dict(model_state)
