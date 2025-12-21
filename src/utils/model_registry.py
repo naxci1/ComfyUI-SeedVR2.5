@@ -31,6 +31,7 @@ class ModelInfo:
     sha256: Optional[str] = None # Cached hash
     description: Optional[str] = None # Human-readable description
     remote_path: Optional[str] = None # Path within repo if different from filename
+    compatible: bool = True # Whether this model is compatible with SeedVR2 architecture
 
 # Model registry with metadata
 MODEL_REGISTRY = {
@@ -54,14 +55,16 @@ MODEL_REGISTRY = {
     "ema_vae_fp16.safetensors": ModelInfo(category="vae", precision="fp16", sha256="20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1", description="SeedVR2 VAE - FP16"),
     
     # VAE models - Wan2.2 3D Causal VAE (Official Comfy-Org repository)
+    # NOTE: Wan2.2 VAE is NOT compatible with SeedVR2 - different architecture
     "wan2.2_vae.safetensors": ModelInfo(
         repo="Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
         category="vae",
         precision="fp16",
         variant="wan2.2",
         sha256=None,
-        description="Wan2.2 3D Causal VAE",
-        remote_path="split_files/vae/wan2.2_vae.safetensors"
+        description="Wan2.2 3D Causal VAE (INCOMPATIBLE with SeedVR2)",
+        remote_path="split_files/vae/wan2.2_vae.safetensors",
+        compatible=False  # Wan2.2 VAE has different architecture than SeedVR2 VAE
     ),
 }
 
@@ -98,17 +101,27 @@ def get_available_dit_models() -> List[str]:
     
     return model_list
 
-def get_available_vae_models() -> List[str]:
+def get_available_vae_models(include_incompatible: bool = False) -> List[str]:
     """
     Get all available VAE models from the registry and discovered on disk.
     
     This function:
-    1. Returns all VAE models from MODEL_REGISTRY
+    1. Returns all compatible VAE models from MODEL_REGISTRY
     2. Scans the model directories for additional VAE files
     3. Returns a combined list for the dropdown menu
+    
+    Args:
+        include_incompatible: If True, include VAEs marked as incompatible with SeedVR2.
+                             Default False - only show compatible VAEs.
     """
-    # Start with registry models
-    model_list = get_default_models("vae")
+    # Start with registry models (filtering by compatibility)
+    model_list = []
+    for name, info in MODEL_REGISTRY.items():
+        if info.category == "vae":
+            # Skip incompatible VAEs unless explicitly requested
+            if not include_incompatible and not info.compatible:
+                continue
+            model_list.append(name)
     
     try:
         # Get all model files from all paths
@@ -118,17 +131,22 @@ def get_available_vae_models() -> List[str]:
         # VAE files typically have 'vae' in the name
         for filename in model_files:
             if filename not in model_list:
-                # Check if it looks like a VAE file
-                lower_name = filename.lower()
-                if 'vae' in lower_name:
-                    model_list.append(filename)
-                elif filename in MODEL_REGISTRY:
-                    # Only add if it's a VAE in the registry
+                # Check if it's in registry (may be incompatible)
+                if filename in MODEL_REGISTRY:
                     info = MODEL_REGISTRY.get(filename)
                     if info and info.category == "vae":
-                        model_list.append(filename)
+                        # Respect compatibility flag
+                        if include_incompatible or info.compatible:
+                            model_list.append(filename)
+                elif 'vae' in filename.lower():
+                    # Unknown VAE file - allow if compatible flag not set
+                    # But warn about Wan2.2 specifically
+                    if 'wan2.2' in filename.lower() and not include_incompatible:
+                        # Skip Wan2.2 VAEs as they're known to be incompatible
+                        continue
+                    model_list.append(filename)
         
-        # Also check cache directory for downloaded Wan2.2 VAE
+        # Also check cache directory for downloaded VAE models
         cache_dir = get_base_cache_dir()
         if os.path.exists(cache_dir):
             for filename in os.listdir(cache_dir):
@@ -136,6 +154,9 @@ def get_available_vae_models() -> List[str]:
                     if filename not in model_list:
                         lower_name = filename.lower()
                         if 'vae' in lower_name:
+                            # Skip Wan2.2 VAEs unless explicitly requested
+                            if 'wan2.2' in lower_name and not include_incompatible:
+                                continue
                             model_list.append(filename)
     except Exception:
         pass

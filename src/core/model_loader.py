@@ -813,6 +813,37 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                           used_meta: bool, model_type: str, model_type_lower: str,
                           debug: Optional['Debug'] = None) -> torch.nn.Module:
     """Load standard (non-GGUF) weights into model."""
+    # Validate that state dict keys match the model structure
+    model_keys = set(model.state_dict().keys())
+    state_keys = set(state.keys())
+    matching_keys = model_keys & state_keys
+    
+    # Check if enough keys match - if too few match, the weights are incompatible
+    match_ratio = len(matching_keys) / len(model_keys) if model_keys else 0
+    if match_ratio < 0.1 and len(model_keys) > 10:
+        # Less than 10% of model keys found in state dict - likely incompatible weights
+        debug.log(
+            f"WARNING: {model_type} weights appear incompatible with model architecture! "
+            f"Only {len(matching_keys)}/{len(model_keys)} keys match ({match_ratio:.1%})",
+            level="WARNING", category=model_type_lower, force=True
+        )
+        debug.log(
+            f"This typically means the VAE file is from a different model family. "
+            f"Please use the SeedVR2 VAE (ema_vae_fp16.safetensors) for compatibility.",
+            level="WARNING", category=model_type_lower, force=True
+        )
+        # Show some example keys for debugging
+        model_sample = list(model_keys)[:3]
+        state_sample = list(state_keys)[:3]
+        debug.log(f"Model expects keys like: {model_sample}", category=model_type_lower)
+        debug.log(f"Weights file has keys like: {state_sample}", category=model_type_lower)
+        
+        raise RuntimeError(
+            f"Incompatible {model_type} weights: The selected VAE file has a different architecture "
+            f"than the SeedVR2 model expects. Only {match_ratio:.1%} of keys match. "
+            f"Please use 'ema_vae_fp16.safetensors' (the SeedVR2 VAE) instead."
+        )
+    
     debug.start_timer(f"{model_type_lower}_state_apply")
     model.load_state_dict(state, strict=False, assign=True)
     
