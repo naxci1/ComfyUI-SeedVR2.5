@@ -30,6 +30,7 @@ class ModelInfo:
     variant: Optional[str] = None # 'sharp', 'wan2.2', etc.
     sha256: Optional[str] = None # Cached hash
     description: Optional[str] = None # Human-readable description
+    remote_path: Optional[str] = None # Path within repo if different from filename
 
 # Model registry with metadata
 MODEL_REGISTRY = {
@@ -52,22 +53,15 @@ MODEL_REGISTRY = {
     # VAE models - Standard SeedVR2 VAE
     "ema_vae_fp16.safetensors": ModelInfo(category="vae", precision="fp16", sha256="20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1", description="SeedVR2 VAE - FP16"),
     
-    # VAE models - Wan2.2 3D Causal VAE
-    "wan2.2_vae_fp16.safetensors": ModelInfo(
-        repo="Wan-AI/Wan2.2-VAE",
+    # VAE models - Wan2.2 3D Causal VAE (Official ComfyUI Repackaged)
+    "wan2.2_vae.safetensors": ModelInfo(
+        repo="Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
         category="vae",
         precision="fp16",
         variant="wan2.2",
-        sha256=None,  # Will be set once official model is available
-        description="Wan2.2 3D Causal VAE - FP16 (Auto-download supported)"
-    ),
-    "wan2.2_vae_bf16.safetensors": ModelInfo(
-        repo="Wan-AI/Wan2.2-VAE",
-        category="vae",
-        precision="bf16",
-        variant="wan2.2",
         sha256=None,
-        description="Wan2.2 3D Causal VAE - BF16 (Auto-download supported)"
+        description="Wan2.2 3D Causal VAE - Official ComfyUI Repackaged",
+        remote_path="split_files/vae/wan2.2_vae.safetensors"
     ),
 }
 

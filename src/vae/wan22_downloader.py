@@ -9,7 +9,7 @@ Features:
 - Auto-detection of missing Wan2.2 VAE models
 - Resumable downloads with progress bar
 - File integrity verification via SHA256 hash
-- Support for FP16 and BF16 precision variants
+- Official Comfy-Org/Wan_2.2_ComfyUI_Repackaged repository support
 """
 
 import os
@@ -25,10 +25,7 @@ logger = logging.getLogger(__name__)
 
 class Wan22VAEVariant(Enum):
     """Wan2.2 VAE model variants"""
-    FP16 = "fp16"
-    BF16 = "bf16"
-    GGUF_Q4 = "gguf_q4"
-    GGUF_Q8 = "gguf_q8"
+    DEFAULT = "default"  # Official wan2.2_vae.safetensors
 
 
 @dataclass
@@ -37,34 +34,28 @@ class Wan22VAEModel:
     filename: str
     repo: str
     precision: str
+    remote_path: Optional[str] = None  # Path within the repo (e.g., "split_files/vae/wan2.2_vae.safetensors")
     sha256: Optional[str] = None
     description: str = ""
     file_size_gb: float = 0.0
 
 
 # Wan2.2 VAE model registry
-# Note: These are placeholder entries. Update repo/sha256 when official models are released.
+# Official repository: Comfy-Org/Wan_2.2_ComfyUI_Repackaged
 WAN22_VAE_MODELS: Dict[str, Wan22VAEModel] = {
-    "wan2.2_vae_fp16.safetensors": Wan22VAEModel(
-        filename="wan2.2_vae_fp16.safetensors",
-        repo="Wan-AI/Wan2.2-VAE",  # Placeholder - update when official repo is available
+    "wan2.2_vae.safetensors": Wan22VAEModel(
+        filename="wan2.2_vae.safetensors",
+        repo="Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+        remote_path="split_files/vae/wan2.2_vae.safetensors",
         precision="fp16",
-        sha256=None,  # Will be populated once official model is available
-        description="Wan2.2 3D Causal VAE - FP16 precision",
-        file_size_gb=0.5,
-    ),
-    "wan2.2_vae_bf16.safetensors": Wan22VAEModel(
-        filename="wan2.2_vae_bf16.safetensors",
-        repo="Wan-AI/Wan2.2-VAE",  # Placeholder - update when official repo is available
-        precision="bf16",
-        sha256=None,
-        description="Wan2.2 3D Causal VAE - BF16 precision",
-        file_size_gb=0.5,
+        sha256=None,  # Can be added for integrity check
+        description="Wan2.2 3D Causal VAE - Official ComfyUI Repackaged",
+        file_size_gb=0.335,
     ),
 }
 
 # Default Wan2.2 VAE model
-DEFAULT_WAN22_VAE = "wan2.2_vae_fp16.safetensors"
+DEFAULT_WAN22_VAE = "wan2.2_vae.safetensors"
 
 
 def get_wan22_vae_models() -> List[str]:
@@ -152,7 +143,10 @@ def ensure_wan22_vae_exists(
     
     # File doesn't exist or force_download - need to download
     filepath = os.path.join(cache_dir, model_name)
-    url = HUGGINGFACE_BASE_URL.format(repo=model_info.repo, filename=model_name)
+    
+    # Use remote_path if available, otherwise use filename
+    remote_filename = model_info.remote_path if model_info.remote_path else model_name
+    url = HUGGINGFACE_BASE_URL.format(repo=model_info.repo, filename=remote_filename)
     
     if debug:
         debug.log(f"Downloading Wan2.2 VAE: {model_name}", category="download", force=True)
@@ -284,7 +278,9 @@ def get_wan22_download_url(model_name: str) -> Optional[str]:
     if model_info is None:
         return None
     
-    return HUGGINGFACE_BASE_URL.format(repo=model_info.repo, filename=model_name)
+    # Use remote_path if available, otherwise use filename
+    remote_filename = model_info.remote_path if model_info.remote_path else model_name
+    return HUGGINGFACE_BASE_URL.format(repo=model_info.repo, filename=remote_filename)
 
 
 # Convenience function for node integration
