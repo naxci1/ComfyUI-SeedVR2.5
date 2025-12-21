@@ -318,6 +318,15 @@ class Wan2_2_VAE(nn.Module):
         if self.vae_model is None:
             raise RuntimeError("VAE model not initialized")
         
+        # Use NHWC memory layout + pinned staging to maximize convolution throughput
+        if x.device.type == "cpu" and torch.cuda.is_available():
+            try:
+                x = x.pin_memory()
+            except (RuntimeError, AttributeError):
+                pass
+        if x.dim() >= 4:
+            x = x.contiguous(memory_format=torch.channels_last)
+        
         # Pass through VAE encoder
         if hasattr(self.vae_model, 'encode'):
             posterior = self.vae_model.encode(x)
@@ -356,6 +365,8 @@ class Wan2_2_VAE(nn.Module):
         
         # Denormalize
         latent = self.denormalize(latent)
+        if latent.dim() >= 4:
+            latent = latent.contiguous(memory_format=torch.channels_last)
         
         # Apply post-quantization conv if enabled
         if self.use_quant and hasattr(self, 'post_quant_conv'):
@@ -366,6 +377,9 @@ class Wan2_2_VAE(nn.Module):
             sample = self.vae_model.decode(latent)
         else:
             sample = self.vae_model(latent)
+        
+        if sample.dim() >= 4:
+            sample = sample.contiguous(memory_format=torch.channels_last)
         
         if return_dict:
             return {'sample': sample}

@@ -12,6 +12,7 @@
 # // See the License for the specific language governing permissions and
 # // limitations under the License.
 
+import os
 import torch
 import torch.nn.functional as F
 
@@ -102,6 +103,7 @@ class FlashAttentionVarlen(nn.Module):
         super().__init__()
         self.attention_mode = attention_mode
         self.compute_dtype = compute_dtype
+        self._compiled_forward = None
 
     def tflops(self, args, kwargs, output) -> float:
         cu_seqlens_q = kwargs["cu_seqlens_q"]
@@ -112,6 +114,41 @@ class FlashAttentionVarlen(nn.Module):
         return h * (4 * d * (seqlens_q * seqlens_k).sum())
 
     def forward(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs):
+        if self._compiled_forward is None and hasattr(torch, "compile") and os.environ.get("SEEDVR2_COMPILE_ATTENTION") == "1":
+            try:
+                self._compiled_forward = torch.compile(self._forward_impl, mode="max-autotune")
+            except Exception:
+                self._compiled_forward = False
+        impl = self._forward_impl if self._compiled_forward in (None, False) else self._compiled_forward
+        return impl(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs)
+
+    def _over_budget(self) -> bool:
+        """Simple VRAM budget check for SageAttention paths."""
+        budget_mb = float(os.environ.get("SEEDVR2_VRAM_BUDGET_MB", "0") or 0)
+        if budget_mb <= 0 or not torch.cuda.is_available():
+            return False
+        try:
+            free, _ = torch.cuda.mem_get_info()
+            return (free / (1024 ** 2)) < budget_mb
+        except Exception:
+            return False
+
+    def _fallback_from_sage(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs):
+        """Fallback chain: SA2 -> FlashAttn2 -> PyTorch SDPA."""
+        try:
+            if self.attention_mode != 'sageattn_2':
+                return call_sage_attn_2_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs)
+        except Exception:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        try:
+            return call_flash_attn_2_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs)
+        except Exception:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        return pytorch_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs)
+
+    def _forward_impl(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs):
         kwargs["deterministic"] = torch.are_deterministic_algorithms_enabled()
         
         # Convert to pipeline compute_dtype if configured (handles FP8 → fp16/bf16)
@@ -121,25 +158,51 @@ class FlashAttentionVarlen(nn.Module):
             v = v.to(self.compute_dtype)
         
         if self.attention_mode == 'flash_attn_3':
-            return call_flash_attn_3_varlen(
-                q, k, v, cu_seqlens_q, cu_seqlens_k, 
-                max_seqlen_q, max_seqlen_k, **kwargs
-            )
+            try:
+                return call_flash_attn_3_varlen(
+                    q, k, v, cu_seqlens_q, cu_seqlens_k, 
+                    max_seqlen_q, max_seqlen_k, **kwargs
+                )
+            except Exception:
+                return pytorch_varlen_attention(
+                    q, k, v, cu_seqlens_q, cu_seqlens_k,
+                    max_seqlen_q, max_seqlen_k, **kwargs
+                )
         elif self.attention_mode == 'flash_attn_2':
-            return call_flash_attn_2_varlen(
-                q, k, v, cu_seqlens_q, cu_seqlens_k, 
-                max_seqlen_q, max_seqlen_k, **kwargs
-            )
+            try:
+                return call_flash_attn_2_varlen(
+                    q, k, v, cu_seqlens_q, cu_seqlens_k, 
+                    max_seqlen_q, max_seqlen_k, **kwargs
+                )
+            except Exception:
+                return pytorch_varlen_attention(
+                    q, k, v, cu_seqlens_q, cu_seqlens_k,
+                    max_seqlen_q, max_seqlen_k, **kwargs
+                )
         elif self.attention_mode == 'sageattn_3':
-            return call_sage_attn_3_varlen(
-                q, k, v, cu_seqlens_q, cu_seqlens_k,
-                max_seqlen_q, max_seqlen_k, **kwargs
-            )
+            if self._over_budget():
+                return self._fallback_from_sage(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs)
+            try:
+                return call_sage_attn_3_varlen(
+                    q, k, v, cu_seqlens_q, cu_seqlens_k,
+                    max_seqlen_q, max_seqlen_k, **kwargs
+                )
+            except RuntimeError:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return self._fallback_from_sage(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs)
         elif self.attention_mode == 'sageattn_2':
-            return call_sage_attn_2_varlen(
-                q, k, v, cu_seqlens_q, cu_seqlens_k,
-                max_seqlen_q, max_seqlen_k, **kwargs
-            )
+            if self._over_budget():
+                return self._fallback_from_sage(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs)
+            try:
+                return call_sage_attn_2_varlen(
+                    q, k, v, cu_seqlens_q, cu_seqlens_k,
+                    max_seqlen_q, max_seqlen_k, **kwargs
+                )
+            except RuntimeError:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return self._fallback_from_sage(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs)
         else:
             # PyTorch SDPA
             return pytorch_varlen_attention(
