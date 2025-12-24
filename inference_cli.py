@@ -171,23 +171,41 @@ class FFMPEGVideoWriter:
             ['ffmpeg', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24',
              '-s', f'{width}x{height}', '-r', str(fps), '-i', '-',
              '-c:v', codec, '-pix_fmt', pix_fmt, '-preset', 'medium', '-crf', '12', path],
-            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
     
     def write(self, frame_bgr: np.ndarray):
+        if not self.isOpened():
+            raise RuntimeError("FFMPEGVideoWriter: ffmpeg process is not running")
+        
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        self.proc.stdin.write(frame_rgb.astype(np.uint8).tobytes())
+        try:
+            self.proc.stdin.write(frame_rgb.astype(np.uint8).tobytes())
+            self.proc.stdin.flush()  # Critical: prevent buffering issues
+        except BrokenPipeError:
+            raise RuntimeError(
+                "FFMPEGVideoWriter: ffmpeg process terminated unexpectedly. "
+                "Check video path, codec support, and disk space."
+            )
     
     def isOpened(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
     
     def release(self):
         if self.proc:
-            self.proc.stdin.close()
+            try:
+                self.proc.stdin.close()
+            except Exception:
+                pass  # Ignore errors on close
+            
             self.proc.wait()
-            stderr = self.proc.stderr.read() if self.proc.stderr else b''
+            
             if self.proc.returncode != 0:
-                debug.log(f"ffmpeg error: {stderr.decode()}", level="WARNING", category="file")
+                debug.log(
+                    f"ffmpeg exited with code {self.proc.returncode}. "
+                    "Check output file for corruption.",
+                    level="WARNING", force=True, category="file"
+                )
             self.proc = None
 
 

@@ -78,7 +78,7 @@ class Debug:
         "device": "🖥️",       # Device info
         "file": "📂",         # File operations
         "alpha": "👻",        # Alpha operations
-        "star": "⭐",         # Star
+        "starlove": "⭐💝",   # Star + love
         "dialogue": "💬",     # Dialogue
         "none" : "",
     }
@@ -259,9 +259,9 @@ class Debug:
         """Print the footer with links - always displayed"""
         self.log("", category="none", force=True)
         self.log("────────────────────────", category="none", force=True)
-        self.log("Questions? Updates? Watch the videos, star the repo & join us!", category="dialogue", force=True)
+        self.log("Questions? Updates? Watch, star & sponsor if you can!", category="dialogue", force=True)
         self.log("https://www.youtube.com/@AInVFX", category="generation", force=True)
-        self.log("https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler", category="star", force=True)
+        self.log("https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler", category="starlove", force=True)
     
     @torch._dynamo.disable  # Skip tracing to avoid time.time() warnings
     def start_timer(self, name: str, force: bool = False) -> None:

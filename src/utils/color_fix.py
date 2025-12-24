@@ -381,6 +381,8 @@ def _rgb_to_lab_batch(rgb: Tensor, device: torch.device, matrix: Tensor, epsilon
     rgb_flat = rgb_linear.permute(0, 2, 3, 1).reshape(-1, 3)
     del rgb_linear
     
+    # Ensure dtype consistency for matrix multiplication
+    rgb_flat = rgb_flat.to(dtype=matrix.dtype)
     xyz_flat = torch.matmul(rgb_flat, matrix.T)
     del rgb_flat
     
@@ -452,6 +454,8 @@ def _lab_to_rgb_batch(lab: Tensor, device: torch.device, matrix_inv: Tensor, eps
     xyz_flat = xyz.permute(0, 2, 3, 1).reshape(-1, 3)
     del xyz
     
+    # Ensure dtype consistency for matrix multiplication
+    xyz_flat = xyz_flat.to(dtype=matrix_inv.dtype)
     rgb_linear_flat = torch.matmul(xyz_flat, matrix_inv.T)
     del xyz_flat
     

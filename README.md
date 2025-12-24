@@ -36,6 +36,22 @@ We're actively working on improvements and new features. To stay informed:
 
 ## 🚀 Release Notes
 
+**2025.12.24 - Version 2.5.24**
+
+- **🍎 Fix: MPS memory leak regression** - Restored MPS cache clearing after VAE encode/decode operations that was accidentally removed during code cleanup in v2.5.23
+
+**2025.12.24 - Version 2.5.23**
+
+- **🔒 Security: Prevent code execution in model loading** - Added protection against malicious .pth files by restricting deserialization to tensors only
+- **🎥 Fix: FFmpeg video writer reliability** - Resolved ffmpeg process hanging issues by redirecting stderr and adding buffer flush, with improved error messages for debugging *(thanks [@thehhmdb](https://github.com/thehhmdb))*
+- **⚡ Fix: GGUF VAE model support** - Enabled automatic weight dequantization for convolution operations, making GGUF-quantized VAE models fully functional *(thanks [@naxci1](https://github.com/naxci1))*
+- **🛡️ Fix: VAE slicing edge cases** - Protected against division by zero crashes when using small split sizes with high temporal downsampling *(thanks [@naxci1](https://github.com/naxci1))*
+- **🎨 Fix: LAB color transfer precision** - Resolved dtype mismatch errors during video upscaling by ensuring consistent float types before matrix operations
+- **🔧 Fix: PyTorch 2.9+ compatibility** - Extended Conv3d memory workaround to all PyTorch 2.9+ versions, fixing 3x VRAM usage on newer PyTorch releases
+- **📦 Fix: Bitsandbytes compatibility** - Added ValueError exception handling for Intel Gaudi version detection failures on non-Gaudi systems
+- **🍎 MPS: Memory optimization** - Reduced memory usage during encode/decode operations on Apple Silicon *(thanks [@s-cerevisiae](https://github.com/s-cerevisiae))*
+
+
 **2025.12.13 - Version 2.5.22**
 
 - **🎬 CLI: FFmpeg video backend with 10-bit support** - New `--video_backend ffmpeg` and `--10bit` flags enable x265 encoding with 10-bit color depth, reducing banding artifacts in gradients compared to 8-bit OpenCV output *(based on PR by [@thehhmdb](https://github.com/thehhmdb) - thank you!)*
@@ -1030,7 +1046,7 @@ For detailed contribution guidelines, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 This ComfyUI implementation is a collaborative project by **[NumZ](https://github.com/numz)** and **[AInVFX](https://www.youtube.com/@AInVFX)** (Adrien Toupet), based on the original [SeedVR2](https://github.com/ByteDance-Seed/SeedVR) by ByteDance Seed Team.
 
-Special thanks to our community contributors including [naxci1](https://github.com/naxci1), [benjaminherb](https://github.com/benjaminherb), [cmeka](https://github.com/cmeka), [FurkanGozukara](https://github.com/FurkanGozukara), [JohnAlcatraz](https://github.com/JohnAlcatraz), [lihaoyun6](https://github.com/lihaoyun6), [Luchuanzhao](https://github.com/Luchuanzhao), [Luke2642](https://github.com/Luke2642), [proxyid](https://github.com/proxyid), [q5sys](https://github.com/q5sys), and many others for their improvements, bug fixes, and testing.
+Special thanks to our community contributors including [naxci1](https://github.com/naxci1), [thehhmdb](https://github.com/thehhmdb), [s-cerevisiae](https://github.com/s-cerevisiae), [benjaminherb](https://github.com/benjaminherb), [cmeka](https://github.com/cmeka), [FurkanGozukara](https://github.com/FurkanGozukara), [JohnAlcatraz](https://github.com/JohnAlcatraz), [lihaoyun6](https://github.com/lihaoyun6), [Luchuanzhao](https://github.com/Luchuanzhao), [Luke2642](https://github.com/Luke2642), [proxyid](https://github.com/proxyid), [q5sys](https://github.com/q5sys), and many others for their improvements, bug fixes, and testing.
 
 ## 📜 License
 
