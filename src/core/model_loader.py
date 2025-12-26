@@ -82,7 +82,7 @@ script_directory = get_script_directory()
 
 
 def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch.device("cpu"),
-                              debug: Optional['Debug'] = None) -> Dict[str, torch.Tensor]:
+                              debug: Optional['Debug'] = None, model_type: str = "dit") -> Dict[str, torch.Tensor]:
     """
     Load model state dict from checkpoint with support for multiple formats.
     
@@ -93,6 +93,7 @@ def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch
         checkpoint_path: Path to checkpoint file
         device: Target device for tensor placement (torch.device object, defaults to CPU)
         debug: Optional Debug instance for logging
+        model_type: Model type ("dit" or "vae") for GGUF prefix handling
         
     Returns:
         dict: State dictionary loaded with appropriate format handler
@@ -100,6 +101,7 @@ def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch
     Notes:
         - SafeTensors files use optimized loading with direct device placement
         - PyTorch files use memory-mapped loading to reduce RAM usage
+        - GGUF files use model_type to determine tensor name prefix handling
     """
     device_str = str(device)
     
@@ -139,11 +141,15 @@ def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch
                 raise
     elif checkpoint_path.endswith('.gguf'):
         validate_gguf_availability(f"load {os.path.basename(checkpoint_path)}", debug)
+        # Use different prefix handling based on model type
+        # DiT models typically have "model.diffusion_model." prefix
+        # VAE models typically have no prefix or a different prefix
+        handle_prefix = "model.diffusion_model." if model_type.lower() == "dit" else None
         state = _load_gguf_state(
                     checkpoint_path=checkpoint_path, 
                     device=device, 
                     debug=debug, 
-                    handle_prefix="model.diffusion_model."
+                    handle_prefix=handle_prefix
                 )
     elif checkpoint_path.endswith('.pth'):
         state = torch.load(checkpoint_path, map_location=device_str, mmap=True, weights_only=True)
@@ -154,7 +160,7 @@ def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch
 
 
 def _load_gguf_state(checkpoint_path: str, device: torch.device, debug: Optional['Debug'] = None,
-                    handle_prefix: str = "model.diffusion_model.") -> Dict[str, torch.Tensor]:
+                    handle_prefix: Optional[str] = "model.diffusion_model.") -> Dict[str, torch.Tensor]:
     """
     Load GGUF state dict
     
@@ -162,7 +168,7 @@ def _load_gguf_state(checkpoint_path: str, device: torch.device, debug: Optional
         checkpoint_path: Path to GGUF file
         device: Target device (torch.device object)
         debug: Debug instance
-        handle_prefix: Prefix to strip from tensor names
+        handle_prefix: Prefix to strip from tensor names (None to keep original names)
         
     Returns:
         State dictionary with loaded tensors
@@ -186,10 +192,10 @@ def _load_gguf_state(checkpoint_path: str, device: torch.device, debug: Optional
         tensors.append((sd_key, tensor))
 
     state_dict = {}
-    total_tensors = len(reader.tensors)
+    total_tensors = len(tensors)
     
     device_str = str(device)
-    debug.log(f"Loading {total_tensors} tensors to {str(device_str)}...", category="dit")
+    debug.log(f"Loading {total_tensors} GGUF tensors to {str(device_str)}...", category="info")
     
     # Suppress expected warnings: GGUF tensors are read-only numpy arrays that trigger warnings when converted
     suppress_tensor_warnings()
@@ -218,9 +224,9 @@ def _load_gguf_state(checkpoint_path: str, device: torch.device, debug: Optional
         
         # Progress reporting
         if (i + 1) % 100 == 0:
-            debug.log(f"Loaded {i+1}/{total_tensors} tensors...", category="dit", indent_level=1)
+            debug.log(f"Loaded {i+1}/{total_tensors} tensors...", category="info", indent_level=1)
 
-    debug.log(f"Successfully loaded {len(state_dict)} tensors to {device_str}", category="success")
+    debug.log(f"Successfully loaded {len(state_dict)} GGUF tensors to {device_str}", category="success")
 
     return state_dict
 
@@ -576,7 +582,7 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
     
     # Load state dict from file
     debug.start_timer(f"{model_type_lower}_weights_load")
-    state = load_quantized_state_dict(checkpoint_path, target_device, debug)
+    state = load_quantized_state_dict(checkpoint_path, target_device, debug, model_type=model_type_lower)
     debug.end_timer(f"{model_type_lower}_weights_load", f"{model_type} weights loaded from file")
     
     # Apply dtype conversion if requested
