@@ -94,10 +94,13 @@ def get_available_vae_models() -> List[str]:
         # Get all model files from all paths
         model_files = get_all_model_files()
         
-        # Add VAE files not in registry (must have 'vae' in filename)
+        # Add VAE files not in registry
+        # Must have 'vae' in filename AND be a supported model format (.safetensors or .gguf)
         discovered_models = [
             filename for filename in model_files
-            if filename not in MODEL_REGISTRY and 'vae' in filename.lower()
+            if filename not in MODEL_REGISTRY 
+            and 'vae' in filename.lower()
+            and (filename.endswith('.safetensors') or filename.endswith('.gguf'))
         ]
         
         # Add discovered models to the list

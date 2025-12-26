@@ -149,7 +149,8 @@ def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch
                     checkpoint_path=checkpoint_path, 
                     device=device, 
                     debug=debug, 
-                    handle_prefix=handle_prefix
+                    handle_prefix=handle_prefix,
+                    model_type=model_type
                 )
     elif checkpoint_path.endswith('.pth'):
         state = torch.load(checkpoint_path, map_location=device_str, mmap=True, weights_only=True)
@@ -160,7 +161,8 @@ def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch
 
 
 def _load_gguf_state(checkpoint_path: str, device: torch.device, debug: Optional['Debug'] = None,
-                    handle_prefix: Optional[str] = "model.diffusion_model.") -> Dict[str, torch.Tensor]:
+                    handle_prefix: Optional[str] = "model.diffusion_model.", 
+                    model_type: str = "dit") -> Dict[str, torch.Tensor]:
     """
     Load GGUF state dict
     
@@ -169,6 +171,7 @@ def _load_gguf_state(checkpoint_path: str, device: torch.device, debug: Optional
         device: Target device (torch.device object)
         debug: Debug instance
         handle_prefix: Prefix to strip from tensor names (None to keep original names)
+        model_type: Model type for logging ("dit" or "vae")
         
     Returns:
         State dictionary with loaded tensors
@@ -193,9 +196,10 @@ def _load_gguf_state(checkpoint_path: str, device: torch.device, debug: Optional
 
     state_dict = {}
     total_tensors = len(tensors)
+    log_category = model_type.lower()
     
     device_str = str(device)
-    debug.log(f"Loading {total_tensors} GGUF tensors to {str(device_str)}...", category="info")
+    debug.log(f"Loading {total_tensors} GGUF tensors to {str(device_str)}...", category=log_category)
     
     # Suppress expected warnings: GGUF tensors are read-only numpy arrays that trigger warnings when converted
     suppress_tensor_warnings()
@@ -224,7 +228,7 @@ def _load_gguf_state(checkpoint_path: str, device: torch.device, debug: Optional
         
         # Progress reporting
         if (i + 1) % 100 == 0:
-            debug.log(f"Loaded {i+1}/{total_tensors} tensors...", category="info", indent_level=1)
+            debug.log(f"Loaded {i+1}/{total_tensors} tensors...", category=log_category, indent_level=1)
 
     debug.log(f"Successfully loaded {len(state_dict)} GGUF tensors to {device_str}", category="success")
 
