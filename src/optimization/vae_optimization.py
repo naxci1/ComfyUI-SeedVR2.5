@@ -1,25 +1,21 @@
 """
-SeedVR2 VAE Attention Optimizer Node
+SeedVR2 VAE Optimization Functions
 
-Patches VAE attention blocks to use SageAttention v2 (when available) or
-optimized SDPA for maximum inference speed on Windows systems.
-
-This node is designed for users who cannot use torch.compile (Windows) and
-want to maximize VAE performance through attention-level optimizations.
-
-Optimizations include:
+Provides optimization functions for VAE encode/decode operations:
 - SageAttention v2 integration for attention blocks
 - channels_last memory format for CNN operations (Tensor Core optimization)
 - FP16/BF16 enforcement for maximum GPU throughput
 - cuDNN benchmark mode for faster convolutions
+
+These optimizations are applied automatically when the VAE model is materialized,
+without requiring a separate node.
 """
 
 import types
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from comfy_api.latest import io
-from typing import Dict, Any, Optional
+from typing import Optional
 import logging
 
 logger = logging.getLogger(__name__)
@@ -114,7 +110,9 @@ def _optimized_attention_forward(self, hidden_states, encoder_hidden_states=None
         )
     
     hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, self.heads * head_dim)
-    hidden_states = hidden_states.to(query.dtype)
+    # Only convert dtype if needed to avoid unnecessary tensor copies
+    if hidden_states.dtype != query.dtype:
+        hidden_states = hidden_states.to(query.dtype)
     
     # Linear projection
     hidden_states = self.to_out[0](hidden_states)
@@ -225,26 +223,40 @@ def enforce_fp16_precision(vae_model) -> int:
     return converted_count
 
 
-def patch_vae_attention(vae_model, use_sage: bool = True, use_fp16: bool = True,
-                        use_channels_last: bool = True) -> int:
+def apply_vae_optimizations(vae_model, use_sage: bool = True, use_fp16: bool = True,
+                            use_channels_last: bool = True, debug=None) -> dict:
     """
-    Patch VAE attention blocks to use optimized attention.
+    Apply all VAE optimizations automatically.
+    
+    This is the main entry point for VAE optimization, called automatically
+    when the VAE model is materialized.
     
     Args:
-        vae_model: The VAE model to patch
+        vae_model: The VAE model to optimize
         use_sage: Whether to use SageAttention (if available)
         use_fp16: Whether to cast to FP16 for Tensor Core usage
         use_channels_last: Whether to use channels_last memory format for CNNs
+        debug: Debug instance for logging
         
     Returns:
-        Number of attention blocks patched
+        Dictionary with optimization results
     """
     from diffusers.models.attention_processor import Attention
     
-    patched_count = 0
+    results = {
+        'attention_blocks_patched': 0,
+        'sage_available': SAGE_ATTN_AVAILABLE,
+        'sage_enabled': use_sage and SAGE_ATTN_AVAILABLE,
+        'channels_last_enabled': use_channels_last,
+        'fp16_enabled': use_fp16,
+    }
     
     # Enable cuDNN benchmark for better performance with consistent input sizes
-    torch.backends.cudnn.benchmark = True
+    # Note: This is a global setting that affects all cuDNN operations
+    # It's beneficial for VAE as input sizes are typically consistent
+    if not torch.backends.cudnn.benchmark:
+        torch.backends.cudnn.benchmark = True
+        logger.debug("Enabled cuDNN benchmark mode for VAE optimization")
     
     # Apply memory layout optimization for CNNs (crucial for VAE performance)
     if use_channels_last:
@@ -260,7 +272,7 @@ def patch_vae_attention(vae_model, use_sage: bool = True, use_fp16: bool = True,
                 
                 # Bind the optimized forward
                 module.forward = types.MethodType(_optimized_attention_forward, module)
-                patched_count += 1
+                results['attention_blocks_patched'] += 1
                 
                 logger.debug(f"Patched attention: {name}")
     
@@ -271,7 +283,26 @@ def patch_vae_attention(vae_model, use_sage: bool = True, use_fp16: bool = True,
         if hasattr(vae_model, 'decoder'):
             _convert_mid_block_to_fp16(vae_model.decoder, 'decoder')
     
-    return patched_count
+    # Mark model as optimized
+    vae_model._attention_optimized = True
+    
+    # Log optimization summary
+    if debug:
+        optimizations = []
+        if results['sage_enabled']:
+            optimizations.append("SageAttention")
+        else:
+            optimizations.append("SDPA")
+        if use_channels_last:
+            optimizations.append("channels_last")
+        if use_fp16:
+            optimizations.append("FP16")
+        optimizations.append("cuDNN_benchmark")
+        
+        debug.log(f"VAE optimized: {results['attention_blocks_patched']} attn blocks, {', '.join(optimizations)}", 
+                  category="vae", force=True)
+    
+    return results
 
 
 def unpatch_vae_attention(vae_model) -> int:
@@ -298,129 +329,7 @@ def unpatch_vae_attention(vae_model) -> int:
                 restored_count += 1
                 logger.debug(f"Restored attention: {name}")
     
+    if hasattr(vae_model, '_attention_optimized'):
+        delattr(vae_model, '_attention_optimized')
+    
     return restored_count
-
-
-class SeedVR2VAEAttentionOptimizer(io.ComfyNode):
-    """
-    Optimize VAE attention blocks for maximum inference speed.
-    
-    This node patches the VAE's attention mechanisms to use:
-    - SageAttention v2 (if available and enabled)
-    - Optimized PyTorch SDPA with memory-efficient settings
-    - channels_last memory format for CNN operations
-    
-    Designed for Windows users who cannot use torch.compile.
-    Works best with NVIDIA RTX GPUs (30xx, 40xx, 50xx series).
-    """
-    
-    @classmethod
-    def define_schema(cls) -> io.Schema:
-        sage_status = "✓ Available" if SAGE_ATTN_AVAILABLE else "✗ Not installed"
-        
-        return io.Schema(
-            node_id="SeedVR2VAEAttentionOptimizer",
-            display_name="SeedVR2 VAE Attention Optimizer",
-            category="SEEDVR2",
-            description=(
-                f"Optimize VAE for maximum speed on NVIDIA GPUs.\n\n"
-                f"SageAttention Status: {sage_status}\n\n"
-                "Optimizations applied:\n"
-                "• SageAttention v2 for attention blocks (if available)\n"
-                "• Optimized SDPA fallback with memory-efficient settings\n"
-                "• channels_last memory format for CNN layers\n"
-                "• FP16 precision enforcement for Tensor Cores\n"
-                "• cuDNN benchmark mode for faster convolutions\n\n"
-                "Best for Windows users who cannot use torch.compile.\n"
-                "Works with RTX 30xx, 40xx, and 50xx series GPUs."
-            ),
-            inputs=[
-                io.Custom("SEEDVR2_VAE").Input("vae",
-                    tooltip="VAE configuration from SeedVR2 Load VAE Model node"
-                ),
-                io.Boolean.Input("use_sage_attention",
-                    default=True,
-                    tooltip=(
-                        f"Use SageAttention v2 for maximum speed (Status: {sage_status}).\n"
-                        "Automatically falls back to optimized SDPA if unavailable.\n\n"
-                        "To install SageAttention: pip install sageattention"
-                    )
-                ),
-                io.Boolean.Input("use_fp16",
-                    default=True,
-                    tooltip=(
-                        "Enforce FP16 precision for Tensor Core acceleration.\n"
-                        "Prevents accidental upcasting to FP32.\n"
-                        "Provides significant speedup on RTX GPUs."
-                    )
-                ),
-                io.Boolean.Input("use_channels_last",
-                    default=True,
-                    tooltip=(
-                        "Use channels_last memory format for CNN layers.\n"
-                        "CRITICAL optimization for VAE performance on RTX GPUs.\n"
-                        "Enables optimal Tensor Core utilization for convolutions."
-                    )
-                ),
-                io.Boolean.Input("enable_cudnn_benchmark",
-                    default=True,
-                    tooltip=(
-                        "Enable cuDNN benchmark mode for faster convolutions.\n"
-                        "Slightly increases memory usage but improves speed.\n"
-                        "Recommended for consistent input sizes."
-                    )
-                ),
-            ],
-            outputs=[
-                io.Custom("SEEDVR2_VAE").Output(
-                    tooltip="Optimized VAE configuration with patched attention blocks"
-                )
-            ]
-        )
-    
-    @classmethod
-    def execute(cls, vae: Dict[str, Any], use_sage_attention: bool = True,
-                use_fp16: bool = True, use_channels_last: bool = True,
-                enable_cudnn_benchmark: bool = True) -> io.NodeOutput:
-        """
-        Apply attention and memory layout optimizations to VAE configuration.
-        
-        The actual patching happens when the VAE model is loaded by the upscaler node.
-        This node adds optimization flags to the configuration.
-        """
-        # Enable cuDNN benchmark if requested
-        if enable_cudnn_benchmark:
-            torch.backends.cudnn.benchmark = True
-        
-        # Create optimized config by copying and adding optimization flags
-        optimized_config = dict(vae)
-        optimized_config["attention_optimization"] = {
-            "enabled": True,
-            "use_sage_attention": use_sage_attention and SAGE_ATTN_AVAILABLE,
-            "use_fp16": use_fp16,
-            "use_channels_last": use_channels_last,
-            "sage_available": SAGE_ATTN_AVAILABLE,
-            "patch_function": patch_vae_attention,
-            "unpatch_function": unpatch_vae_attention,
-        }
-        
-        # Log optimization status
-        optimizations = []
-        if use_sage_attention and SAGE_ATTN_AVAILABLE:
-            optimizations.append("SageAttention v2")
-        else:
-            optimizations.append("Optimized SDPA")
-        if use_channels_last:
-            optimizations.append("channels_last")
-        if use_fp16:
-            optimizations.append("FP16")
-        if enable_cudnn_benchmark:
-            optimizations.append("cuDNN benchmark")
-            
-        logger.info(f"VAE Attention Optimizer: {', '.join(optimizations)}")
-        
-        return io.NodeOutput(optimized_config)
-
-
-# Export for node registration
-NODES = [SeedVR2VAEAttentionOptimizer]

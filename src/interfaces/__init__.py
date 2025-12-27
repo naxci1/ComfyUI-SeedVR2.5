@@ -9,7 +9,6 @@ from .video_upscaler import SeedVR2VideoUpscaler
 from .dit_model_loader import SeedVR2LoadDiTModel
 from .vae_model_loader import SeedVR2LoadVAEModel
 from .torch_compile_settings import SeedVR2TorchCompileSettings
-from .vae_attention_optimizer import SeedVR2VAEAttentionOptimizer
 
 
 class SeedVR2Extension(ComfyExtension):
@@ -22,7 +21,6 @@ class SeedVR2Extension(ComfyExtension):
             SeedVR2LoadDiTModel,
             SeedVR2LoadVAEModel,
             SeedVR2TorchCompileSettings,
-            SeedVR2VAEAttentionOptimizer,
         ]
 
 
@@ -36,7 +34,6 @@ __all__ = [
     'SeedVR2LoadDiTModel',
     'SeedVR2LoadVAEModel',
     'SeedVR2TorchCompileSettings',
-    'SeedVR2VAEAttentionOptimizer',
     'SeedVR2Extension',
     'comfy_entrypoint',
 ]
