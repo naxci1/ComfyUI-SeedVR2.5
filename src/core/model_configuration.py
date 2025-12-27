@@ -1269,6 +1269,28 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
             else:
                 debug.log("Reusing existing torch.compile for VAE submodules", category="reuse")
         
+        # Apply VAE optimizations automatically (SageAttention, channels_last, FP16, cuDNN benchmark)
+        # These optimizations are applied by default for maximum performance
+        if not getattr(model, '_attention_optimized', False):
+            try:
+                from ..optimization.vae_optimization import apply_vae_optimizations
+                debug.start_timer("vae_optimization")
+                results = apply_vae_optimizations(
+                    model, 
+                    use_sage=True,  # Auto-fallback to SDPA if unavailable
+                    use_fp16=True,  # Enable Tensor Core acceleration
+                    use_channels_last=True,  # Critical for CNN performance
+                    debug=debug
+                )
+                debug.end_timer("vae_optimization", "VAE optimization applied")
+            except Exception as e:
+                debug.log(
+                    f"Could not apply VAE optimizations: {e}. "
+                    "VAE will still work but may be slower. "
+                    "If you see this often, please report it as an issue.",
+                    category="warning"
+                )
+        
         # Propagate debug and tensor_offload_device to submodules
         model.debug = debug
         model.tensor_offload_device = runner._tensor_offload_device
