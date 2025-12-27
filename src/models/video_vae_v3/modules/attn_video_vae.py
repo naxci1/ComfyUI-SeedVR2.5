@@ -107,6 +107,28 @@ class Upsample3D(Upsample2D):
         else:
             self.Conv2d_0 = conv
 
+    def _pixel_shuffle_3d(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        OPTIMIZATION [Report 3.6]: Native PyTorch pixel shuffle for 3D tensors.
+        Replaces einops rearrange with reshape/permute for 2-3x speedup and reduced memory.
+        Pattern: "b (x y z c) f h w -> b c (f z) (h x) (w y)"
+        """
+        B, C_packed, F, H, W = x.shape
+        upscale_ratio = self.spatial_ratio * self.spatial_ratio * self.temporal_ratio
+        C = C_packed // upscale_ratio
+        
+        # OPTIMIZATION [Report 3.6]: Single reshape + permute chain instead of einops
+        # Reshape: (B, C_packed, F, H, W) -> (B, x, y, z, C, F, H, W)
+        x = x.view(B, self.spatial_ratio, self.spatial_ratio, self.temporal_ratio, C, F, H, W)
+        
+        # Permute: (B, x, y, z, C, F, H, W) -> (B, C, F, z, H, x, W, y)
+        x = x.permute(0, 4, 5, 3, 6, 1, 7, 2).contiguous()
+        
+        # Reshape: (B, C, F, z, H, x, W, y) -> (B, C, F*z, H*x, W*y)
+        x = x.view(B, C, F * self.temporal_ratio, H * self.spatial_ratio, W * self.spatial_ratio)
+        
+        return x
+
     def forward(
         self,
         hidden_states: torch.FloatTensor,
@@ -114,6 +136,7 @@ class Upsample3D(Upsample2D):
         memory_state: MemoryState = MemoryState.DISABLED,
         **kwargs,
     ) -> torch.FloatTensor:
+        # OPTIMIZATION [Report 3.6]: Optimized forward with native pixel shuffle
         assert hidden_states.shape[1] == self.channels
 
         if hasattr(self, "norm") and self.norm is not None:
@@ -134,13 +157,8 @@ class Upsample3D(Upsample2D):
         for i in range(len(hidden_states)):
             def upscale_and_rearrange():
                 temp = self.upscale_conv(hidden_states[i])
-                return rearrange(
-                    temp,
-                    "b (x y z c) f h w -> b c (f z) (h x) (w y)",
-                    x=self.spatial_ratio,
-                    y=self.spatial_ratio,
-                    z=self.temporal_ratio,
-                )
+                # OPTIMIZATION [Report 3.6]: Use native pixel shuffle instead of einops
+                return self._pixel_shuffle_3d(temp)
             
             hidden_states[i] = retry_on_oom(
                 upscale_and_rearrange,
@@ -654,15 +672,26 @@ class UNetMidBlock3D(nn.Module):
         self.resnets = nn.ModuleList(resnets)
 
     def forward(self, hidden_states, temb=None, memory_state: MemoryState = MemoryState.DISABLED):
-        video_length, frame_height, frame_width = hidden_states.size()[-3:]
+        # OPTIMIZATION [Report 3.2]: Optimized attention forward with native PyTorch operations
+        B, C, video_length, frame_height, frame_width = hidden_states.shape
         hidden_states = self.resnets[0](hidden_states, temb, memory_state=memory_state)
+        
         for attn, resnet in zip(self.attentions, self.resnets[1:]):
             if attn is not None:
-                hidden_states = rearrange(hidden_states, "b c f h w -> (b f) c h w")
-                hidden_states = attn(hidden_states, temb=temb)
-                hidden_states = rearrange(
-                    hidden_states, "(b f) c h w -> b c f h w", f=video_length
+                # OPTIMIZATION [Report 3.2]: Replace einops rearrange with native reshape/permute
+                # "b c f h w -> (b f) c h w" using permute + reshape
+                hidden_states = hidden_states.permute(0, 2, 1, 3, 4).reshape(
+                    B * video_length, C, frame_height, frame_width
                 )
+                
+                hidden_states = attn(hidden_states, temb=temb)
+                
+                # OPTIMIZATION [Report 3.2]: Replace einops rearrange with native reshape/permute
+                # "(b f) c h w -> b c f h w" using reshape + permute
+                hidden_states = hidden_states.reshape(
+                    B, video_length, C, frame_height, frame_width
+                ).permute(0, 2, 1, 3, 4)
+                
             hidden_states = resnet(hidden_states, temb, memory_state=memory_state)
 
         return hidden_states
