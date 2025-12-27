@@ -3,6 +3,8 @@ Wan2.1 VAE Implementation for ComfyUI-SeedVR2.5
 Includes encoder/decoder blocks and Wan2_1_VAE wrapper class
 
 Optimized with SageAttention 2.2.0 for improved VAE decoding performance.
+Note: SageAttention only supports head_dim <= 256. For larger dimensions,
+automatically falls back to PyTorch SDPA.
 """
 
 import torch
@@ -11,7 +13,7 @@ import torch.nn.functional as F
 from typing import Optional, Tuple, List
 
 # Import SageAttention for optimized VAE attention
-from ..optimization.vae_sage_attention import sage_attn_vae, SAGE_ATTN_BATCHED_AVAILABLE
+from ..optimization.vae_sage_attention import sage_attn_vae, SAGE_ATTN_BATCHED_AVAILABLE, is_head_dim_supported
 
 
 class ResidualBlock(nn.Module):

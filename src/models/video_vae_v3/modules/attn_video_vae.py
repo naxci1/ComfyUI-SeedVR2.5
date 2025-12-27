@@ -54,7 +54,7 @@ from .types import (
     _receptive_field_t,
 )
 from ....optimization.memory_manager import retry_on_oom
-from ....optimization.vae_sage_attention import sage_attn_vae, SAGE_ATTN_BATCHED_AVAILABLE
+from ....optimization.vae_sage_attention import sage_attn_vae, SAGE_ATTN_BATCHED_AVAILABLE, is_head_dim_supported
 
 logger = get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -67,6 +67,7 @@ class SageAttentionVAEAttnProcessor:
     - SageAttention kernel for improved performance
     - Memory-efficient tiling for 16GB VRAM constraint
     - Automatic fallback to PyTorch SDPA when SageAttention unavailable
+    - Automatic fallback for unsupported head dimensions (> 256)
     """
     
     def __init__(self, tile_size: int = 64, use_tiling: bool = True):

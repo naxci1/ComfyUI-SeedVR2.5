@@ -39,6 +39,16 @@ except (ImportError, AttributeError, OSError):
 # Check if batched SageAttention is available (separate from varlen)
 SAGE_ATTN_BATCHED_AVAILABLE = _sageattn is not None
 
+# SageAttention 2.x supported head dimensions (must be <= 256)
+SAGE_ATTN_SUPPORTED_HEAD_DIMS = {32, 64, 96, 128, 256}
+SAGE_ATTN_MAX_HEAD_DIM = 256
+
+
+def is_head_dim_supported(head_dim: int) -> bool:
+    """Check if head dimension is supported by SageAttention 2.x."""
+    # SageAttention supports head_dim up to 256
+    return head_dim <= SAGE_ATTN_MAX_HEAD_DIM
+
 
 @torch._dynamo.disable
 def sage_attn_vae(
@@ -54,7 +64,7 @@ def sage_attn_vae(
     Optimized for VAE decoder mid-block attention with:
     - Automatic dtype conversion to fp16/bf16 (SageAttention requirement)
     - Proper scale factor handling
-    - Fallback to PyTorch SDPA when SageAttention unavailable
+    - Fallback to PyTorch SDPA when SageAttention unavailable or head_dim unsupported
     
     Args:
         q: Query tensor (B, num_heads, seq_len, head_dim)
@@ -65,8 +75,15 @@ def sage_attn_vae(
         
     Returns:
         Attention output tensor (B, num_heads, seq_len, head_dim)
+        
+    Note:
+        SageAttention 2.x only supports head_dim <= 256. For larger head dimensions
+        (e.g., 512 common in VAE architectures), automatically falls back to PyTorch SDPA.
     """
-    if not SAGE_ATTN_BATCHED_AVAILABLE:
+    head_dim = q.shape[-1]
+    
+    # Check if SageAttention is available and head_dim is supported
+    if not SAGE_ATTN_BATCHED_AVAILABLE or not is_head_dim_supported(head_dim):
         # Fallback to PyTorch scaled_dot_product_attention
         return F.scaled_dot_product_attention(q, k, v, is_causal=is_causal, scale=scale)
     
@@ -87,7 +104,7 @@ def sage_attn_vae(
     
     # Calculate scale if not provided
     if scale is None:
-        scale = q.shape[-1] ** -0.5
+        scale = head_dim ** -0.5
     
     # Call SageAttention
     # sageattn expects (B, num_heads, seq_len, head_dim) layout
@@ -394,5 +411,7 @@ def get_sage_attention_status() -> dict:
         "sage_attn_3_available": SAGE_ATTN_3_AVAILABLE,
         "sage_attn_batched_available": SAGE_ATTN_BATCHED_AVAILABLE,
         "using_sage": SAGE_ATTN_BATCHED_AVAILABLE,
-        "fallback": "pytorch_sdpa" if not SAGE_ATTN_BATCHED_AVAILABLE else None,
+        "max_head_dim": SAGE_ATTN_MAX_HEAD_DIM,
+        "supported_head_dims": "up to 256 (32, 64, 96, 128, 256)",
+        "fallback": "pytorch_sdpa" if not SAGE_ATTN_BATCHED_AVAILABLE else "pytorch_sdpa for head_dim > 256",
     }
