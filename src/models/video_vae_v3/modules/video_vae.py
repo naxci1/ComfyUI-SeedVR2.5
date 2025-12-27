@@ -16,7 +16,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
-from einops import rearrange
 from ....common.half_precision_fixes import safe_pad_operation
 
 from ....common.distributed.advanced import get_sequence_parallel_world_size
@@ -42,6 +41,7 @@ from .types import (
     _receptive_field_t,
     _selective_checkpointing_t,
 )
+from ....optimization.vae_optimizations import pixel_shuffle_3d_optimized
 
 logger = get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -175,12 +175,12 @@ class Upsample3D(nn.Module):
 
         for i in range(len(hidden_states)):
             hidden_states[i] = self.upscale_conv(hidden_states[i])
-            hidden_states[i] = rearrange(
+            # Use optimized pixel shuffle instead of einops rearrange
+            # Pattern: "b (x y z c) f h w -> b c (f z) (h x) (w y)"
+            hidden_states[i] = pixel_shuffle_3d_optimized(
                 hidden_states[i],
-                "b (x y z c) f h w -> b c (f z) (h x) (w y)",
-                x=self.spatial_ratio,
-                y=self.spatial_ratio,
-                z=self.temporal_ratio,
+                spatial_ratio=self.spatial_ratio,
+                temporal_ratio=self.temporal_ratio
             )
 
         # [Overridden] For causal temporal conv

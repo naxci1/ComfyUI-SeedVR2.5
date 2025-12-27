@@ -52,6 +52,7 @@ from .types import (
     _receptive_field_t,
 )
 from ....optimization.memory_manager import retry_on_oom
+from ....optimization.vae_optimizations import pixel_shuffle_3d_optimized
 
 logger = get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -134,12 +135,12 @@ class Upsample3D(Upsample2D):
         for i in range(len(hidden_states)):
             def upscale_and_rearrange():
                 temp = self.upscale_conv(hidden_states[i])
-                return rearrange(
+                # Use optimized pixel shuffle instead of einops rearrange
+                # Pattern: "b (x y z c) f h w -> b c (f z) (h x) (w y)"
+                return pixel_shuffle_3d_optimized(
                     temp,
-                    "b (x y z c) f h w -> b c (f z) (h x) (w y)",
-                    x=self.spatial_ratio,
-                    y=self.spatial_ratio,
-                    z=self.temporal_ratio,
+                    spatial_ratio=self.spatial_ratio,
+                    temporal_ratio=self.temporal_ratio
                 )
             
             hidden_states[i] = retry_on_oom(
