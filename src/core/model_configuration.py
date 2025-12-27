@@ -1277,12 +1277,22 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
                 if patch_func:
                     use_sage = attn_opt.get('use_sage_attention', True)
                     use_fp16 = attn_opt.get('use_fp16', True)
+                    use_channels_last = attn_opt.get('use_channels_last', True)
                     debug.start_timer("vae_attention_optimization")
-                    patched_count = patch_func(model, use_sage=use_sage, use_fp16=use_fp16)
+                    patched_count = patch_func(model, use_sage=use_sage, use_fp16=use_fp16, 
+                                               use_channels_last=use_channels_last)
                     model._attention_optimized = True
-                    sage_status = "SageAttention" if attn_opt.get('sage_available', False) and use_sage else "optimized SDPA"
+                    optimizations = []
+                    if attn_opt.get('sage_available', False) and use_sage:
+                        optimizations.append("SageAttention")
+                    else:
+                        optimizations.append("SDPA")
+                    if use_channels_last:
+                        optimizations.append("channels_last")
+                    if use_fp16:
+                        optimizations.append("FP16")
                     debug.end_timer("vae_attention_optimization", 
-                                   f"VAE attention optimized ({patched_count} blocks, using {sage_status})")
+                                   f"VAE optimized ({patched_count} attn blocks, {', '.join(optimizations)})")
         
         # Propagate debug and tensor_offload_device to submodules
         model.debug = debug
