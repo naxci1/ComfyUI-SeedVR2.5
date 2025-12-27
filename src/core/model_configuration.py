@@ -1269,6 +1269,21 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
             else:
                 debug.log("Reusing existing torch.compile for VAE submodules", category="reuse")
         
+        # Apply attention optimization if configured (from VAE Attention Optimizer node)
+        if hasattr(runner, '_vae_attention_optimization') and runner._vae_attention_optimization:
+            attn_opt = runner._vae_attention_optimization
+            if attn_opt.get('enabled', False) and not getattr(model, '_attention_optimized', False):
+                patch_func = attn_opt.get('patch_function')
+                if patch_func:
+                    use_sage = attn_opt.get('use_sage_attention', True)
+                    use_fp16 = attn_opt.get('use_fp16', True)
+                    debug.start_timer("vae_attention_optimization")
+                    patched_count = patch_func(model, use_sage=use_sage, use_fp16=use_fp16)
+                    model._attention_optimized = True
+                    sage_status = "SageAttention" if attn_opt.get('sage_available', False) and use_sage else "optimized SDPA"
+                    debug.end_timer("vae_attention_optimization", 
+                                   f"VAE attention optimized ({patched_count} blocks, using {sage_status})")
+        
         # Propagate debug and tensor_offload_device to submodules
         model.debug = debug
         model.tensor_offload_device = runner._tensor_offload_device

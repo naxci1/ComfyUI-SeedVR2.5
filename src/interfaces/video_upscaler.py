@@ -377,6 +377,9 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
         dit_torch_compile_args = dit.get("torch_compile_args")
         vae_torch_compile_args = vae.get("torch_compile_args")
         
+        # Attention optimization args (from VAE Attention Optimizer node)
+        vae_attention_optimization = vae.get("attention_optimization")
+        
         # Print header
         debug.print_header()
 
@@ -435,6 +438,10 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 torch_compile_args_dit=dit_torch_compile_args,
                 torch_compile_args_vae=vae_torch_compile_args
             )
+            
+            # Apply VAE attention optimization if configured
+            if vae_attention_optimization:
+                runner._vae_attention_optimization = vae_attention_optimization
 
             # Store cache context in ctx for use in generation phases
             ctx['cache_context'] = cache_context
