@@ -49,13 +49,12 @@ Output Sample [B, C, F*T_factor, H*S_factor, W*S_factor]
 
 ### 2.1 Memory Bandwidth Bottlenecks
 
-#### 2.1.1 Upsample3D Operations (CRITICAL) - ✅ FIXED
+#### 2.1.1 Upsample3D Operations (CRITICAL)
 
 **Location**: `src/models/video_vae_v3/modules/attn_video_vae.py:110-174`
 
 ```python
 # Lines 134-143: The critical upscaling operation
-# BEFORE (slow einops rearrange):
 for i in range(len(hidden_states)):
     def upscale_and_rearrange():
         temp = self.upscale_conv(hidden_states[i])
@@ -66,17 +65,16 @@ for i in range(len(hidden_states)):
             y=self.spatial_ratio,
             z=self.temporal_ratio,
         )
-
-# AFTER (optimized pixel_shuffle_3d_optimized):
-# Uses native PyTorch reshape/permute instead of einops - 2-3x faster
 ```
 
-**Problem** (FIXED): 
+**Problem**: 
 - `upscale_conv` expands channels by `(spatial_ratio² × temporal_ratio)` = 4-8x
-- ~~`einops.rearrange` creates intermediate tensors for reshaping~~ → **FIXED: Now uses `pixel_shuffle_3d_optimized`**
+- `einops.rearrange` creates intermediate tensors for reshaping
 - Memory bandwidth bound: ~200-400 GB/s transfer for typical batch
 
-**Slowness Factor**: ✅ **OPTIMIZED** - Now using native PyTorch operations
+**Slowness Factor**: ⚠️ **HIGH** - This is the primary memory bottleneck
+
+**Recommended Fix**: Replace with native PyTorch `reshape/permute` operations (see Section 3.6)
 
 #### 2.1.2 ResnetBlock3D Forward Pass
 
@@ -421,9 +419,9 @@ def fast_decode(z):
 | Tiled/Sliced VAE | ✅ Implemented | Baseline | 40-60% |
 | torch.compile | ✅ Implemented | 15-25% | 0% |
 | FP16/BF16 | ✅ Implemented | 10-20% | 50% |
-| Optimized Pixel Shuffle 3D | ✅ **NEW** Implemented | 15-20% | 5-10% |
-| Fused GroupNorm+SiLU | ✅ **NEW** Available (vae_optimizations.py) | 15-25% | 10-20% |
-| CUDA Memory Optimizations | ✅ **NEW** Implemented | 5-10% | 5-10% |
+| Optimized Pixel Shuffle 3D | 💡 Recommended | 15-20% | 5-10% |
+| Fused GroupNorm+SiLU | 💡 Recommended | 15-25% | 10-20% |
+| CUDA Memory Optimizations | 💡 Recommended | 5-10% | 5-10% |
 | FlashAttention VAE | ❌ Not implemented | 10-15% overall | 5-10% |
 | Chunked Upsampling | ❌ Not implemented | 0% | 30-50% |
 | CUDA Graphs | ❌ Not implemented | 10-30% | 0% |
@@ -431,9 +429,9 @@ def fast_decode(z):
 
 ### Combined Potential Improvement
 
-With current optimizations implemented:
-- **Speed**: 30-50% faster decode operations
-- **VRAM**: 50-70% reduction in peak usage
+With all optimizations implemented:
+- **Speed**: 50-80% faster decode operations
+- **VRAM**: 60-80% reduction in peak usage
 
 ---
 

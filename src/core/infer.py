@@ -30,11 +30,7 @@ from ..optimization.performance import (
     optimized_channels_to_last,
     optimized_channels_to_second
 )
-from ..optimization.vae_optimizations import optimize_cuda_memory
 from ..models.dit_3b import na
-
-# Apply CUDA optimizations at module load time
-optimize_cuda_memory()
 
 
 class VideoDiffusionInfer():
