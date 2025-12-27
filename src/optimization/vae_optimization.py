@@ -40,6 +40,8 @@ def _optimized_attention_forward(self, hidden_states, encoder_hidden_states=None
     This replaces the default diffusers Attention forward with a faster
     implementation optimized for NVIDIA GPUs.
     """
+    # Store original dtype for restoration at the end
+    original_dtype = hidden_states.dtype
     residual = hidden_states
     
     input_ndim = hidden_states.ndim
@@ -53,6 +55,10 @@ def _optimized_attention_forward(self, hidden_states, encoder_hidden_states=None
     )
     
     if self.group_norm is not None:
+        # Ensure dtype matches group_norm parameters to avoid mixed dtype errors
+        gn_dtype = self.group_norm.weight.dtype if self.group_norm.weight is not None else hidden_states.dtype
+        if hidden_states.dtype != gn_dtype:
+            hidden_states = hidden_states.to(gn_dtype)
         hidden_states = self.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
     
     query = self.to_q(hidden_states)
@@ -78,7 +84,7 @@ def _optimized_attention_forward(self, hidden_states, encoder_hidden_states=None
     if use_sage:
         # SageAttention expects (B, H, N, D) format
         # Convert to half precision for SageAttention
-        original_dtype = query.dtype
+        compute_dtype = query.dtype
         if query.dtype == torch.float32:
             query = query.to(torch.float16)
             key = key.to(torch.float16)
@@ -86,14 +92,12 @@ def _optimized_attention_forward(self, hidden_states, encoder_hidden_states=None
         
         try:
             hidden_states = sageattn_func(query, key, value, is_causal=False)
-            if hidden_states.dtype != original_dtype:
-                hidden_states = hidden_states.to(original_dtype)
         except (RuntimeError, ValueError, TypeError) as e:
             # Fallback to SDPA if SageAttention fails (e.g., unsupported tensor shapes)
-            if query.dtype != original_dtype:
-                query = query.to(original_dtype)
-                key = key.to(original_dtype)
-                value = value.to(original_dtype)
+            if query.dtype != compute_dtype:
+                query = query.to(compute_dtype)
+                key = key.to(compute_dtype)
+                value = value.to(compute_dtype)
             hidden_states = F.scaled_dot_product_attention(
                 query, key, value, 
                 attn_mask=attention_mask,
@@ -110,9 +114,11 @@ def _optimized_attention_forward(self, hidden_states, encoder_hidden_states=None
         )
     
     hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, self.heads * head_dim)
-    # Only convert dtype if needed to avoid unnecessary tensor copies
-    if hidden_states.dtype != query.dtype:
-        hidden_states = hidden_states.to(query.dtype)
+    
+    # Ensure dtype matches for to_out linear layers
+    to_out_dtype = self.to_out[0].weight.dtype
+    if hidden_states.dtype != to_out_dtype:
+        hidden_states = hidden_states.to(to_out_dtype)
     
     # Linear projection
     hidden_states = self.to_out[0](hidden_states)
@@ -123,9 +129,16 @@ def _optimized_attention_forward(self, hidden_states, encoder_hidden_states=None
         hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
     
     if self.residual_connection:
+        # Ensure residual has matching dtype
+        if residual.dtype != hidden_states.dtype:
+            residual = residual.to(hidden_states.dtype)
         hidden_states = hidden_states + residual
     
     hidden_states = hidden_states / self.rescale_output_factor
+    
+    # Restore original dtype if needed
+    if hidden_states.dtype != original_dtype:
+        hidden_states = hidden_states.to(original_dtype)
     
     return hidden_states
 
