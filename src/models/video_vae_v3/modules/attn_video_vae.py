@@ -8,6 +8,8 @@
 # available at http://www.apache.org/licenses/LICENSE-2.0.
 #
 # This modified file is released under the same license.
+#
+# SageAttention 2.2.0 optimization added for improved VAE decoding performance.
 
 
 from contextlib import nullcontext
@@ -52,8 +54,153 @@ from .types import (
     _receptive_field_t,
 )
 from ....optimization.memory_manager import retry_on_oom
+from ....optimization.vae_sage_attention import sage_attn_vae, SAGE_ATTN_BATCHED_AVAILABLE
 
 logger = get_logger(__name__)  # pylint: disable=invalid-name
+
+
+class SageAttentionVAEAttnProcessor:
+    """
+    SageAttention 2.2.0 processor for diffusers Attention modules in VAE.
+    
+    Optimized for VAE decoder mid-block attention with:
+    - SageAttention kernel for improved performance
+    - Memory-efficient tiling for 16GB VRAM constraint
+    - Automatic fallback to PyTorch SDPA when SageAttention unavailable
+    """
+    
+    def __init__(self, tile_size: int = 64, use_tiling: bool = True):
+        self.tile_size = tile_size
+        self.use_tiling = use_tiling
+        self._use_sage = SAGE_ATTN_BATCHED_AVAILABLE
+    
+    def __call__(
+        self,
+        attn: Attention,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        temb: Optional[torch.Tensor] = None,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        
+        # Handle spatial norm if present
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
+        
+        input_ndim = hidden_states.ndim
+        
+        # Handle batch dimensions
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+        
+        batch_size, sequence_length, _ = hidden_states.shape
+        
+        # Handle encoder hidden states for cross-attention
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+        
+        # Apply group norm if present
+        if attn.group_norm is not None:
+            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+        
+        # Project Q, K, V
+        query = attn.to_q(hidden_states)
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+        
+        inner_dim = key.shape[-1]
+        head_dim = inner_dim // attn.heads
+        
+        # Reshape for multi-head attention
+        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        
+        # Apply SageAttention with optional tiling
+        if self.use_tiling and sequence_length > self.tile_size * self.tile_size:
+            hidden_states = self._tiled_attention(query, key, value, sequence_length, head_dim)
+        else:
+            hidden_states = sage_attn_vae(query, key, value, is_causal=False)
+        
+        # Reshape back
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        hidden_states = hidden_states.to(query.dtype)
+        
+        # Linear projection and dropout
+        hidden_states = attn.to_out[0](hidden_states)
+        if len(attn.to_out) > 1:
+            hidden_states = attn.to_out[1](hidden_states)
+        
+        # Reshape back to input format
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+        
+        # Apply residual connection and rescaling
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+        
+        hidden_states = hidden_states / attn.rescale_output_factor
+        
+        return hidden_states
+    
+    def _tiled_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        seq_len: int,
+        head_dim: int,
+    ) -> torch.Tensor:
+        """Memory-efficient tiled attention for large spatial dimensions."""
+        tile_seq = self.tile_size * self.tile_size
+        
+        if seq_len <= tile_seq:
+            return sage_attn_vae(query, key, value, is_causal=False)
+        
+        num_tiles = (seq_len + tile_seq - 1) // tile_seq
+        outputs = []
+        
+        for i in range(num_tiles):
+            start_idx = i * tile_seq
+            end_idx = min((i + 1) * tile_seq, seq_len)
+            
+            q_tile = query[:, :, start_idx:end_idx, :]
+            
+            # Sliding window for K, V
+            k_start = max(0, start_idx - tile_seq // 2)
+            k_end = min(seq_len, end_idx + tile_seq // 2)
+            
+            k_tile = key[:, :, k_start:k_end, :]
+            v_tile = value[:, :, k_start:k_end, :]
+            
+            out_tile = sage_attn_vae(q_tile, k_tile, v_tile, is_causal=False)
+            outputs.append(out_tile)
+        
+        return torch.cat(outputs, dim=2)
+
+
+def set_vae_sage_attention_processor(vae_model, tile_size: int = 64, use_tiling: bool = True):
+    """
+    Set SageAttention processor on all Attention modules in a VAE model.
+    
+    Args:
+        vae_model: The VAE model to modify
+        tile_size: Tile size for memory-efficient processing
+        use_tiling: Whether to use tiled attention for large sequences
+    """
+    processor = SageAttentionVAEAttnProcessor(tile_size=tile_size, use_tiling=use_tiling)
+    
+    for module in vae_model.modules():
+        if isinstance(module, Attention):
+            module.set_processor(processor)
+    
+    return vae_model
 
 class Upsample3D(Upsample2D):
     """A 3D upsampling layer with an optional convolution."""
