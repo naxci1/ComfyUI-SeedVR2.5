@@ -40,7 +40,6 @@ except (ImportError, AttributeError, OSError):
 SAGE_ATTN_BATCHED_AVAILABLE = _sageattn is not None
 
 # SageAttention 2.x supported head dimensions (must be <= 256)
-SAGE_ATTN_SUPPORTED_HEAD_DIMS = {32, 64, 96, 128, 256}
 SAGE_ATTN_MAX_HEAD_DIM = 256
 
 
@@ -412,6 +411,5 @@ def get_sage_attention_status() -> dict:
         "sage_attn_batched_available": SAGE_ATTN_BATCHED_AVAILABLE,
         "using_sage": SAGE_ATTN_BATCHED_AVAILABLE,
         "max_head_dim": SAGE_ATTN_MAX_HEAD_DIM,
-        "supported_head_dims": "up to 256 (32, 64, 96, 128, 256)",
-        "fallback": "pytorch_sdpa" if not SAGE_ATTN_BATCHED_AVAILABLE else "pytorch_sdpa for head_dim > 256",
+        "fallback": "pytorch_sdpa" if not SAGE_ATTN_BATCHED_AVAILABLE else f"pytorch_sdpa for head_dim > {SAGE_ATTN_MAX_HEAD_DIM}",
     }
