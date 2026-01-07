@@ -201,10 +201,38 @@ class InflatedCausalConv3d(Conv3d):
             # Update cache.
             cache = next_cache
 
+        # OPTIMIZATION [Report 2.1.3]: Memory-efficient concatenation
+        # Pre-allocate output tensor and copy slices in-place to avoid peak memory spike
+        def _memory_efficient_cat():
+            # Handle empty input list
+            if not x:
+                return torch.empty(0)
+            
+            # Calculate total size for the output tensor
+            total_size = sum(t.size(split_dim) for t in x)
+            out_shape = list(x[0].shape)
+            out_shape[split_dim] = total_size
+            
+            # Pre-allocate output tensor
+            output = torch.empty(out_shape, dtype=x[0].dtype, device=x[0].device)
+            
+            # Copy slices in-place sequentially
+            offset = 0
+            for i in range(len(x)):
+                t = x[i]
+                size = t.size(split_dim)
+                # Create slice for this portion
+                slices = [slice(None)] * len(out_shape)
+                slices[split_dim] = slice(offset, offset + size)
+                output[tuple(slices)].copy_(t)
+                offset += size
+                # Clear reference to help garbage collection
+                x[i] = None
+            
+            return output
+        
         output = retry_on_oom(
-            torch.cat,
-            x,
-            split_dim,
+            _memory_efficient_cat,
             debug=getattr(self, 'debug', None),
             operation_name="InflatedCausalConv3d.concat_splits"
         )
