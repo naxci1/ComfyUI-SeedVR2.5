@@ -1063,8 +1063,9 @@ def decode_all_batches(
             debug.log("Blackwell GPU detected: using bfloat16 for maximum decode performance", 
                      category="vae", force=True)
         
-        # ============ PROCESS EACH BATCH WITH DIVISION (Nested Slicing) ============
-        # Iterate through each batch individually - no global concatenation to avoid VRAM spikes
+        # ============ PROCESS EACH BATCH WITH NESTED SPLIT & PURGE LOGIC ============
+        # This is the "Load -> Split -> Decode -> Purge" cycle for Blackwell 16GB VRAM
+        # Key: We keep the batch on CPU, move ONLY the active sub-slice to CUDA
         
         debug.log(f"[VAE] Total batches to decode: {len(valid_latents)}", category="vae", force=True)
         
@@ -1072,42 +1073,32 @@ def decode_all_batches(
         
         debug.start_timer("vae_decode")
         
-        # Pre-decode: Ensure VAE is on CUDA and clear cache
-        if hasattr(runner.vae, 'clear_cache'):
-            runner.vae.clear_cache()
-        
         for batch_idx, upscaled_latent in enumerate(valid_latents):
             if upscaled_latent is None:
                 continue
             
             check_interrupt(ctx)
             
-            # Move latent to VAE device
+            # STEP 1: Move batch to CPU first to save VRAM (the entire batch stays in RAM)
             with torch.no_grad():
                 upscaled_latent = upscaled_latent.detach()
-                upscaled_latent = manage_tensor(
-                    tensor=upscaled_latent,
-                    target_device=ctx['vae_device'],
-                    tensor_name=f"latent_batch_{batch_idx+1}",
-                    dtype=ctx['compute_dtype'],
-                    debug=debug,
-                    reason="VAE decoding",
-                    indent_level=1
-                )
+                # Ensure batch is on CPU - we'll only move sub-slices to CUDA
+                if upscaled_latent.device.type != 'cpu':
+                    upscaled_latent = upscaled_latent.cpu()
             
             batch_frames = upscaled_latent.shape[0]
-            debug.log(f"[VAE] Batch {batch_idx+1}/{len(valid_latents)}: {batch_frames} frames, shape {upscaled_latent.shape}", 
+            debug.log(f"[VAE] Batch {batch_idx+1}/{len(valid_latents)}: {batch_frames} frames, shape {upscaled_latent.shape} (on CPU)", 
                      category="vae", force=True)
             
-            # Split batch using torch.chunk based on division factor
+            # STEP 2: Internal Split using torch.chunk (divide factor)
+            # Note: latent format is [T, C, H, W] so temporal is dim=0
             if division_factor == 1:
-                # No division - process entire batch at once
+                # No division - but still keep on CPU and move slice to CUDA
                 sub_slices = [upscaled_latent]
-                debug.log(f"[VAE] No division: processing all {batch_frames} frames at once", 
+                debug.log(f"[VAE] No division: will process all {batch_frames} frames", 
                          category="vae", indent_level=1)
             else:
-                # Use torch.chunk to split batch into equal parts along temporal dimension (dim=0)
-                # Note: latent format is [T, C, H, W] so temporal is dim=0
+                # Example: If batch_size = 85 and divide = 2, split into 42 + 43 frames
                 sub_slices = list(torch.chunk(upscaled_latent, chunks=division_factor, dim=0))
                 debug.log(f"[VAE] Using torch.chunk to split into {len(sub_slices)} sub-slices (factor={division_factor})", 
                          category="vae", indent_level=1)
@@ -1120,43 +1111,51 @@ def decode_all_batches(
                 if "error" not in vram_info:
                     debug.log(f"[VAE] VRAM Free: {vram_info['free_gb']:.2f}GB", category="vae", indent_level=1)
                 
-                # Explicit logging format as requested
                 debug.log(f"[VAE] Processing Batch {batch_idx+1}, Sub-slice {slice_idx+1}/{len(sub_slices)}", 
                          category="vae", force=True)
                 debug.log(f"[VAE] Sub-slice frames: {sub_slice.shape[0]}", category="vae", indent_level=1)
                 
-                # Ensure sub_slice is detached and no gradients
+                # A. Move ONLY the small sub-slice (e.g., 40 frames) to CUDA
                 with torch.no_grad():
-                    sub_latent = sub_slice.detach()
+                    sub_slice_cuda = sub_slice.detach().to(ctx['vae_device'])
                 
                 # Blackwell Optimization: Use bfloat16
-                if use_bfloat16 and sub_latent.dtype != torch.bfloat16:
-                    sub_latent = sub_latent.to(torch.bfloat16)
+                if use_bfloat16 and sub_slice_cuda.dtype != torch.bfloat16:
+                    sub_slice_cuda = sub_slice_cuda.to(torch.bfloat16)
                 
-                # Decode sub-latent with torch.no_grad()
+                # B. Reset VAE decoder internal temporal memory to prevent OOM leakage
+                if hasattr(runner.vae, 'decoder') and hasattr(runner.vae.decoder, 'reset_cache'):
+                    runner.vae.decoder.reset_cache()
+                if hasattr(runner.vae, 'clear_cache'):
+                    runner.vae.clear_cache()
+                
+                # C. Decode ONLY this sub-slice
                 with torch.no_grad():
-                    sub_samples = runner.vae_decode([sub_latent])
+                    decoded_rgb = runner.vae_decode([sub_slice_cuda])
                 
-                sub_sample = sub_samples[0]
-                del sub_samples
+                decoded_output = decoded_rgb[0]
+                del decoded_rgb
                 
-                debug.log(f"[VAE] Decoded sub-slice shape: {sub_sample.shape}", category="vae", indent_level=1)
+                debug.log(f"[VAE] Decoded sub-slice shape: {decoded_output.shape}", category="vae", indent_level=1)
                 
-                # Move to CPU immediately to free VRAM (Blackwell memory management)
-                sub_sample = sub_sample.cpu().detach()
-                batch_decoded_samples.append(sub_sample)
+                # D. IMMEDIATE PURGE: Move result to CPU and KILL the CUDA tensor
+                decoded_cpu = decoded_output.to("cpu")
+                batch_decoded_samples.append(decoded_cpu)
                 
-                # CRUCIAL: Strict VRAM cleanup after EACH sub-slice (not just each batch)
-                del sub_latent
+                del sub_slice_cuda
+                del decoded_output
+                
+                # E. Force Blackwell to reclaim every byte of VRAM
                 gc.collect()
                 if is_cuda_available():
                     torch.cuda.empty_cache()
+                
+                debug.log(f"[VAE] Batch {batch_idx+1}, Slice {slice_idx+1} DONE. VRAM Purged.", 
+                         category="vae", force=True)
             
-            # Free the batch latent and sub_slices
+            # Free the batch latent and sub_slices list (both on CPU, minimal impact but clean)
             del upscaled_latent, sub_slices
             gc.collect()
-            if is_cuda_available():
-                torch.cuda.empty_cache()
             
             # Concatenate all sub-slices from this batch
             with torch.no_grad():
