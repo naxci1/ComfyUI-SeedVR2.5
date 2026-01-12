@@ -1086,11 +1086,15 @@ def decode_all_batches(
                 indent_level=1
             )
             
-            # ============ Blackwell Optimization: Sub-batch VAE Decoding ============
+            # ============ Sub-batch VAE Decoding ============
             # Split large batches into smaller sub-batches for VRAM efficiency.
             # This allows using large batch_size for DiT (temporal quality) while
             # using smaller decode_vae_batch_size for VAE (VRAM efficiency).
             # Each sub-batch uses tiling=False for maximum speed.
+            
+            # [DEBUG] Log received decode_vae_batch_size
+            debug.log(f"[DEBUG] Received decode_vae_batch_size: {decode_vae_batch_size}", 
+                     category="vae", indent_level=1)
             
             # Get total frames in this latent (temporal dimension is first after channels_to_last)
             total_latent_frames = upscaled_latent.shape[0]
@@ -1118,13 +1122,23 @@ def decode_all_batches(
                 sub_end = min(sub_start + decode_vae_batch_size, total_latent_frames)
                 sub_size = sub_end - sub_start
                 
+                # [DEBUG] VRAM before sub-batch
+                vram_before = get_basic_vram_info(device=ctx['vae_device'])
+                if "error" not in vram_before:
+                    debug.log(f"[DEBUG] VRAM before sub-batch: {vram_before['free_gb']:.2f}GB free", 
+                             category="vae", indent_level=2)
+                
+                # [DEBUG] Processing frames
+                debug.log(f"[DEBUG] Processing frames {sub_start} to {sub_end} (Sub-batch {sub_idx + 1}/{num_sub_batches})", 
+                         category="vae", indent_level=2)
+                
                 debug.log(f"[VAE] Decoding sub-batch {sub_idx + 1} of {num_sub_batches} with size {sub_size}", 
                          category="vae", indent_level=2)
                 
                 # Extract sub-batch latent
                 sub_latent = upscaled_latent[sub_start:sub_end]
                 
-                # ============ Blackwell Optimization: Use bfloat16 for maximum performance ============
+                # Blackwell Optimization: Use bfloat16 for maximum performance
                 # RTX 50-series (Blackwell) has optimized bfloat16 tensor cores
                 if use_bfloat16 and sub_latent.dtype != torch.bfloat16:
                     sub_latent = sub_latent.to(torch.bfloat16)
@@ -1144,9 +1158,17 @@ def decode_all_batches(
                 decoded_sub_batches.append(sub_sample)
                 del sub_latent
                 
-                # Clear VRAM after each sub-batch
+                # Clear VRAM and run garbage collection after each sub-batch
                 if is_cuda_available():
+                    gc.collect()  # Run gc before empty_cache for maximum effect
                     torch.cuda.empty_cache()
+                    
+                    # [DEBUG] Peak VRAM usage after sub-batch
+                    vram_after = get_basic_vram_info(device=ctx['vae_device'])
+                    if "error" not in vram_after:
+                        peak_usage = vram_after['total_gb'] - vram_after['free_gb']
+                        debug.log(f"[DEBUG] Peak VRAM usage after this sub-batch: {peak_usage:.2f}GB", 
+                                 category="vae", indent_level=2)
             
             # Restore original tiling settings
             runner.decode_tiled = original_decode_tiled
