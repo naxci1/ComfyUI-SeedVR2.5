@@ -124,6 +124,29 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
                         "Provides 20-40% speedup with compatible PyTorch 2.0+ and Triton installation."
                     )
                 ),
+                io.Boolean.Input("enable_nvfp4",
+                    default=True,
+                    optional=True,
+                    tooltip=(
+                        "Enable NVFP4 (4-bit floating point) quantization for Blackwell GPUs.\n"
+                        "• Requires RTX 50-series (Blackwell) GPU with PyTorch 2.6+ and CUDA 12.8+\n"
+                        "• Provides 2-4x speedup for linear layers with ~75% VRAM reduction\n"
+                        "• Uses E2M1 format for weights with E4M3 scaling factors\n"
+                        "• Critical layers (Bias, Norm, Embeddings) remain in FP16 for quality\n"
+                        "\n"
+                        "Automatically enabled when supported. Disable to force FP16 precision."
+                    )
+                ),
+                io.Boolean.Input("nvfp4_async_offload",
+                    default=True,
+                    optional=True,
+                    tooltip=(
+                        "Enable async offloading with pinned memory for NVFP4 models.\n"
+                        "• Overlaps CPU-GPU transfers with computation\n"
+                        "• Reduces latency when using model offloading\n"
+                        "• Only active when NVFP4 is enabled and supported"
+                    )
+                ),
             ],
             outputs=[
                 io.Custom("SEEDVR2_DIT").Output(
@@ -136,7 +159,8 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
     def execute(cls, model: str, device: str, offload_device: str = "none",
                      cache_model: bool = False, blocks_to_swap: int = 0, 
                      swap_io_components: bool = False, attention_mode: str = "sdpa",
-                     torch_compile_args: Dict[str, Any] = None) -> io.NodeOutput:
+                     torch_compile_args: Dict[str, Any] = None,
+                     enable_nvfp4: bool = True, nvfp4_async_offload: bool = True) -> io.NodeOutput:
         """
         Create DiT model configuration for SeedVR2 main node
         
@@ -149,6 +173,8 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
             swap_io_components: Whether to offload I/O components (requires offload_device != device)
             attention_mode: Attention computation backend ('sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3')
             torch_compile_args: Optional torch.compile configuration from settings node
+            enable_nvfp4: Enable NVFP4 quantization for Blackwell GPUs (default: True)
+            nvfp4_async_offload: Enable async offloading with pinned memory for NVFP4 (default: True)
             
         Returns:
             NodeOutput containing configuration dictionary for SeedVR2 main node
@@ -165,6 +191,12 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
                 "(e.g., 'cpu' or another device). Set cache_model=False if you don't want to cache the model."
             )
         
+        # Lazy import to avoid loading torch at module level (breaks ComfyUI node registration)
+        from ..optimization.compatibility import NVFP4_AVAILABLE, BLACKWELL_GPU_DETECTED
+        
+        # Validate NVFP4 availability - only actually enable if hardware supports it
+        nvfp4_active = enable_nvfp4 and NVFP4_AVAILABLE
+        
         config = {
             "model": model,
             "device": device,
@@ -174,6 +206,9 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
             "swap_io_components": swap_io_components,
             "attention_mode": attention_mode,
             "torch_compile_args": torch_compile_args,
+            "enable_nvfp4": nvfp4_active,
+            "nvfp4_async_offload": nvfp4_async_offload and nvfp4_active,
+            "blackwell_detected": BLACKWELL_GPU_DETECTED,
             "node_id": get_executing_context().node_id,
         }
         
