@@ -1039,28 +1039,38 @@ def decode_all_batches(
         runner.decode_tiled = False
         
         # ============ COLLECT ALL LATENTS FROM PHASE 2 ============
-        # CRITICAL: We must iterate through EVERY item in ctx['all_upscaled_latents']
-        # If batch_size=85 and total=120, this list should have 2 items: 85 + 35 frames
+        # CRITICAL: Process packets SEQUENTIALLY without combining them
+        # Phase 2 produces independent packets: e.g., Batch 1 = 81 frames, Batch 2 = 69 frames
         
-        # First, log the raw structure
+        # First, log the raw structure EXPLICITLY
+        debug.log(f"[VAE] ============ SEQUENTIAL PACKET DECODING ============", category="vae", force=True)
         debug.log(f"[VAE] Scanning all_upscaled_latents...", category="vae", force=True)
-        debug.log(f"[VAE] all_upscaled_latents length: {len(ctx['all_upscaled_latents'])}", category="vae", indent_level=1)
+        
+        all_upscaled_list = ctx['all_upscaled_latents']
+        debug.log(f"[VAE] all_upscaled_latents type: {type(all_upscaled_list)}", category="vae", indent_level=1)
+        debug.log(f"[VAE] all_upscaled_latents length: {len(all_upscaled_list)}", category="vae", indent_level=1)
         
         # Build list of valid latents and count ALL frames BEFORE processing
         valid_latents = []
         original_batch_lengths = []
         total_latent_frames = 0
         
-        for i, lat in enumerate(ctx['all_upscaled_latents']):
+        # CRITICAL: Log EVERY entry, even None, to diagnose frame loss
+        for i in range(len(all_upscaled_list)):
+            lat = all_upscaled_list[i]
             if lat is not None:
-                valid_latents.append(lat)
+                # Latent format is [T, C, H, W] - frame count is dim 0
                 frames_in_batch = lat.shape[0]
+                valid_latents.append(lat)
                 total_latent_frames += frames_in_batch
-                debug.log(f"[VAE] Batch {i+1}: shape {lat.shape}, frames: {frames_in_batch}", category="vae", indent_level=1)
+                debug.log(f"[VAE] Packet {i+1}/{len(all_upscaled_list)}: shape {list(lat.shape)}, device: {lat.device}, frames: {frames_in_batch}", 
+                         category="vae", force=True, indent_level=1)
             else:
-                debug.log(f"[VAE] Batch {i+1}: None (skipping)", category="vae", indent_level=1)
+                debug.log(f"[VAE] Packet {i+1}/{len(all_upscaled_list)}: None (skipping)", 
+                         category="vae", force=True, indent_level=1)
         
         # Also process original lengths
+        debug.log(f"[VAE] all_ori_lengths: {ctx['all_ori_lengths']}", category="vae", indent_level=1)
         for o in ctx['all_ori_lengths']:
             if o is not None:
                 original_batch_lengths.append(o)
@@ -1068,9 +1078,10 @@ def decode_all_batches(
         if not valid_latents:
             raise ValueError("No valid latents to decode - all_upscaled_latents is empty or all None!")
         
-        # CRITICAL LOG: This must show the FULL frame count
+        # CRITICAL LOG: This MUST show the FULL frame count (e.g., 81 + 69 = 150)
         debug.log(f"[VAE] Total Frames in Latent List: {total_latent_frames}", category="vae", force=True)
-        debug.log(f"[VAE] Total batches to decode: {len(valid_latents)}", category="vae", force=True)
+        debug.log(f"[VAE] Total packets to decode: {len(valid_latents)}", category="vae", force=True)
+        debug.log(f"[VAE] Original batch lengths: {original_batch_lengths}", category="vae", indent_level=1)
         
         # Check for Blackwell GPU for bfloat16 optimization
         use_bfloat16 = is_blackwell_gpu()
@@ -1078,50 +1089,50 @@ def decode_all_batches(
             debug.log("Blackwell GPU detected: using bfloat16 for maximum decode performance", 
                      category="vae", force=True)
         
-        # ============ PROCESS EACH BATCH WITH NESTED SPLIT & PURGE LOGIC ============
+        # ============ PROCESS EACH PACKET WITH NESTED SPLIT & PURGE LOGIC ============
         # This is the "Load -> Split -> Decode -> Purge" cycle for Blackwell 16GB VRAM
-        # Key: We keep the batch on CPU, move ONLY the active sub-slice to CUDA
+        # Key: We keep the packet on CPU, move ONLY the active sub-slice to CUDA
         
-        debug.log(f"[VAE] Total batches to decode: {len(valid_latents)}", category="vae", force=True)
+        debug.log(f"[VAE] ============ STARTING ITERATIVE DECODE ============", category="vae", force=True)
         
         current_write_idx = 0
         
         debug.start_timer("vae_decode")
         
-        for batch_idx, upscaled_latent in enumerate(valid_latents):
+        for packet_idx, upscaled_latent in enumerate(valid_latents):
             if upscaled_latent is None:
                 continue
             
             check_interrupt(ctx)
             
-            # STEP 1: Move batch to CPU first to save VRAM (the entire batch stays in RAM)
+            # STEP 1: Move packet to CPU first to save VRAM (the entire packet stays in RAM)
             with torch.no_grad():
                 upscaled_latent = upscaled_latent.detach()
-                # Ensure batch is on CPU - we'll only move sub-slices to CUDA
+                # Ensure packet is on CPU - we'll only move sub-slices to CUDA
                 if upscaled_latent.device.type != 'cpu':
                     upscaled_latent = upscaled_latent.cpu()
             
-            batch_frames = upscaled_latent.shape[0]
-            debug.log(f"[VAE] Processing Batch {batch_idx+1}/{len(valid_latents)} ({batch_frames} frames)", 
+            packet_frames = upscaled_latent.shape[0]
+            debug.log(f"[VAE] Processing Packet {packet_idx+1}/{len(valid_latents)} ({packet_frames} frames)", 
                      category="vae", force=True)
-            debug.log(f"[VAE] Batch shape: {upscaled_latent.shape} (on CPU)", category="vae", indent_level=1)
+            debug.log(f"[VAE] Packet shape: {list(upscaled_latent.shape)} (on CPU)", category="vae", indent_level=1)
             
             # STEP 2: Internal Split using torch.chunk (divide factor)
             # CRITICAL: Latent format is [T, C, H, W] so temporal dimension is dim=0
             if division_factor == 1:
                 # No division - but still keep on CPU and move slice to CUDA
                 sub_slices = [upscaled_latent]
-                debug.log(f"[VAE] No division: will process all {batch_frames} frames at once", 
+                debug.log(f"[VAE] No division: will process all {packet_frames} frames at once", 
                          category="vae", indent_level=1)
             else:
-                # Split batch into division_factor parts
-                # Example: If batch_size = 85 and divide = 2, split into 42 + 43 frames
+                # Split packet into division_factor parts
+                # Example: If packet = 81 frames and divide = 2, split into 41 + 40 frames
                 sub_slices = list(torch.chunk(upscaled_latent, chunks=division_factor, dim=0))
                 frame_sizes = [s.shape[0] for s in sub_slices]
-                debug.log(f"[VAE] Splitting {batch_frames} frames into {len(sub_slices)} sub-slices: {frame_sizes}", 
+                debug.log(f"[VAE] Splitting {packet_frames} frames into {len(sub_slices)} sub-slices: {frame_sizes}", 
                          category="vae", indent_level=1)
             
-            batch_decoded_samples = []
+            packet_decoded_samples = []
             
             for slice_idx, sub_slice in enumerate(sub_slices):
                 # Log VRAM before slice
@@ -1130,7 +1141,7 @@ def decode_all_batches(
                     debug.log(f"[VAE] VRAM Free: {vram_info['free_gb']:.2f}GB", category="vae", indent_level=1)
                 
                 sub_slice_frames = sub_slice.shape[0]
-                debug.log(f"[VAE] Processing Batch {batch_idx+1}, Sub-slice {slice_idx+1}/{len(sub_slices)} -> {sub_slice_frames} frames", 
+                debug.log(f"[VAE] Processing Packet {packet_idx+1}, Sub-slice {slice_idx+1}/{len(sub_slices)} -> {sub_slice_frames} frames", 
                          category="vae", force=True)
                 
                 # A. Move ONLY the small sub-slice (e.g., 40 frames) to CUDA
@@ -1158,7 +1169,7 @@ def decode_all_batches(
                 
                 # D. IMMEDIATE PURGE: Move result to CPU and KILL the CUDA tensor
                 decoded_cpu = decoded_output.to("cpu")
-                batch_decoded_samples.append(decoded_cpu)
+                packet_decoded_samples.append(decoded_cpu)
                 
                 del sub_slice_cuda
                 del decoded_output
@@ -1168,27 +1179,27 @@ def decode_all_batches(
                 if is_cuda_available():
                     torch.cuda.empty_cache()
                 
-                debug.log(f"[VAE] Batch {batch_idx+1}, Slice {slice_idx+1} DONE. VRAM Purged.", 
+                debug.log(f"[VAE] Packet {packet_idx+1}, Slice {slice_idx+1} DONE. VRAM Purged.", 
                          category="vae", force=True)
             
-            # Free the batch latent and sub_slices list (both on CPU, minimal impact but clean)
+            # Free the packet latent and sub_slices list (both on CPU, minimal impact but clean)
             del upscaled_latent, sub_slices
             gc.collect()
             
-            # Concatenate all sub-slices from this batch
+            # Concatenate all sub-slices from this packet
             with torch.no_grad():
-                batch_sample = torch.cat(batch_decoded_samples, dim=0)
-            del batch_decoded_samples
+                packet_sample = torch.cat(packet_decoded_samples, dim=0)
+            del packet_decoded_samples
             
-            debug.log(f"[VAE] Batch {batch_idx+1} decoded sample shape: {batch_sample.shape}", category="vae", indent_level=1)
+            debug.log(f"[VAE] Packet {packet_idx+1} decoded sample shape: {list(packet_sample.shape)}", category="vae", indent_level=1)
             
             # Process through video rearrange
-            samples = optimized_video_rearrange([batch_sample])
+            samples = optimized_video_rearrange([packet_sample])
             sample = samples[0]
-            del samples, batch_sample
+            del samples, packet_sample
             
-            # Get original length for this batch
-            ori_length = original_batch_lengths[batch_idx] if batch_idx < len(original_batch_lengths) else sample.shape[0]
+            # Get original length for this packet
+            ori_length = original_batch_lengths[packet_idx] if packet_idx < len(original_batch_lengths) else sample.shape[0]
             
             # Trim temporal padding
             if ori_length < sample.shape[0]:
@@ -1206,7 +1217,7 @@ def decode_all_batches(
             sample = manage_tensor(
                 tensor=sample,
                 target_device=target_device,
-                tensor_name=f"sample_{batch_idx+1}",
+                tensor_name=f"sample_{packet_idx+1}",
                 dtype=ctx['compute_dtype'],
                 non_blocking=True,
                 debug=debug,
@@ -1224,7 +1235,7 @@ def decode_all_batches(
             else:
                 ctx['final_video'][write_start:write_end] = sample
             
-            ctx['decode_batch_info'].append((write_start, write_end, batch_idx, ori_length))
+            ctx['decode_batch_info'].append((write_start, write_end, packet_idx, ori_length))
             current_write_idx = write_end
             
             debug.log(f"Wrote {batch_frames_out} frames to positions {write_start}-{write_end}", 
@@ -1233,11 +1244,11 @@ def decode_all_batches(
             del sample
             
             # Free memory from original latents list
-            release_tensor_memory(ctx['all_upscaled_latents'][batch_idx])
-            ctx['all_upscaled_latents'][batch_idx] = None
+            release_tensor_memory(ctx['all_upscaled_latents'][packet_idx])
+            ctx['all_upscaled_latents'][packet_idx] = None
             
             if progress_callback:
-                progress_callback(batch_idx+1, len(valid_latents), 1, "Phase 3: Decoding")
+                progress_callback(packet_idx+1, len(valid_latents), 1, "Phase 3: Decoding")
         
         # Restore original tiling settings
         runner.decode_tiled = original_decode_tiled
