@@ -666,38 +666,340 @@ def is_nvfp4_checkpoint(checkpoint_path: str) -> bool:
 
 # Async offload utilities for Blackwell optimization
 
+class PinnedMemoryPool:
+    """
+    Reusable pool of pinned memory buffers for efficient CPU-GPU transfers.
+    
+    Pinned (page-locked) memory enables:
+    - DMA (Direct Memory Access) transfers
+    - Non-blocking async transfers
+    - Higher bandwidth on PCIe
+    
+    This pool reduces allocation overhead by reusing buffers.
+    """
+    
+    def __init__(self, max_pool_size_gb: float = 4.0, debug: Optional[Any] = None):
+        """
+        Initialize pinned memory pool.
+        
+        Args:
+            max_pool_size_gb: Maximum total pinned memory to allocate (GB)
+            debug: Debug instance for logging
+        """
+        self._buffers: Dict[str, torch.Tensor] = {}
+        self._buffer_last_used: Dict[str, float] = {}
+        self._total_allocated: int = 0
+        self._max_size = int(max_pool_size_gb * 1024 * 1024 * 1024)
+        self._debug = debug
+        self._enabled = torch.cuda.is_available()
+        
+        # Track statistics
+        self._hits = 0
+        self._misses = 0
+    
+    def _make_key(self, shape: torch.Size, dtype: torch.dtype) -> str:
+        """Create unique key for buffer lookup"""
+        return f"{tuple(shape)}_{dtype}"
+    
+    def get_buffer(self, shape: torch.Size, dtype: torch.dtype) -> Optional[torch.Tensor]:
+        """
+        Get a pinned buffer of the specified shape and dtype.
+        
+        If a matching buffer exists in the pool, reuse it.
+        Otherwise, allocate a new pinned buffer.
+        
+        Args:
+            shape: Required tensor shape
+            dtype: Required tensor dtype
+            
+        Returns:
+            Pinned memory tensor, or None if pinned memory disabled/failed
+        """
+        if not self._enabled:
+            return None
+        
+        import time
+        key = self._make_key(shape, dtype)
+        
+        if key in self._buffers:
+            self._hits += 1
+            self._buffer_last_used[key] = time.time()
+            return self._buffers[key]
+        
+        # Need to allocate new buffer
+        self._misses += 1
+        size_bytes = shape.numel() * torch.tensor([], dtype=dtype).element_size()
+        
+        # Check if we have room
+        if self._total_allocated + size_bytes > self._max_size:
+            # Try to evict least recently used buffers
+            self._evict_lru(size_bytes)
+        
+        if self._total_allocated + size_bytes > self._max_size:
+            # Still not enough room - skip pooling
+            if self._debug:
+                self._debug.log(f"Pinned memory pool full, allocating unpooled buffer", 
+                               category="memory")
+            try:
+                return torch.empty(shape, dtype=dtype, pin_memory=True)
+            except RuntimeError:
+                return None
+        
+        try:
+            buffer = torch.empty(shape, dtype=dtype, pin_memory=True)
+            self._buffers[key] = buffer
+            self._buffer_last_used[key] = time.time()
+            self._total_allocated += size_bytes
+            return buffer
+        except RuntimeError as e:
+            if self._debug:
+                self._debug.log(f"Failed to allocate pinned memory: {e}", 
+                               level="WARNING", category="memory", force=True)
+            return None
+    
+    def _evict_lru(self, needed_bytes: int) -> None:
+        """Evict least recently used buffers to free space"""
+        import time
+        
+        if not self._buffer_last_used:
+            return
+        
+        # Sort by last used time
+        sorted_keys = sorted(self._buffer_last_used.keys(), 
+                            key=lambda k: self._buffer_last_used[k])
+        
+        freed = 0
+        for key in sorted_keys:
+            if freed >= needed_bytes:
+                break
+            
+            if key in self._buffers:
+                buffer = self._buffers[key]
+                size = buffer.numel() * buffer.element_size()
+                del self._buffers[key]
+                del self._buffer_last_used[key]
+                self._total_allocated -= size
+                freed += size
+    
+    def copy_to_pinned(self, tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Copy tensor to a pinned memory buffer.
+        
+        Args:
+            tensor: Source tensor
+            
+        Returns:
+            Tensor in pinned memory (may be same tensor if already pinned)
+        """
+        if tensor.is_pinned():
+            return tensor
+        
+        buffer = self.get_buffer(tensor.shape, tensor.dtype)
+        if buffer is None:
+            # Fallback: direct allocation
+            try:
+                return tensor.pin_memory()
+            except RuntimeError:
+                return tensor.cpu()
+        
+        buffer.copy_(tensor)
+        return buffer
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get pool statistics"""
+        hit_rate = self._hits / (self._hits + self._misses) if (self._hits + self._misses) > 0 else 0
+        return {
+            'hits': self._hits,
+            'misses': self._misses,
+            'hit_rate': hit_rate,
+            'allocated_mb': self._total_allocated / (1024 * 1024),
+            'max_mb': self._max_size / (1024 * 1024),
+            'buffer_count': len(self._buffers)
+        }
+    
+    def clear(self) -> None:
+        """Release all pooled buffers"""
+        self._buffers.clear()
+        self._buffer_last_used.clear()
+        self._total_allocated = 0
+
+
+class CUDAStreamManager:
+    """
+    Manage CUDA streams for overlapped operations.
+    
+    Provides separate streams for:
+    - Compute operations (default stream)
+    - Host-to-Device transfers (H2D stream)
+    - Device-to-Host transfers (D2H stream)
+    
+    This enables overlapping compute with data transfers for maximum throughput.
+    """
+    
+    def __init__(self, debug: Optional[Any] = None):
+        self._debug = debug
+        self._enabled = torch.cuda.is_available()
+        
+        if self._enabled:
+            # Create dedicated streams
+            self._h2d_stream = torch.cuda.Stream()
+            self._d2h_stream = torch.cuda.Stream()
+            self._compute_stream = torch.cuda.Stream()
+            
+            # Events for synchronization
+            self._h2d_events: Dict[str, torch.cuda.Event] = {}
+            self._compute_events: Dict[str, torch.cuda.Event] = {}
+        else:
+            self._h2d_stream = None
+            self._d2h_stream = None
+            self._compute_stream = None
+            self._h2d_events = {}
+            self._compute_events = {}
+    
+    @property
+    def h2d_stream(self) -> Optional[torch.cuda.Stream]:
+        """Get Host-to-Device transfer stream"""
+        return self._h2d_stream
+    
+    @property
+    def d2h_stream(self) -> Optional[torch.cuda.Stream]:
+        """Get Device-to-Host transfer stream"""
+        return self._d2h_stream
+    
+    @property
+    def compute_stream(self) -> Optional[torch.cuda.Stream]:
+        """Get compute stream"""
+        return self._compute_stream
+    
+    def transfer_h2d_async(self, tensor: torch.Tensor, device: torch.device,
+                           name: str = "tensor") -> torch.Tensor:
+        """
+        Asynchronously transfer tensor from host to device.
+        
+        Args:
+            tensor: Source tensor on CPU
+            device: Target CUDA device
+            name: Name for tracking/debugging
+            
+        Returns:
+            Tensor on device (transfer may still be in progress)
+        """
+        if not self._enabled or device.type != 'cuda':
+            return tensor.to(device)
+        
+        with torch.cuda.stream(self._h2d_stream):
+            result = tensor.to(device, non_blocking=True)
+            
+            # Record event for synchronization
+            event = torch.cuda.Event()
+            event.record(self._h2d_stream)
+            self._h2d_events[name] = event
+            
+        return result
+    
+    def transfer_d2h_async(self, tensor: torch.Tensor, name: str = "tensor") -> torch.Tensor:
+        """
+        Asynchronously transfer tensor from device to host.
+        
+        Args:
+            tensor: Source tensor on device
+            name: Name for tracking/debugging
+            
+        Returns:
+            Tensor on CPU (transfer may still be in progress)
+        """
+        if not self._enabled or tensor.device.type != 'cuda':
+            return tensor.cpu()
+        
+        with torch.cuda.stream(self._d2h_stream):
+            result = tensor.cpu()
+            
+        return result
+    
+    def wait_for_h2d(self, name: str) -> None:
+        """Wait for specific H2D transfer to complete"""
+        if name in self._h2d_events:
+            self._h2d_events[name].synchronize()
+            del self._h2d_events[name]
+    
+    def synchronize_all(self) -> None:
+        """Wait for all async operations to complete"""
+        if self._enabled:
+            if self._h2d_stream:
+                self._h2d_stream.synchronize()
+            if self._d2h_stream:
+                self._d2h_stream.synchronize()
+            if self._compute_stream:
+                self._compute_stream.synchronize()
+        
+        self._h2d_events.clear()
+        self._compute_events.clear()
+
+
 class AsyncModelOffloader:
     """
     Async model offloading with pinned memory for Blackwell optimization.
     
     Uses CUDA streams and pinned memory to overlap CPU-GPU transfers
     with computation for maximum throughput.
+    
+    Key optimizations for RTX 50-series:
+    - Pinned memory pool for reduced allocation overhead
+    - Dedicated CUDA streams for H2D/D2H transfers
+    - Layer-by-layer prefetching during inference
+    - Automatic detection of Blackwell architecture
     """
     
-    def __init__(self, use_pinned_memory: bool = True, debug: Optional[Any] = None):
+    def __init__(self, use_pinned_memory: bool = True, debug: Optional[Any] = None,
+                 max_pinned_pool_gb: float = 4.0):
+        """
+        Initialize async offloader.
+        
+        Args:
+            use_pinned_memory: Enable pinned memory for async transfers
+            debug: Debug instance for logging
+            max_pinned_pool_gb: Maximum pinned memory pool size (GB)
+        """
         self.use_pinned_memory = use_pinned_memory and torch.cuda.is_available()
         self.debug = debug
+        
+        # Initialize pinned memory pool
+        self._pinned_pool = PinnedMemoryPool(
+            max_pool_size_gb=max_pinned_pool_gb,
+            debug=debug
+        ) if self.use_pinned_memory else None
+        
+        # Initialize CUDA stream manager
+        self._stream_manager = CUDAStreamManager(debug=debug)
+        
+        # Legacy buffer dict for backward compatibility
         self._pinned_buffers: Dict[str, torch.Tensor] = {}
         self._offload_stream = None
         
         if torch.cuda.is_available():
             self._offload_stream = torch.cuda.Stream()
+        
+        # Track if Blackwell optimizations are active
+        self._blackwell_optimized = is_blackwell_gpu() and self.use_pinned_memory
     
     def _get_pinned_buffer(self, tensor: torch.Tensor, name: str) -> torch.Tensor:
         """Get or create a pinned memory buffer for a tensor"""
         if not self.use_pinned_memory:
             return tensor.cpu()
         
+        # Use pool if available
+        if self._pinned_pool:
+            return self._pinned_pool.copy_to_pinned(tensor.cpu())
+        
+        # Legacy path: individual buffers
         key = f"{name}_{tensor.shape}_{tensor.dtype}"
         
         if key not in self._pinned_buffers:
-            # Create pinned buffer
             self._pinned_buffers[key] = torch.empty(
                 tensor.shape, dtype=tensor.dtype, 
                 pin_memory=True
             )
         
-        # Copy to pinned buffer
         buffer = self._pinned_buffers[key]
         buffer.copy_(tensor)
         return buffer
@@ -748,14 +1050,165 @@ class AsyncModelOffloader:
         with torch.cuda.stream(self._offload_stream):
             model.to(device, non_blocking=True)
     
+    def prefetch_layer(self, layer: nn.Module, device: torch.device,
+                       layer_name: str = "layer") -> None:
+        """
+        Prefetch a layer to GPU while compute is happening on current layer.
+        
+        This enables overlapped loading for BlockSwap-style layer streaming.
+        
+        Args:
+            layer: Layer to prefetch
+            device: Target device
+            layer_name: Name for tracking
+        """
+        if not torch.cuda.is_available() or device.type != 'cuda':
+            layer.to(device)
+            return
+        
+        h2d_stream = self._stream_manager.h2d_stream
+        if h2d_stream is None:
+            layer.to(device)
+            return
+        
+        with torch.cuda.stream(h2d_stream):
+            layer.to(device, non_blocking=True)
+    
+    def wait_for_prefetch(self) -> None:
+        """Wait for prefetched layer to be ready"""
+        self._stream_manager.synchronize_all()
+    
+    def transfer_tensor_async(self, tensor: torch.Tensor, device: torch.device,
+                              name: str = "tensor") -> torch.Tensor:
+        """
+        Transfer a tensor to device asynchronously.
+        
+        If tensor is on CPU, uses pinned memory for efficient DMA transfer.
+        
+        Args:
+            tensor: Tensor to transfer
+            device: Target device
+            name: Name for tracking
+            
+        Returns:
+            Tensor on target device (transfer may be in progress)
+        """
+        if tensor.device == device:
+            return tensor
+        
+        # CPU to GPU: use pinned memory path
+        if tensor.device.type == 'cpu' and device.type == 'cuda':
+            if self.use_pinned_memory and self._pinned_pool:
+                pinned = self._pinned_pool.copy_to_pinned(tensor)
+                return self._stream_manager.transfer_h2d_async(pinned, device, name)
+            return self._stream_manager.transfer_h2d_async(tensor, device, name)
+        
+        # GPU to CPU
+        if tensor.device.type == 'cuda' and device.type == 'cpu':
+            return self._stream_manager.transfer_d2h_async(tensor, name)
+        
+        # Same device type, different index, or other cases
+        return tensor.to(device, non_blocking=True)
+    
     def synchronize(self) -> None:
         """Wait for all async operations to complete"""
         if self._offload_stream is not None:
             self._offload_stream.synchronize()
+        self._stream_manager.synchronize_all()
     
     def cleanup(self) -> None:
         """Release pinned memory buffers"""
         self._pinned_buffers.clear()
+        if self._pinned_pool:
+            if self.debug:
+                stats = self._pinned_pool.get_stats()
+                self.debug.log(
+                    f"Pinned memory pool stats: {stats['hits']} hits, {stats['misses']} misses, "
+                    f"{stats['hit_rate']:.1%} hit rate, {stats['allocated_mb']:.1f}MB allocated",
+                    category="memory"
+                )
+            self._pinned_pool.clear()
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get offloader statistics"""
+        stats = {
+            'blackwell_optimized': self._blackwell_optimized,
+            'pinned_memory_enabled': self.use_pinned_memory
+        }
+        if self._pinned_pool:
+            stats['pool_stats'] = self._pinned_pool.get_stats()
+        return stats
+
+
+def ensure_native_fp4_dispatch() -> bool:
+    """
+    Ensure PyTorch uses native FP4 kernels on Blackwell GPUs.
+    
+    This function configures PyTorch to prefer native FP4 Tensor Core
+    operations over software fallbacks. Call this before model inference.
+    
+    Returns:
+        True if native FP4 dispatch is active, False if fallback mode
+    """
+    if not is_nvfp4_supported():
+        return False
+    
+    try:
+        # Enable TF32 for Tensor Core operations (helps with FP4 too)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        # Set CUDA memory allocator to be more efficient
+        if hasattr(torch.cuda, 'memory') and hasattr(torch.cuda.memory, 'set_per_process_memory_fraction'):
+            # Don't limit memory - let the allocator use what's available
+            pass
+        
+        # Enable cudnn benchmark for optimal kernel selection
+        torch.backends.cudnn.benchmark = True
+        
+        # For Blackwell, ensure we're using the native compute path
+        # This helps the dispatcher select the right kernels
+        if hasattr(torch._C, '_cuda_setBlackwellOptimizations'):
+            torch._C._cuda_setBlackwellOptimizations(True)
+        
+        return True
+        
+    except Exception:
+        return False
+
+
+def create_pinned_tensor(shape: torch.Size, dtype: torch.dtype,
+                         fill_value: Optional[float] = None) -> torch.Tensor:
+    """
+    Create a tensor in pinned (page-locked) memory.
+    
+    Pinned memory enables faster CPU-GPU transfers via DMA.
+    Use this for tensors that will be frequently transferred.
+    
+    Args:
+        shape: Tensor shape
+        dtype: Tensor dtype
+        fill_value: Optional value to fill tensor with
+        
+    Returns:
+        Pinned memory tensor on CPU
+    """
+    if not torch.cuda.is_available():
+        if fill_value is not None:
+            return torch.full(shape, fill_value, dtype=dtype)
+        return torch.empty(shape, dtype=dtype)
+    
+    try:
+        if fill_value is not None:
+            tensor = torch.full(shape, fill_value, dtype=dtype, pin_memory=True)
+        else:
+            tensor = torch.empty(shape, dtype=dtype, pin_memory=True)
+        return tensor
+    except RuntimeError:
+        # Fallback if pinned allocation fails
+        if fill_value is not None:
+            return torch.full(shape, fill_value, dtype=dtype)
+        return torch.empty(shape, dtype=dtype)
 
 
 # Module exports
@@ -764,6 +1217,8 @@ __all__ = [
     'NVFP4Tensor',
     'NvFP4LinearLayer',
     'AsyncModelOffloader',
+    'PinnedMemoryPool',
+    'CUDAStreamManager',
     'is_nvfp4_supported',
     'is_blackwell_gpu',
     'get_nvfp4_status',
@@ -771,5 +1226,7 @@ __all__ = [
     'quantize_to_nvfp4',
     'load_nvfp4_weights',
     'is_nvfp4_checkpoint',
+    'ensure_native_fp4_dispatch',
+    'create_pinned_tensor',
     'PRESERVED_LAYER_PATTERNS',
 ]

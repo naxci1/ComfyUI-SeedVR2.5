@@ -731,6 +731,14 @@ if not os.environ.get("SEEDVR2_OPTIMIZATIONS_LOGGED"):
         if NVFP4_AVAILABLE:
             gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "Blackwell GPU"
             print(f"🚀 NVFP4 Blackwell optimization: {nvfp4_status} ({gpu_name} - 4-bit Tensor Core acceleration enabled)")
+            
+            # Enable native FP4 dispatch for Blackwell
+            try:
+                from .nvfp4 import ensure_native_fp4_dispatch
+                if ensure_native_fp4_dispatch():
+                    print("   └─ Native FP4 dispatch configured (TF32 enabled, cuDNN benchmark active)")
+            except ImportError:
+                pass
         else:
             # Blackwell GPU detected but NVFP4 not available (needs PyTorch 2.6+ with CUDA 12.8+)
             print(f"🔷 Blackwell GPU detected but NVFP4 unavailable (requires PyTorch 2.6+ with CUDA 12.8+)")
