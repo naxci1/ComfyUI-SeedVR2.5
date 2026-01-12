@@ -56,6 +56,7 @@ from ..optimization.memory_manager import (
     is_cuda_available,
     get_basic_vram_info
 )
+from ..optimization.nvfp4 import is_blackwell_gpu
 from ..optimization.performance import (
     optimized_video_rearrange, 
     optimized_single_video_rearrange, 
@@ -916,7 +917,8 @@ def decode_all_batches(
     ctx: Dict[str, Any],
     debug: 'Debug',
     progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
-    cache_model: bool = False
+    cache_model: bool = False,
+    decode_vae_batch_size: int = 16
 ) -> Dict[str, Any]:
     """
     Phase 3: VAE Decoding.
@@ -924,6 +926,10 @@ def decode_all_batches(
     Decodes all upscaled latents back to pixel space and writes directly to
     pre-allocated final_video tensor. This avoids memory duplication by not
     storing intermediate batch_samples.
+    
+    Supports sub-batch decoding to decouple VAE decoding from DiT batch size,
+    allowing large DiT batches for temporal quality while using smaller VAE
+    sub-batches for VRAM efficiency.
     
     Requires context from upscale_all_batches with upscaled latents.
     
@@ -933,6 +939,7 @@ def decode_all_batches(
         debug: Debug instance for logging (required)
         progress_callback: Optional callback(current, total, frames, phase_name)
         cache_model: If True, keep VAE model for reuse instead of deleting it
+        decode_vae_batch_size: Number of frames to decode per VAE sub-batch (default: 16)
         
     Returns:
         dict: Updated context containing:
@@ -1079,14 +1086,81 @@ def decode_all_batches(
                 indent_level=1
             )
             
-            # Decode latent
+            # ============ Blackwell Optimization: Sub-batch VAE Decoding ============
+            # Split large batches into smaller sub-batches for VRAM efficiency.
+            # This allows using large batch_size for DiT (temporal quality) while
+            # using smaller decode_vae_batch_size for VAE (VRAM efficiency).
+            # Each sub-batch uses tiling=False for maximum speed.
+            
+            # Get total frames in this latent (temporal dimension is first after channels_to_last)
+            total_latent_frames = upscaled_latent.shape[0]
+            # Ceiling division: (a + b - 1) // b == ceil(a / b)
+            num_sub_batches = (total_latent_frames + decode_vae_batch_size - 1) // decode_vae_batch_size
+            
+            debug.log(f"Decoding {total_latent_frames} frames in {num_sub_batches} sub-batches of {decode_vae_batch_size}", 
+                     category="vae", indent_level=1)
+            
+            # Store original tiling settings to restore later
+            original_decode_tiled = runner.decode_tiled
+            
+            # Check for Blackwell GPU once for bfloat16 optimization
+            use_bfloat16 = is_blackwell_gpu()
+            if use_bfloat16:
+                debug.log("Blackwell GPU detected: using bfloat16 for maximum decode performance", 
+                         category="vae", indent_level=1)
+            
+            # Collect decoded sub-batches
+            decoded_sub_batches = []
+            
             debug.start_timer("vae_decode")
-            samples = runner.vae_decode([upscaled_latent])
+            for sub_idx in range(num_sub_batches):
+                sub_start = sub_idx * decode_vae_batch_size
+                sub_end = min(sub_start + decode_vae_batch_size, total_latent_frames)
+                sub_size = sub_end - sub_start
+                
+                debug.log(f"[VAE] Decoding sub-batch {sub_idx + 1} of {num_sub_batches} with size {sub_size}", 
+                         category="vae", indent_level=2)
+                
+                # Extract sub-batch latent
+                sub_latent = upscaled_latent[sub_start:sub_end]
+                
+                # ============ Blackwell Optimization: Use bfloat16 for maximum performance ============
+                # RTX 50-series (Blackwell) has optimized bfloat16 tensor cores
+                if use_bfloat16 and sub_latent.dtype != torch.bfloat16:
+                    sub_latent = sub_latent.to(torch.bfloat16)
+                
+                # Disable tiling for sub-batch decoding (faster, no tile seams)
+                runner.decode_tiled = False
+                
+                # Decode sub-batch
+                sub_samples = runner.vae_decode([sub_latent])
+                
+                # Get decoded sample and immediately move to CPU to free VRAM
+                sub_sample = sub_samples[0]
+                del sub_samples
+                
+                # Move decoded sub-batch to CPU immediately to free VRAM
+                sub_sample = sub_sample.cpu()
+                decoded_sub_batches.append(sub_sample)
+                del sub_latent
+                
+                # Clear VRAM after each sub-batch
+                if is_cuda_available():
+                    torch.cuda.empty_cache()
+            
+            # Restore original tiling settings
+            runner.decode_tiled = original_decode_tiled
             debug.end_timer("vae_decode", "VAE decode")
             
-            # Process samples - get the single decoded sample
+            # Concatenate all sub-batches on CPU (they're already there)
+            # This is memory-efficient as each sub-batch was moved to CPU immediately
+            sample = torch.cat(decoded_sub_batches, dim=0)
+            del decoded_sub_batches
+            # ============ End Sub-batch VAE Decoding ============
+            
+            # Process samples
             debug.start_timer("optimized_video_rearrange")
-            samples = optimized_video_rearrange(samples)
+            samples = optimized_video_rearrange([sample])
             debug.end_timer("optimized_video_rearrange", "Video rearrange")
             
             # Get the decoded sample (always single-element list)
