@@ -564,6 +564,58 @@ except ImportError:
     GGMLQuantizationType = None
 
 
+# 4. NVFP4 - Native 4-bit floating point for Blackwell (RTX 50-series)
+# Deferred import to avoid circular dependency - just set flags here
+NVFP4_AVAILABLE = False
+BLACKWELL_GPU_DETECTED = False
+
+def _check_nvfp4_support():
+    """Check if NVFP4 is supported (Blackwell GPU + PyTorch 2.6+ + CUDA 12.8+)"""
+    global NVFP4_AVAILABLE, BLACKWELL_GPU_DETECTED
+    
+    if not torch.cuda.is_available():
+        return False, False
+    
+    try:
+        # Check for Blackwell GPU (compute capability 10.0+)
+        capability = torch.cuda.get_device_capability(0)
+        is_blackwell = capability[0] >= 10
+        BLACKWELL_GPU_DETECTED = is_blackwell
+        
+        if not is_blackwell:
+            return False, False
+        
+        # Check PyTorch version (need 2.6+)
+        version_str = torch.__version__.split('+')[0]
+        parts = version_str.split('.')
+        torch_version = tuple(int(p) for p in parts[:2])
+        if torch_version < (2, 6):
+            return False, True  # Blackwell detected but PyTorch too old
+        
+        # Check CUDA version (need 12.8+)
+        cuda_version = torch.version.cuda
+        if cuda_version is None:
+            return False, True
+        
+        cuda_parts = cuda_version.split('.')
+        cuda_major = int(cuda_parts[0])
+        cuda_minor = int(cuda_parts[1]) if len(cuda_parts) > 1 else 0
+        
+        if cuda_major < 12 or (cuda_major == 12 and cuda_minor < 8):
+            return False, True  # Blackwell detected but CUDA too old
+        
+        NVFP4_AVAILABLE = True
+        return True, True
+        
+    except Exception:
+        return False, False
+
+# Run NVFP4 check at module load
+_nvfp4_result = _check_nvfp4_support()
+NVFP4_AVAILABLE = _nvfp4_result[0]
+BLACKWELL_GPU_DETECTED = _nvfp4_result[1]
+
+
 def validate_gguf_availability(operation: str = "load GGUF model", debug=None) -> None:
     """
     Validate GGUF availability and raise error if not installed.
@@ -648,6 +700,7 @@ if not os.environ.get("SEEDVR2_OPTIMIZATIONS_LOGGED"):
     sage_status = "✅" if SAGE_ATTN_AVAILABLE else "❌"
     flash_status = "✅" if FLASH_ATTN_AVAILABLE else "❌"
     triton_status = "✅" if TRITON_AVAILABLE else "❌"
+    nvfp4_status = "✅" if NVFP4_AVAILABLE else "❌"
     
     # Count available optimizations
     available = [SAGE_ATTN_AVAILABLE, FLASH_ATTN_AVAILABLE, TRITON_AVAILABLE]
@@ -672,6 +725,15 @@ if not os.environ.get("SEEDVR2_OPTIMIZATIONS_LOGGED"):
             missing.append("triton")
         if missing:
             print(f"💡 Optional: pip install {' '.join(missing)}")
+    
+    # NVFP4/Blackwell status (RTX 50-series optimizations)
+    if BLACKWELL_GPU_DETECTED:
+        if NVFP4_AVAILABLE:
+            gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "Blackwell GPU"
+            print(f"🚀 NVFP4 Blackwell optimization: {nvfp4_status} ({gpu_name} - 4-bit Tensor Core acceleration enabled)")
+        else:
+            # Blackwell GPU detected but NVFP4 not available (needs PyTorch 2.6+ with CUDA 12.8+)
+            print(f"🔷 Blackwell GPU detected but NVFP4 unavailable (requires PyTorch 2.6+ with CUDA 12.8+)")
     
     # Conv3d workaround status (if applicable)
     if NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND:
