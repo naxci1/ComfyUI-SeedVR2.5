@@ -1151,7 +1151,7 @@ def decode_all_batches(
             debug.log(f"[VAE] ====== Starting Packet {packet_id} ======", category="vae", force=True)
             debug.log(f"[VAE] Starting Packet {packet_id} (Total: {packet_frames} frames). Splitting into {division_factor if division_factor > 1 else 1} sub-slices.", 
                      category="vae", force=True)
-            debug.log(f"[VAE] Packet shape: {list(upscaled_latent.shape)} (on CPU)", category="vae", indent_level=1)
+            debug.log(f"[VAE] Packet shape: {list(upscaled_latent.shape)} (STAYS ON CPU - only sub-slices go to GPU)", category="vae", indent_level=1)
             
             # STEP 2: Split packet on CPU using torch.chunk
             # Apply dynamic division if needed
@@ -1241,13 +1241,28 @@ def decode_all_batches(
                     packet_decoded_samples.append(decoded_cpu)
                     total_decoded_frames += sub_slice_frames
                 
-                # E. FORCE Blackwell VRAM reclaim
+                # E. FORCE Blackwell VRAM reclaim - ONE-IN-ONE-OUT PRINCIPLE
+                # MANDATORY: VRAM must return to baseline (~0.5GB) before next sub-batch
                 gc.collect()
                 if is_cuda_available():
                     torch.cuda.empty_cache()
+                    torch.cuda.synchronize()  # Ensure all ops complete before measuring
                 
-                debug.log(f"[VAE] Sub-slice {packet_id}.{slice_id} DONE. VRAM Purged. Moving to next...", 
+                # VERIFY: Check VRAM returned to baseline
+                allocated_after, _, _, _ = get_vram_usage(device=ctx['vae_device'])
+                vram_info_after = get_basic_vram_info(device=ctx['vae_device'])
+                free_after = vram_info_after.get('free_gb', 0.0) if "error" not in vram_info_after else 0.0
+                
+                debug.log(f"[VAE] Sub-slice {packet_id}.{slice_id} DONE. VRAM Purged: {allocated_after:.2f}GB allocated, {free_after:.2f}GB free", 
                          category="vae", force=True)
+                
+                # Warn if VRAM not back to baseline
+                if allocated_after > 1.0:
+                    debug.log(f"[VAE] WARNING: VRAM baseline exceeded ({allocated_after:.2f}GB > 1.0GB) - potential leak!", 
+                             level="WARNING", category="vae", force=True)
+            
+            # Store sub_slice count before deletion for logging
+            num_sub_slices = len(sub_slices)
             
             # Free packet and sub_slices (both on CPU)
             del upscaled_latent, sub_slices
@@ -1258,7 +1273,7 @@ def decode_all_batches(
                 packet_sample = torch.cat(packet_decoded_samples, dim=0)
             del packet_decoded_samples
             
-            debug.log(f"[VAE] Packet {packet_num+1} decoded shape: {list(packet_sample.shape)}", category="vae", indent_level=1)
+            debug.log(f"[VAE] Packet {packet_id} complete: {num_sub_slices} sub-slices decoded = {packet_sample.shape[0]} frames", category="vae", force=True)
             
             # Process through video rearrange
             samples = optimized_video_rearrange([packet_sample])
