@@ -1019,6 +1019,16 @@ def decode_all_batches(
         
         debug.log_memory_state("After VAE loading for decoding", detailed_tensors=False)
         
+        # ============ CRITICAL: DISABLE VAE INTERNAL SLICING ============
+        # The VAE has internal slicing (use_slicing) that causes double memory allocation
+        # We must disable it since WE control the slicing with decode_vae_batch_size
+        original_use_slicing = getattr(runner.vae, 'use_slicing', None)
+        if hasattr(runner.vae, 'use_slicing'):
+            runner.vae.use_slicing = False
+            debug.log("[VAE] Disabled internal slicing to prevent double allocation", category="vae", force=True)
+        if hasattr(runner.vae, 'disable_slicing'):
+            runner.vae.disable_slicing()
+        
         # ============ GLOBAL LATENT FLATTENING ============
         # Concatenate ALL latent chunks from Phase 2 into ONE global tensor
         # This completely decouples VAE decoding from DiT batch structure
@@ -1032,9 +1042,19 @@ def decode_all_batches(
         if not valid_latents:
             raise ValueError("No valid latents to decode")
         
+        # Log individual latent shapes for debugging
+        debug.log(f"[DEBUG] Number of latent chunks from Phase 2: {len(valid_latents)}", category="vae", force=True)
+        total_frames_from_chunks = 0
+        for i, lat in enumerate(valid_latents):
+            debug.log(f"[DEBUG] Chunk {i+1} shape: {lat.shape}, frames: {lat.shape[0]}", category="vae", indent_level=1)
+            total_frames_from_chunks += lat.shape[0]
+        debug.log(f"[DEBUG] Total frames from all chunks: {total_frames_from_chunks}", category="vae", force=True)
+        
         # Move all latents to VAE device and concatenate
         latents_on_device = []
         for i, lat in enumerate(valid_latents):
+            # Use detach() to ensure no gradients are tracked
+            lat = lat.detach()
             lat = manage_tensor(
                 tensor=lat,
                 target_device=ctx['vae_device'],
@@ -1046,9 +1066,13 @@ def decode_all_batches(
             )
             latents_on_device.append(lat)
         
-        # Concatenate into global tensor
-        all_latents = torch.cat(latents_on_device, dim=0)
+        # Concatenate into global tensor along temporal dimension (dim=0)
+        # Latent format is [T, C, H, W] so dim=0 concatenates frames
+        with torch.no_grad():
+            all_latents = torch.cat(latents_on_device, dim=0)
         total_latent_frames = all_latents.shape[0]
+        
+        debug.log(f"[DEBUG] Concatenated tensor shape: {all_latents.shape}", category="vae", force=True)
         
         # Free individual chunks immediately
         for lat in latents_on_device:
@@ -1059,6 +1083,11 @@ def decode_all_batches(
             torch.cuda.empty_cache()
         
         debug.log(f"[VAE] Flattened total frames: {total_latent_frames}", category="vae", force=True)
+        
+        # Verify frame count matches expected - raise error if mismatch (data integrity issue)
+        if total_latent_frames != total_frames_from_chunks:
+            raise ValueError(f"Frame count mismatch during flattening! Expected {total_frames_from_chunks}, got {total_latent_frames}. "
+                           f"This indicates data loss during torch.cat. Please report this issue.")
         
         # ============ GLOBAL SLICING LOOP ============
         # Ignore DiT batches. Use ONLY decode_vae_batch_size for slicing.
@@ -1102,7 +1131,11 @@ def decode_all_batches(
                      category="vae", force=True)
             
             # Extract sub-batch latent from global tensor
-            sub_latent = all_latents[slice_start:slice_end]
+            # Use detach() to ensure no gradients are tracked (saves VRAM)
+            with torch.no_grad():
+                sub_latent = all_latents[slice_start:slice_end].detach()
+            
+            debug.log(f"[DEBUG] Sub-latent shape: {sub_latent.shape}", category="vae", indent_level=1)
             
             # Blackwell Optimization: Use bfloat16 for maximum performance
             if use_bfloat16 and sub_latent.dtype != torch.bfloat16:
@@ -1111,15 +1144,16 @@ def decode_all_batches(
             # Disable tiling - sub-batches are small enough to fit
             runner.decode_tiled = False
             
-            # Decode sub-batch
-            sub_samples = runner.vae_decode([sub_latent])
+            # Decode sub-batch with torch.no_grad() to prevent gradient VRAM usage
+            with torch.no_grad():
+                sub_samples = runner.vae_decode([sub_latent])
             
             # Get decoded sample
             sub_sample = sub_samples[0]
             del sub_samples
             
             # Move to CPU immediately to free VRAM
-            sub_sample = sub_sample.cpu()
+            sub_sample = sub_sample.cpu().detach()
             all_decoded_samples.append(sub_sample)
             
             # CRUCIAL: Strict VRAM cleanup after EACH slice
@@ -1141,8 +1175,12 @@ def decode_all_batches(
         # ============ REASSEMBLE DECODED FRAMES ============
         # Concatenate all decoded samples on CPU
         debug.log("Reassembling decoded frames...", category="vae", force=True)
+        debug.log(f"[DEBUG] Number of decoded slices: {len(all_decoded_samples)}", category="vae", force=True)
+        for i, s in enumerate(all_decoded_samples):
+            debug.log(f"[DEBUG] Decoded slice {i+1} shape: {s.shape}", category="vae", indent_level=1)
         
         sample = torch.cat(all_decoded_samples, dim=0)
+        debug.log(f"[DEBUG] Reassembled sample shape: {sample.shape}", category="vae", force=True)
         del all_decoded_samples
         
         # Process samples through video rearrange
@@ -1216,6 +1254,10 @@ def decode_all_batches(
         debug.log(f"Error in Phase 3 (Decoding): {e}", level="ERROR", category="error", force=True)
         raise
     finally:
+        # Restore VAE slicing settings if we changed them
+        if original_use_slicing is not None and hasattr(runner.vae, 'use_slicing'):
+            runner.vae.use_slicing = original_use_slicing
+        
         # Cleanup VAE as it's no longer needed
         cleanup_vae(runner=runner, debug=debug, cache_model=cache_model)
         
