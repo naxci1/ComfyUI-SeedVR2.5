@@ -912,19 +912,12 @@ def upscale_all_batches(
     debug.end_timer("phase2_upscaling", "Phase 2: DiT upscaling complete", show_breakdown=True)
     debug.log_memory_state("After phase 2 (DiT upscaling)", show_tensors=False)
     
-    # ============ VRAM WIPE PROTOCOL ============
-    # CRITICAL: After Phase 2, we MUST aggressively clear VRAM before VAE starts
-    # This prevents ghost memory from causing OOM during VAE decoding
-    debug.log("Executing VRAM Wipe Protocol after DiT upscaling...", category="cleanup", force=True)
+    # ============ CLEAN SLATE RULE - VRAM WIPE PROTOCOL ============
+    # CRITICAL: After Phase 2, we MUST aggressively clear VRAM to near-zero before VAE starts
+    # The 9.13GB ghost memory MUST disappear before the 6.92GB VAE allocation starts
+    debug.log("[CLEAN SLATE] Executing VRAM Wipe Protocol after DiT upscaling...", category="cleanup", force=True)
     
-    # Triple garbage collection to ensure all Python objects are freed
-    for wipe_pass in range(3):
-        gc.collect()
-        if is_cuda_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-    
-    # Log total frames collected for verification
+    # Log total frames collected for verification FIRST (before any cleanup)
     total_collected_frames = sum(
         lat.shape[0] for lat in ctx['all_upscaled_latents'] if lat is not None
     )
@@ -934,15 +927,40 @@ def upscale_all_batches(
               category="cleanup", force=True)
     debug.log(f"TOTAL FRAMES COLLECTED: {total_collected_frames}", category="cleanup", force=True)
     
-    # Log VRAM after wipe using get_vram_usage() which returns (allocated, reserved, peak_alloc, peak_reserved)
-    allocated_gb, reserved_gb, _, _ = get_vram_usage()
+    # Log VRAM BEFORE wipe
+    allocated_before, _, _, _ = get_vram_usage()
+    debug.log(f"[CLEAN SLATE] VRAM before wipe: {allocated_before:.2f}GB allocated", category="cleanup", force=True)
+    
+    # AGGRESSIVE VRAM WIPE: Repeat until memory is near zero (max 10 attempts)
+    max_wipe_attempts = 10
+    target_vram_gb = 0.5  # Target: below 0.5GB allocated
+    
+    for wipe_pass in range(max_wipe_attempts):
+        gc.collect()
+        if is_cuda_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        
+        allocated_gb, _, _, _ = get_vram_usage()
+        if allocated_gb < target_vram_gb:
+            debug.log(f"[CLEAN SLATE] VRAM cleared to {allocated_gb:.2f}GB after {wipe_pass+1} passes", 
+                     category="cleanup", force=True)
+            break
+        elif wipe_pass == max_wipe_attempts - 1:
+            debug.log(f"[CLEAN SLATE] WARNING: Could not clear VRAM below {target_vram_gb}GB after {max_wipe_attempts} passes. Current: {allocated_gb:.2f}GB", 
+                     level="WARNING", category="cleanup", force=True)
+    
+    # Final VRAM verification
+    allocated_after, reserved_gb, _, _ = get_vram_usage()
     vram_info = get_basic_vram_info()
     free_gb = vram_info.get('free_gb', 0.0) if "error" not in vram_info else 0.0
     
-    debug.log(f"VRAM after wipe: {allocated_gb:.2f}GB allocated / {free_gb:.2f}GB free", 
+    debug.log(f"[CLEAN SLATE] VRAM after wipe: {allocated_after:.2f}GB allocated / {free_gb:.2f}GB free (was {allocated_before:.2f}GB)", 
               category="cleanup", force=True)
-    if allocated_gb > 1.0:
-        debug.log(f"WARNING: {allocated_gb:.2f}GB still allocated - ghost memory detected!", 
+    
+    # Warn if ghost memory still present
+    if allocated_after > 1.0:
+        debug.log(f"[CLEAN SLATE] WARNING: {allocated_after:.2f}GB still allocated - ghost memory detected! VAE may OOM.", 
                  level="WARNING", category="cleanup", force=True)
     
     return ctx
@@ -1241,24 +1259,39 @@ def decode_all_batches(
                     packet_decoded_samples.append(decoded_cpu)
                     total_decoded_frames += sub_slice_frames
                 
-                # E. FORCE Blackwell VRAM reclaim - ONE-IN-ONE-OUT PRINCIPLE
-                # MANDATORY: VRAM must return to baseline (~0.5GB) before next sub-batch
+                # E. FORCE Blackwell VRAM reclaim - STRICT ISOLATION PRINCIPLE
+                # MANDATORY: VRAM must return to baseline (~0.5GB) BEFORE touching next sub-batch
+                # This is THE KEY to preventing OOM - no stacking memory!
+                
+                # First purge
                 gc.collect()
                 if is_cuda_available():
                     torch.cuda.empty_cache()
-                    torch.cuda.synchronize()  # Ensure all ops complete before measuring
+                    torch.cuda.synchronize()  # Ensure all ops complete
                 
-                # VERIFY: Check VRAM returned to baseline
-                allocated_after, _, _, _ = get_vram_usage(device=ctx['vae_device'])
+                # VERIFY: Check VRAM returned to baseline with retry loop
+                target_baseline_gb = 1.0  # Max acceptable VRAM after purge
+                max_purge_retries = 3
+                
+                for purge_attempt in range(max_purge_retries):
+                    allocated_after, _, _, _ = get_vram_usage(device=ctx['vae_device'])
+                    if allocated_after < target_baseline_gb:
+                        break
+                    # Retry purge
+                    gc.collect()
+                    if is_cuda_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                
                 vram_info_after = get_basic_vram_info(device=ctx['vae_device'])
                 free_after = vram_info_after.get('free_gb', 0.0) if "error" not in vram_info_after else 0.0
                 
-                debug.log(f"[VAE] Sub-slice {packet_id}.{slice_id} DONE. VRAM Purged: {allocated_after:.2f}GB allocated, {free_after:.2f}GB free", 
+                debug.log(f"[VAE] Sub-slice {packet_id}.{slice_id} DONE. VRAM Purged: {allocated_after:.2f}GB allocated, {free_after:.2f}GB free. Moving to next...", 
                          category="vae", force=True)
                 
-                # Warn if VRAM not back to baseline
-                if allocated_after > 1.0:
-                    debug.log(f"[VAE] WARNING: VRAM baseline exceeded ({allocated_after:.2f}GB > 1.0GB) - potential leak!", 
+                # Warn if VRAM not back to baseline after retries
+                if allocated_after > target_baseline_gb:
+                    debug.log(f"[VAE] WARNING: VRAM baseline exceeded ({allocated_after:.2f}GB > {target_baseline_gb}GB) after {max_purge_retries} purge attempts - potential leak!", 
                              level="WARNING", category="vae", force=True)
             
             # Store sub_slice count before deletion for logging
