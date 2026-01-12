@@ -1039,23 +1039,38 @@ def decode_all_batches(
         runner.decode_tiled = False
         
         # ============ COLLECT ALL LATENTS FROM PHASE 2 ============
-        # This is the FIX for the 39 vs 150 frames issue - we iterate through ALL batches
+        # CRITICAL: We must iterate through EVERY item in ctx['all_upscaled_latents']
+        # If batch_size=85 and total=120, this list should have 2 items: 85 + 35 frames
         
-        valid_latents = [l for l in ctx['all_upscaled_latents'] if l is not None]
-        original_batch_lengths = [o for o in ctx['all_ori_lengths'] if o is not None]
+        # First, log the raw structure
+        debug.log(f"[VAE] Scanning all_upscaled_latents...", category="vae", force=True)
+        debug.log(f"[VAE] all_upscaled_latents length: {len(ctx['all_upscaled_latents'])}", category="vae", indent_level=1)
+        
+        # Build list of valid latents and count ALL frames BEFORE processing
+        valid_latents = []
+        original_batch_lengths = []
+        total_latent_frames = 0
+        
+        for i, lat in enumerate(ctx['all_upscaled_latents']):
+            if lat is not None:
+                valid_latents.append(lat)
+                frames_in_batch = lat.shape[0]
+                total_latent_frames += frames_in_batch
+                debug.log(f"[VAE] Batch {i+1}: shape {lat.shape}, frames: {frames_in_batch}", category="vae", indent_level=1)
+            else:
+                debug.log(f"[VAE] Batch {i+1}: None (skipping)", category="vae", indent_level=1)
+        
+        # Also process original lengths
+        for o in ctx['all_ori_lengths']:
+            if o is not None:
+                original_batch_lengths.append(o)
         
         if not valid_latents:
-            raise ValueError("No valid latents to decode")
+            raise ValueError("No valid latents to decode - all_upscaled_latents is empty or all None!")
         
-        # Count total frames from ALL batches
-        debug.log(f"[VAE] Number of latent batches from Phase 2: {len(valid_latents)}", category="vae", force=True)
-        total_latent_frames = 0
-        for i, lat in enumerate(valid_latents):
-            frames_in_batch = lat.shape[0]
-            debug.log(f"[VAE] Batch {i+1}: shape {lat.shape}, frames: {frames_in_batch}", category="vae", indent_level=1)
-            total_latent_frames += frames_in_batch
-        
-        debug.log(f"[VAE] Total frames collected from Phase 2: {total_latent_frames}", category="vae", force=True)
+        # CRITICAL LOG: This must show the FULL frame count
+        debug.log(f"[VAE] Total Frames in Latent List: {total_latent_frames}", category="vae", force=True)
+        debug.log(f"[VAE] Total batches to decode: {len(valid_latents)}", category="vae", force=True)
         
         # Check for Blackwell GPU for bfloat16 optimization
         use_bfloat16 = is_blackwell_gpu()
@@ -1087,20 +1102,23 @@ def decode_all_batches(
                     upscaled_latent = upscaled_latent.cpu()
             
             batch_frames = upscaled_latent.shape[0]
-            debug.log(f"[VAE] Batch {batch_idx+1}/{len(valid_latents)}: {batch_frames} frames, shape {upscaled_latent.shape} (on CPU)", 
+            debug.log(f"[VAE] Processing Batch {batch_idx+1}/{len(valid_latents)} ({batch_frames} frames)", 
                      category="vae", force=True)
+            debug.log(f"[VAE] Batch shape: {upscaled_latent.shape} (on CPU)", category="vae", indent_level=1)
             
             # STEP 2: Internal Split using torch.chunk (divide factor)
-            # Note: latent format is [T, C, H, W] so temporal is dim=0
+            # CRITICAL: Latent format is [T, C, H, W] so temporal dimension is dim=0
             if division_factor == 1:
                 # No division - but still keep on CPU and move slice to CUDA
                 sub_slices = [upscaled_latent]
-                debug.log(f"[VAE] No division: will process all {batch_frames} frames", 
+                debug.log(f"[VAE] No division: will process all {batch_frames} frames at once", 
                          category="vae", indent_level=1)
             else:
+                # Split batch into division_factor parts
                 # Example: If batch_size = 85 and divide = 2, split into 42 + 43 frames
                 sub_slices = list(torch.chunk(upscaled_latent, chunks=division_factor, dim=0))
-                debug.log(f"[VAE] Using torch.chunk to split into {len(sub_slices)} sub-slices (factor={division_factor})", 
+                frame_sizes = [s.shape[0] for s in sub_slices]
+                debug.log(f"[VAE] Splitting {batch_frames} frames into {len(sub_slices)} sub-slices: {frame_sizes}", 
                          category="vae", indent_level=1)
             
             batch_decoded_samples = []
@@ -1111,9 +1129,9 @@ def decode_all_batches(
                 if "error" not in vram_info:
                     debug.log(f"[VAE] VRAM Free: {vram_info['free_gb']:.2f}GB", category="vae", indent_level=1)
                 
-                debug.log(f"[VAE] Processing Batch {batch_idx+1}, Sub-slice {slice_idx+1}/{len(sub_slices)}", 
+                sub_slice_frames = sub_slice.shape[0]
+                debug.log(f"[VAE] Processing Batch {batch_idx+1}, Sub-slice {slice_idx+1}/{len(sub_slices)} -> {sub_slice_frames} frames", 
                          category="vae", force=True)
-                debug.log(f"[VAE] Sub-slice frames: {sub_slice.shape[0]}", category="vae", indent_level=1)
                 
                 # A. Move ONLY the small sub-slice (e.g., 40 frames) to CUDA
                 with torch.no_grad():
