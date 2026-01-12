@@ -123,21 +123,21 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                     )
                 ),
                 io.Int.Input("decode_vae_batch_size",
-                    default=16,
+                    default=4,
                     min=1,
-                    max=101,
+                    max=128,
                     step=1,
                     optional=True,
                     tooltip=(
-                        "Number of frames decoded per VAE sub-batch (default: 16).\n"
-                        "Decouples VAE decoding from DiT batch_size for VRAM efficiency.\n"
+                        "Number of frames decoded per VAE sub-batch (default: 4).\n"
+                        "This is the ONLY parameter controlling Phase 3 batching.\n"
                         "\n"
+                        "• Low values (1-4): Minimal VRAM usage, ideal for 16GB GPUs\n"
                         "• Higher values: Faster decoding on high-VRAM GPUs\n"
-                        "• Lower values: Reduced VRAM usage during decode phase\n"
                         "\n"
-                        "Each sub-batch uses tiling=False for maximum speed.\n"
-                        "On RTX 50-series GPUs, bfloat16 is automatically used for\n"
-                        "optimized tensor core performance."
+                        "All latents from DiT are flattened into one global tensor,\n"
+                        "then decoded in slices of this size with tiling=False.\n"
+                        "On RTX 50-series GPUs, bfloat16 is automatically used."
                     )
                 ),
                 io.Boolean.Input("uniform_batch_size",
@@ -244,7 +244,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
     @classmethod
     def execute(cls, image: torch.Tensor, dit: Dict[str, Any], vae: Dict[str, Any], 
                 seed: int, resolution: int = 1080, max_resolution: int = 0, batch_size: int = 5,
-                decode_vae_batch_size: int = 16, uniform_batch_size: bool = False, 
+                decode_vae_batch_size: int = 4, uniform_batch_size: bool = False, 
                 temporal_overlap: int = 0, prepend_frames: int = 0,
                 color_correction: str = "wavelet", input_noise_scale: float = 0.0,
                 latent_noise_scale: float = 0.0, offload_device: str = "none", 
