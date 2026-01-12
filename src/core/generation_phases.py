@@ -55,7 +55,9 @@ from ..optimization.memory_manager import (
     clear_memory,
     is_cuda_available,
     get_basic_vram_info,
-    get_vram_usage
+    get_vram_usage,
+    perform_hard_reset,
+    check_vram_dirty
 )
 from ..optimization.nvfp4 import is_blackwell_gpu
 from ..optimization.performance import (
@@ -1006,15 +1008,20 @@ def decode_all_batches(
     # ============ AGGRESSIVE PRE-DECODE VRAM CLEANUP ============
     debug.log("[VAE] Executing pre-decode VRAM cleanup...", category="cleanup", force=True)
     
-    # Triple garbage collection for maximum cleanup
-    for cleanup_pass in range(3):
-        gc.collect()
-        if is_cuda_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+    vae_device = ctx.get('vae_device')
+    
+    # Check if VRAM is "dirty" (>2GB allocated) and perform hard reset if needed
+    if check_vram_dirty(device=vae_device, threshold_gb=2.0):
+        perform_hard_reset(device=vae_device, debug=debug, threshold_gb=2.0)
+    else:
+        # Standard cleanup even if not dirty
+        for cleanup_pass in range(3):
+            gc.collect()
+            if is_cuda_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
     
     # Log VRAM after pre-cleanup using get_vram_usage() (returns tuple)
-    vae_device = ctx.get('vae_device')
     allocated_gb_pre, reserved_gb_pre, _, _ = get_vram_usage(device=vae_device)
     vram_info_pre = get_basic_vram_info(device=vae_device)
     free_gb_pre = vram_info_pre.get('free_gb', 0.0) if "error" not in vram_info_pre else 0.0
@@ -1187,6 +1194,11 @@ def decode_all_batches(
                     runner.vae.clear_cache()
                 
                 # C. Decode with autocast for Blackwell
+                # CRITICAL PRE-DECODE VRAM PURGE: Clear any ghost memory BEFORE the 6.92GB allocation
+                gc.collect()
+                if is_cuda_available():
+                    torch.cuda.empty_cache()
+                
                 decode_success = False
                 decoded_cpu = None
                 
