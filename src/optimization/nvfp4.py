@@ -334,16 +334,18 @@ class NVFP4Tensor(torch.Tensor):
         unpacked = unpacked[:total_original]
         
         # Convert E2M1 4-bit values to floating point
-        # E2M1: 1 sign bit, 2 exponent bits, 1 mantissa bit
+        # E2M1 format: [sign(1) | mag_code(3)]
+        # mag_code maps to: 0->0, 1->0.5, 2->1.0, 3->1.5, 4->2.0, 5->3.0, 6->4.0, 7->6.0
         sign = ((unpacked >> 3) & 1).to(dtype)  # Bit 3 is sign
-        exp = ((unpacked >> 1) & 0x3).to(dtype)  # Bits 1-2 are exponent
-        mantissa = (unpacked & 1).to(dtype)  # Bit 0 is mantissa
+        mag_code = (unpacked & 0x7).to(dtype)   # Bits 0-2 are magnitude code
         
-        # Reconstruct value: (-1)^sign * 2^(exp-1) * (1 + mantissa/2)
-        # With bias of 1 for E2M1 format
-        exp_value = torch.pow(2.0, exp - 1)
-        mantissa_value = 1.0 + mantissa * 0.5
-        magnitude = exp_value * mantissa_value
+        # Map magnitude code to actual E2M1 value
+        # Using lookup approach for accurate dequantization
+        e2m1_values = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], 
+                                   dtype=dtype, device=device)
+        magnitude = e2m1_values[mag_code.long().clamp(0, 7)]
+        
+        # Apply sign
         result = torch.where(sign == 1, -magnitude, magnitude)
         
         # Apply per-block scaling
@@ -457,6 +459,13 @@ def quantize_to_nvfp4(tensor: torch.Tensor, block_size: int = NVFP4_BLOCK_SIZE
     """
     Quantize a tensor to NVFP4 (E2M1) format with E4M3 scaling.
     
+    E2M1 format (true 4-bit floating point):
+    - 1 sign bit (bit 3)
+    - 2 exponent bits (bits 1-2) with bias=1
+    - 1 mantissa bit (bit 0)
+    
+    Representable values: 0, ±0.5, ±1.0, ±1.5, ±2.0, ±3.0, ±4.0, ±6.0
+    
     Args:
         tensor: Input tensor to quantize
         block_size: Number of elements per scaling block
@@ -484,7 +493,7 @@ def quantize_to_nvfp4(tensor: torch.Tensor, block_size: int = NVFP4_BLOCK_SIZE
     # Avoid division by zero
     block_max = torch.where(block_max == 0, torch.ones_like(block_max), block_max)
     
-    # E2M1 has range [-6, 6] approximately
+    # E2M1 max representable value is 6.0
     e2m1_max = 6.0
     scales = block_max / e2m1_max
     
@@ -495,26 +504,35 @@ def quantize_to_nvfp4(tensor: torch.Tensor, block_size: int = NVFP4_BLOCK_SIZE
     normalized = normalized.clamp(-e2m1_max, e2m1_max)
     
     # Quantize to 4-bit E2M1
-    # Simplified quantization using rounding
-    # E2M1 values: -6, -4, -3, -2, -1.5, -1, -0.5, 0, 0.5, 1, 1.5, 2, 3, 4, 6
-    # Map to integers 0-15
+    # E2M1 representable magnitudes: 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0
+    # Map to 3-bit unsigned codes (0-7)
     sign = (normalized < 0).int()
     magnitude = normalized.abs()
     
-    # Map magnitude to 3-bit unsigned value (0-7)
-    # Using approximate mapping
-    mag_quantized = torch.zeros_like(magnitude, dtype=torch.int8)
-    mag_quantized = torch.where(magnitude >= 5.0, torch.tensor(7, dtype=torch.int8), mag_quantized)
-    mag_quantized = torch.where((magnitude >= 3.5) & (magnitude < 5.0), torch.tensor(6, dtype=torch.int8), mag_quantized)
-    mag_quantized = torch.where((magnitude >= 2.5) & (magnitude < 3.5), torch.tensor(5, dtype=torch.int8), mag_quantized)
-    mag_quantized = torch.where((magnitude >= 1.75) & (magnitude < 2.5), torch.tensor(4, dtype=torch.int8), mag_quantized)
-    mag_quantized = torch.where((magnitude >= 1.25) & (magnitude < 1.75), torch.tensor(3, dtype=torch.int8), mag_quantized)
-    mag_quantized = torch.where((magnitude >= 0.75) & (magnitude < 1.25), torch.tensor(2, dtype=torch.int8), mag_quantized)
-    mag_quantized = torch.where((magnitude >= 0.25) & (magnitude < 0.75), torch.tensor(1, dtype=torch.int8), mag_quantized)
+    # E2M1 magnitude encoding:
+    # exp=0, m=0 -> 0     (code 0)
+    # exp=0, m=1 -> 0.5   (code 1)  
+    # exp=1, m=0 -> 1.0   (code 2)
+    # exp=1, m=1 -> 1.5   (code 3)
+    # exp=2, m=0 -> 2.0   (code 4)
+    # exp=2, m=1 -> 3.0   (code 5)
+    # exp=3, m=0 -> 4.0   (code 6)
+    # exp=3, m=1 -> 6.0   (code 7)
+    
+    # Quantize magnitude to nearest E2M1 value
+    mag_code = torch.zeros_like(magnitude, dtype=torch.int8)
+    mag_code = torch.where(magnitude >= 5.0, torch.tensor(7, dtype=torch.int8, device=tensor.device), mag_code)
+    mag_code = torch.where((magnitude >= 3.5) & (magnitude < 5.0), torch.tensor(6, dtype=torch.int8, device=tensor.device), mag_code)
+    mag_code = torch.where((magnitude >= 2.5) & (magnitude < 3.5), torch.tensor(5, dtype=torch.int8, device=tensor.device), mag_code)
+    mag_code = torch.where((magnitude >= 1.75) & (magnitude < 2.5), torch.tensor(4, dtype=torch.int8, device=tensor.device), mag_code)
+    mag_code = torch.where((magnitude >= 1.25) & (magnitude < 1.75), torch.tensor(3, dtype=torch.int8, device=tensor.device), mag_code)
+    mag_code = torch.where((magnitude >= 0.75) & (magnitude < 1.25), torch.tensor(2, dtype=torch.int8, device=tensor.device), mag_code)
+    mag_code = torch.where((magnitude >= 0.25) & (magnitude < 0.75), torch.tensor(1, dtype=torch.int8, device=tensor.device), mag_code)
     # magnitude < 0.25 stays at 0
     
-    # Combine sign and magnitude into 4-bit value
-    quantized_4bit = (sign.int() << 3) | mag_quantized.int()
+    # Combine sign and magnitude code into 4-bit value
+    # Format: [sign(1) | exp(2) | mantissa(1)] = [sign | mag_code(3)]
+    quantized_4bit = (sign.int() << 3) | mag_code.int()
     quantized_4bit = quantized_4bit.flatten()[:num_elements]
     
     # Pack two 4-bit values into each uint8
@@ -523,10 +541,13 @@ def quantize_to_nvfp4(tensor: torch.Tensor, block_size: int = NVFP4_BLOCK_SIZE
     
     # Pack even indices into high nibble, odd into low nibble
     even_values = quantized_4bit[0::2]
-    odd_values = quantized_4bit[1::2] if len(quantized_4bit) > 1 else torch.zeros_like(even_values[:0])
-    
     packed[:len(even_values)] = (even_values << 4).to(torch.uint8)
-    if len(odd_values) > 0:
+    
+    # Handle odd values - check bounds before assignment
+    if num_elements > 1:
+        odd_values = quantized_4bit[1::2]
+        # The number of odd values can be at most equal to even values (or one less)
+        # packed[:len(odd_values)] is safe since packed_len = (n+1)//2 >= len(odd_values)
         packed[:len(odd_values)] |= odd_values.to(torch.uint8)
     
     return packed, scales
