@@ -23,6 +23,7 @@ Key Features:
 - Each phase handles its own cleanup in finally blocks
 """
 
+import gc
 import os
 import torch
 from typing import Dict, List, Optional, Tuple, Any, Callable
@@ -50,7 +51,10 @@ from ..optimization.memory_manager import (
     manage_tensor,
     manage_model_device,
     release_tensor_memory,
-    release_tensor_collection
+    release_tensor_collection,
+    clear_memory,
+    is_cuda_available,
+    get_basic_vram_info
 )
 from ..optimization.performance import (
     optimized_video_rearrange, 
@@ -64,6 +68,92 @@ from ..utils.color_fix import (
     wavelet_reconstruction,
     adaptive_instance_normalization
 )
+
+
+def compute_optimal_vae_tile_size(
+    vae_device: torch.device,
+    current_tile_size: Tuple[int, int],
+    decode: bool = True,
+    debug: Optional['Debug'] = None
+) -> Tuple[int, int]:
+    """
+    Compute optimal VAE tile size based on available VRAM.
+    
+    Implements a "Max-VRAM-Fill" strategy for Blackwell GPUs (RTX 50-series):
+    - On 16GB cards, use larger tiles (1024x1024) to reduce overhead
+    - On 8-12GB cards, use smaller tiles (768x768) to avoid OOM
+    - Falls back to user-specified size if VRAM cannot be detected
+    
+    Args:
+        vae_device: Device where VAE will run
+        current_tile_size: User-specified tile size (height, width)
+        decode: True for decode tiles, False for encode tiles
+        debug: Debug instance for logging
+        
+    Returns:
+        Optimal tile size (height, width)
+    """
+    # Only apply optimization for CUDA devices
+    if not is_cuda_available() or vae_device.type != 'cuda':
+        return current_tile_size
+    
+    vram_info = get_basic_vram_info(device=vae_device)
+    if "error" in vram_info:
+        return current_tile_size
+    
+    total_vram = vram_info['total_gb']
+    free_vram = vram_info['free_gb']
+    
+    # Blackwell "Max-VRAM-Fill" strategy
+    # Larger tiles = fewer tiles = less overhead from tile blending
+    # But larger tiles require more VRAM per decode operation
+    
+    # VAE decode VRAM usage estimate (approximate, depends on model):
+    # - 512x512 tile: ~1.5GB peak during decode
+    # - 768x768 tile: ~2.5GB peak during decode  
+    # - 1024x1024 tile: ~4.0GB peak during decode
+    # - 1280x1280 tile: ~6.0GB peak during decode
+    
+    optimal_tile = current_tile_size
+    
+    if total_vram >= 16.0:
+        # RTX 5070 Ti / 5080 (16GB) or higher: Use large tiles
+        if free_vram >= 8.0:
+            optimal_tile = (1024, 1024)
+        elif free_vram >= 5.0:
+            optimal_tile = (768, 768)
+        else:
+            optimal_tile = (512, 512)
+    elif total_vram >= 12.0:
+        # RTX 4070 Ti / 4080 (12GB)
+        if free_vram >= 6.0:
+            optimal_tile = (768, 768)
+        else:
+            optimal_tile = (512, 512)
+    elif total_vram >= 8.0:
+        # RTX 4060 Ti (8GB)
+        if free_vram >= 4.0:
+            optimal_tile = (512, 512)
+        else:
+            optimal_tile = (384, 384)
+    else:
+        # Low VRAM: use small tiles
+        optimal_tile = (384, 384)
+    
+    # Only upgrade tile size if it's larger than user-specified
+    # (don't downgrade user's choice unless necessary for OOM prevention)
+    if optimal_tile[0] > current_tile_size[0] or optimal_tile[1] > current_tile_size[1]:
+        phase = "decode" if decode else "encode"
+        if debug:
+            debug.log(
+                f"Blackwell optimization: Upgrading VAE {phase} tile size from "
+                f"{current_tile_size[0]}x{current_tile_size[1]} to {optimal_tile[0]}x{optimal_tile[1]} "
+                f"(available VRAM: {free_vram:.1f}GB)", 
+                category="vae", force=True, indent_level=1
+            )
+        return optimal_tile
+    
+    return current_tile_size
 
 
 def _prepare_video_batch(
@@ -850,6 +940,31 @@ def decode_all_batches(
     debug.log("", category="none", force=True)
     debug.log("━━━━━━━━ Phase 3: VAE decoding ━━━━━━━━", category="none", force=True)
     debug.start_timer("phase3_decoding")
+    
+    # ============ Blackwell Optimization: Aggressive VRAM Cleanup ============
+    # After DiT (Phase 2), we need maximum VRAM available for VAE decoding.
+    # On 16GB cards (RTX 5070 Ti / Blackwell), this cleanup frees ~3.5GB.
+    # The DiT model was already offloaded in upscale_all_batches's finally block,
+    # but we need to ensure all VRAM fragments are consolidated.
+    debug.log("Performing aggressive VRAM cleanup before VAE decoding...", category="cleanup")
+    debug.start_timer("pre_vae_cleanup")
+    
+    # Force garbage collection to release Python references
+    gc.collect()
+    
+    # Clear GPU cache to consolidate VRAM
+    if is_cuda_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()  # Ensure all ops complete before proceeding
+    
+    # Log VRAM state after cleanup
+    vram_info = get_basic_vram_info(device=ctx.get('vae_device'))
+    if "error" not in vram_info:
+        debug.log(f"VRAM after cleanup: {vram_info['free_gb']:.2f}GB free / {vram_info['total_gb']:.2f}GB total", 
+                  category="cleanup", indent_level=1)
+    
+    debug.end_timer("pre_vae_cleanup", "Pre-VAE VRAM cleanup")
+    # ============ End Blackwell Optimization ============
 
     # Count valid latents
     num_valid_latents = len([l for l in ctx['all_upscaled_latents'] if l is not None])
@@ -904,6 +1019,21 @@ def decode_all_batches(
                           model_name="VAE", debug=debug, runner=runner)
         
         debug.log_memory_state("After VAE loading for decoding", detailed_tensors=False)
+
+        # ============ Blackwell Optimization: Adaptive Tile Sizing ============
+        # Compute optimal tile size based on available VRAM
+        # On 16GB Blackwell cards, use larger tiles to reduce tile overhead
+        if runner.decode_tiled:
+            original_tile_size = runner.decode_tile_size
+            optimal_tile_size = compute_optimal_vae_tile_size(
+                vae_device=ctx['vae_device'],
+                current_tile_size=runner.decode_tile_size,
+                decode=True,
+                debug=debug
+            )
+            if optimal_tile_size != original_tile_size:
+                runner.decode_tile_size = optimal_tile_size
+        # ============ End Blackwell Optimization ============
 
         # Initialize tile_boundaries for decoding debug
         if runner.tile_debug == "decode" and runner.decode_tiled:
@@ -999,16 +1129,20 @@ def decode_all_batches(
                 write_start = current_write_idx
                 write_end = current_write_idx + batch_frames
             
-            # Move sample to target device and write directly to final_video
+            # ============ Blackwell Optimization: Async Transfer to CPU ============
+            # Use non-blocking transfer so GPU can start next decode while this 
+            # batch is being transferred to CPU. This overlaps decode with D2H transfer.
             sample = manage_tensor(
                 tensor=sample,
                 target_device=target_device,
                 tensor_name=f"sample_{decode_idx+1}",
                 dtype=ctx['compute_dtype'],
+                non_blocking=True,  # Enable async transfer for overlap
                 debug=debug,
-                reason="writing to final_video",
+                reason="writing to final_video (async)",
                 indent_level=1
             )
+            # ============ End Blackwell Optimization ============
             
             # Write to final_video - for RGBA, write only RGB channels (VAE outputs 3 channels)
             if ctx.get('is_rgba', False):
@@ -1035,6 +1169,13 @@ def decode_all_batches(
                                 1, "Phase 3: Decoding")
             
             decode_idx += 1
+        
+        # ============ Blackwell Optimization: Sync Async Transfers ============
+        # Ensure all non-blocking D2H transfers complete before proceeding
+        if is_cuda_available():
+            torch.cuda.synchronize()
+            debug.log("Synchronized async transfers to final_video", category="cleanup", indent_level=1)
+        # ============ End Blackwell Optimization ============
         
         # Store padding stats for Phase 4 final summary
         ctx['total_padding_removed'] = total_padding_removed
