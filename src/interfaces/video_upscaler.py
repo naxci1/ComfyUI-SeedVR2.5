@@ -122,21 +122,18 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                         "Ideally match to shot length for best quality."
                     )
                 ),
-                io.Int.Input("decode_vae_batch_size",
-                    default=4,
-                    min=1,
-                    max=128,
-                    step=1,
-                    optional=True,
+                io.Combo.Input("decode_vae_divide",
+                    options=["False", "2", "4"],
+                    default="False",
                     tooltip=(
-                        "Number of frames decoded per VAE sub-batch (default: 4).\n"
-                        "This is the ONLY parameter controlling Phase 3 batching.\n"
+                        "Division factor for VAE decoding (default: False = no division).\n"
+                        "Controls how latent chunks are split for decoding.\n"
                         "\n"
-                        "• Low values (1-4): Minimal VRAM usage, ideal for 16GB GPUs\n"
-                        "• Higher values: Faster decoding on high-VRAM GPUs\n"
+                        "• False: Decode entire chunk at once (fastest, needs more VRAM)\n"
+                        "• 2: Split each chunk in half (moderate VRAM savings)\n"
+                        "• 4: Split each chunk into quarters (max VRAM savings)\n"
                         "\n"
-                        "All latents from DiT are flattened into one global tensor,\n"
-                        "then decoded in slices of this size with tiling=False.\n"
+                        "Use 2 or 4 on 16GB GPUs (RTX 5070 Ti) to avoid OOM.\n"
                         "On RTX 50-series GPUs, bfloat16 is automatically used."
                     )
                 ),
@@ -244,7 +241,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
     @classmethod
     def execute(cls, image: torch.Tensor, dit: Dict[str, Any], vae: Dict[str, Any], 
                 seed: int, resolution: int = 1080, max_resolution: int = 0, batch_size: int = 5,
-                decode_vae_batch_size: int = 4, uniform_batch_size: bool = False, 
+                decode_vae_divide: str = "False", uniform_batch_size: bool = False, 
                 temporal_overlap: int = 0, prepend_frames: int = 0,
                 color_correction: str = "wavelet", input_noise_scale: float = 0.0,
                 latent_noise_scale: float = 0.0, offload_device: str = "none", 
@@ -264,7 +261,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             resolution: Target resolution for shortest edge (maintains aspect ratio)
             max_resolution: Maximum resolution for any edge (0 = no limit)
             batch_size: Frames per batch (minimum 5 for temporal consistency)
-            decode_vae_batch_size: Frames per VAE decoding sub-batch (1-101)
+            decode_vae_divide: Division factor for VAE decoding ("False", "2", "4")
             uniform_batch_size: Whether to pad final batch to match batch_size
             temporal_overlap: Overlapping frames between batches (0-16)
             prepend_frames: Frames to prepend (0-32) to reduce initial artifacts.
@@ -520,7 +517,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 debug=debug,
                 progress_callback=progress_callback,
                 cache_model=vae_cache,
-                decode_vae_batch_size=decode_vae_batch_size
+                decode_vae_divide=decode_vae_divide
             )
 
             # Phase 4: Post-processing

@@ -918,19 +918,15 @@ def decode_all_batches(
     debug: 'Debug',
     progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
     cache_model: bool = False,
-    decode_vae_batch_size: int = 4
+    decode_vae_divide: str = "False"
 ) -> Dict[str, Any]:
     """
-    Phase 3: VAE Decoding with Global Latent Flattening.
+    Phase 3: VAE Decoding with Division Factor.
     
-    This function implements a complete architectural reset for VAE decoding:
-    1. Flatten all latent chunks from Phase 2 into a single global tensor
-    2. Decode using a global slicing loop based ONLY on decode_vae_batch_size
-    3. Ignore DiT batch structure entirely - use decode_vae_batch_size exclusively
-    
-    This approach decouples VAE decoding from DiT batch sizes, allowing
-    large DiT batches for temporal quality while using small decode batches
-    for VRAM efficiency on 16GB GPUs like RTX 5070 Ti.
+    This function implements VAE decoding with configurable division:
+    1. Collect ALL latents from Phase 2 (fixes the 39 vs 150 frame issue)
+    2. Process each batch with optional division (False/2/4)
+    3. Manually handle slicing to bypass VAE internal spikes
     
     Args:
         runner: VideoDiffusionInfer instance with loaded models (required)
@@ -938,14 +934,12 @@ def decode_all_batches(
         debug: Debug instance for logging (required)
         progress_callback: Optional callback(current, total, frames, phase_name)
         cache_model: If True, keep VAE model for reuse instead of deleting it
-        decode_vae_batch_size: Number of frames per VAE sub-batch (default: 4)
-            This is the ONLY parameter controlling Phase 3 batching.
+        decode_vae_divide: Division factor - "False" (no division), "2", or "4"
         
     Returns:
         dict: Updated context containing:
-            - final_video: Pre-allocated tensor with decoded samples (unnormalized, in [-1,1])
-            - decode_batch_info: List of (start_idx, end_idx, ori_length) for Phase 4 processing
-            - VAE cleanup completed
+            - final_video: Pre-allocated tensor with decoded samples
+            - decode_batch_info: List for Phase 4 processing
             
     Raises:
         ValueError: If context is missing or has no upscaled latents
@@ -962,12 +956,19 @@ def decode_all_batches(
         raise ValueError("No upscaled latents found. Run upscale_all_batches first.")
     
     debug.log("", category="none", force=True)
-    debug.log("━━━━━━━━ Phase 3: VAE decoding (Global Slicing) ━━━━━━━━", category="none", force=True)
+    debug.log("━━━━━━━━ Phase 3: VAE decoding (Division Factor) ━━━━━━━━", category="none", force=True)
     debug.start_timer("phase3_decoding")
+    
+    # Parse division factor
+    if decode_vae_divide == "False" or decode_vae_divide is False:
+        division_factor = 1
+    else:
+        division_factor = int(decode_vae_divide)
+    
+    debug.log(f"[VAE] Division factor: {division_factor} (decode_vae_divide={decode_vae_divide})", category="vae", force=True)
     
     # ============ Aggressive VRAM Cleanup ============
     debug.log("Performing aggressive VRAM cleanup before VAE decoding...", category="cleanup")
-    debug.start_timer("pre_vae_cleanup")
     
     gc.collect()
     if is_cuda_available():
@@ -978,8 +979,6 @@ def decode_all_batches(
     if "error" not in vram_info:
         debug.log(f"VRAM after cleanup: {vram_info['free_gb']:.2f}GB free / {vram_info['total_gb']:.2f}GB total", 
                   category="cleanup", indent_level=1)
-    
-    debug.end_timer("pre_vae_cleanup", "Pre-VAE VRAM cleanup")
     
     # Get output dimensions from context (set during Phase 1)
     if 'true_target_dims' not in ctx:
@@ -1019,89 +1018,44 @@ def decode_all_batches(
         
         debug.log_memory_state("After VAE loading for decoding", detailed_tensors=False)
         
-        # ============ CRITICAL: DISABLE VAE INTERNAL SLICING ============
-        # The VAE has internal slicing (use_slicing) that causes double memory allocation
-        # We must disable it since WE control the slicing with decode_vae_batch_size
+        # ============ CRITICAL: DISABLE VAE INTERNAL SLICING AND TILING ============
+        # We must disable internal slicing/tiling since WE control it manually with division factor
         original_use_slicing = getattr(runner.vae, 'use_slicing', None)
+        original_use_tiling = getattr(runner.vae, 'use_tiling', None)
+        
         if hasattr(runner.vae, 'use_slicing'):
             runner.vae.use_slicing = False
-            debug.log("[VAE] Disabled internal slicing to prevent double allocation", category="vae", force=True)
+        if hasattr(runner.vae, 'use_tiling'):
+            runner.vae.use_tiling = False
         if hasattr(runner.vae, 'disable_slicing'):
             runner.vae.disable_slicing()
+        if hasattr(runner.vae, 'disable_tiling'):
+            runner.vae.disable_tiling()
         
-        # ============ GLOBAL LATENT FLATTENING ============
-        # Concatenate ALL latent chunks from Phase 2 into ONE global tensor
-        # This completely decouples VAE decoding from DiT batch structure
+        debug.log("[VAE] Disabled internal slicing and tiling to prevent double allocation", category="vae", force=True)
         
-        debug.log("Flattening all latent chunks into global tensor...", category="vae", force=True)
+        # Store original tiling settings
+        original_decode_tiled = runner.decode_tiled
+        runner.decode_tiled = False
+        
+        # ============ COLLECT ALL LATENTS FROM PHASE 2 ============
+        # This is the FIX for the 39 vs 150 frames issue - we iterate through ALL batches
         
         valid_latents = [l for l in ctx['all_upscaled_latents'] if l is not None]
-        # Track original lengths for proper Phase 4 compatibility
         original_batch_lengths = [o for o in ctx['all_ori_lengths'] if o is not None]
         
         if not valid_latents:
             raise ValueError("No valid latents to decode")
         
-        # Log individual latent shapes for debugging
-        debug.log(f"[DEBUG] Number of latent chunks from Phase 2: {len(valid_latents)}", category="vae", force=True)
-        total_frames_from_chunks = 0
+        # Count total frames from ALL batches
+        debug.log(f"[VAE] Number of latent batches from Phase 2: {len(valid_latents)}", category="vae", force=True)
+        total_latent_frames = 0
         for i, lat in enumerate(valid_latents):
-            debug.log(f"[DEBUG] Chunk {i+1} shape: {lat.shape}, frames: {lat.shape[0]}", category="vae", indent_level=1)
-            total_frames_from_chunks += lat.shape[0]
-        debug.log(f"[DEBUG] Total frames from all chunks: {total_frames_from_chunks}", category="vae", force=True)
+            frames_in_batch = lat.shape[0]
+            debug.log(f"[VAE] Batch {i+1}: shape {lat.shape}, frames: {frames_in_batch}", category="vae", indent_level=1)
+            total_latent_frames += frames_in_batch
         
-        # Move all latents to VAE device and concatenate
-        latents_on_device = []
-        for i, lat in enumerate(valid_latents):
-            # Use detach() to ensure no gradients are tracked
-            lat = lat.detach()
-            lat = manage_tensor(
-                tensor=lat,
-                target_device=ctx['vae_device'],
-                tensor_name=f"latent_chunk_{i}",
-                dtype=ctx['compute_dtype'],
-                debug=debug,
-                reason="global flattening",
-                indent_level=1
-            )
-            latents_on_device.append(lat)
-        
-        # Concatenate into global tensor along temporal dimension (dim=0)
-        # Latent format is [T, C, H, W] so dim=0 concatenates frames
-        with torch.no_grad():
-            all_latents = torch.cat(latents_on_device, dim=0)
-        total_latent_frames = all_latents.shape[0]
-        
-        debug.log(f"[DEBUG] Concatenated tensor shape: {all_latents.shape}", category="vae", force=True)
-        
-        # Free individual chunks immediately
-        for lat in latents_on_device:
-            del lat
-        del latents_on_device
-        gc.collect()
-        if is_cuda_available():
-            torch.cuda.empty_cache()
-        
-        debug.log(f"[VAE] Flattened total frames: {total_latent_frames}", category="vae", force=True)
-        
-        # Verify frame count matches expected - raise error if mismatch (data integrity issue)
-        if total_latent_frames != total_frames_from_chunks:
-            raise ValueError(f"Frame count mismatch during flattening! Expected {total_frames_from_chunks}, got {total_latent_frames}. "
-                           f"This indicates data loss during torch.cat. Please report this issue.")
-        
-        # ============ GLOBAL SLICING LOOP ============
-        # Ignore DiT batches. Use ONLY decode_vae_batch_size for slicing.
-        
-        debug.log(f"[DEBUG] Received decode_vae_batch_size: {decode_vae_batch_size}", category="vae", force=True)
-        
-        # Calculate number of slices
-        num_slices = (total_latent_frames + decode_vae_batch_size - 1) // decode_vae_batch_size
-        
-        debug.log(f"Decoding {total_latent_frames} frames in {num_slices} global slices of {decode_vae_batch_size}", 
-                 category="vae", force=True)
-        
-        # Store original tiling settings
-        original_decode_tiled = runner.decode_tiled
+        debug.log(f"[VAE] Total frames collected from Phase 2: {total_latent_frames}", category="vae", force=True)
         
         # Check for Blackwell GPU for bfloat16 optimization
         use_bfloat16 = is_blackwell_gpu()
@@ -1109,154 +1063,180 @@ def decode_all_batches(
             debug.log("Blackwell GPU detected: using bfloat16 for maximum decode performance", 
                      category="vae", force=True)
         
-        # Collect ALL decoded frames
+        # ============ PROCESS EACH BATCH WITH DIVISION ============
         all_decoded_samples = []
+        current_write_idx = 0
         
         debug.start_timer("vae_decode")
         
-        for slice_idx in range(num_slices):
+        for batch_idx, upscaled_latent in enumerate(valid_latents):
+            if upscaled_latent is None:
+                continue
+            
             check_interrupt(ctx)
             
-            slice_start = slice_idx * decode_vae_batch_size
-            slice_end = min(slice_start + decode_vae_batch_size, total_latent_frames)
-            slice_size = slice_end - slice_start
-            
-            # [VAE] VRAM Free logging
-            vram_info = get_basic_vram_info(device=ctx['vae_device'])
-            if "error" not in vram_info:
-                debug.log(f"[VAE] VRAM Free: {vram_info['free_gb']:.2f}GB", category="vae", indent_level=1)
-            
-            # [VAE] Global Progress logging
-            debug.log(f"[VAE] Global Progress: Slice {slice_idx + 1}/{num_slices} (Frames {slice_start}-{slice_end})", 
-                     category="vae", force=True)
-            
-            # Extract sub-batch latent from global tensor
-            # Use detach() to ensure no gradients are tracked (saves VRAM)
+            # Move latent to VAE device
             with torch.no_grad():
-                sub_latent = all_latents[slice_start:slice_end].detach()
+                upscaled_latent = upscaled_latent.detach()
+                upscaled_latent = manage_tensor(
+                    tensor=upscaled_latent,
+                    target_device=ctx['vae_device'],
+                    tensor_name=f"latent_batch_{batch_idx+1}",
+                    dtype=ctx['compute_dtype'],
+                    debug=debug,
+                    reason="VAE decoding",
+                    indent_level=1
+                )
             
-            debug.log(f"[DEBUG] Sub-latent shape: {sub_latent.shape}", category="vae", indent_level=1)
+            batch_frames = upscaled_latent.shape[0]
             
-            # Blackwell Optimization: Use bfloat16 for maximum performance
-            if use_bfloat16 and sub_latent.dtype != torch.bfloat16:
-                sub_latent = sub_latent.to(torch.bfloat16)
+            # Calculate slices based on division factor
+            if division_factor == 1:
+                # No division - process entire batch at once
+                slices = [(0, batch_frames)]
+                debug.log(f"[VAE] Batch {batch_idx+1}/{len(valid_latents)}: Processing all {batch_frames} frames at once", 
+                         category="vae", force=True)
+            else:
+                # Divide batch into equal parts
+                slice_size = max(1, batch_frames // division_factor)
+                slices = []
+                for i in range(0, batch_frames, slice_size):
+                    end = min(i + slice_size, batch_frames)
+                    slices.append((i, end))
+                debug.log(f"[VAE] Batch {batch_idx+1}/{len(valid_latents)}: Dividing {batch_frames} frames into {len(slices)} slices (factor={division_factor})", 
+                         category="vae", force=True)
             
-            # Disable tiling - sub-batches are small enough to fit
-            runner.decode_tiled = False
+            batch_decoded_samples = []
             
-            # Decode sub-batch with torch.no_grad() to prevent gradient VRAM usage
-            with torch.no_grad():
-                sub_samples = runner.vae_decode([sub_latent])
+            for slice_idx, (start, end) in enumerate(slices):
+                # Log VRAM before slice
+                vram_info = get_basic_vram_info(device=ctx['vae_device'])
+                if "error" not in vram_info:
+                    debug.log(f"[VAE] VRAM Free: {vram_info['free_gb']:.2f}GB", category="vae", indent_level=1)
+                
+                debug.log(f"[VAE] Slice {slice_idx+1}/{len(slices)} (Frames {start}-{end})", 
+                         category="vae", force=True)
+                
+                # Extract sub-latent slice
+                with torch.no_grad():
+                    sub_latent = upscaled_latent[start:end].detach()
+                
+                debug.log(f"[DEBUG] Sub-latent shape: {sub_latent.shape}", category="vae", indent_level=1)
+                
+                # Blackwell Optimization: Use bfloat16
+                if use_bfloat16 and sub_latent.dtype != torch.bfloat16:
+                    sub_latent = sub_latent.to(torch.bfloat16)
+                
+                # Decode sub-latent with torch.no_grad()
+                with torch.no_grad():
+                    sub_samples = runner.vae_decode([sub_latent])
+                
+                sub_sample = sub_samples[0]
+                del sub_samples
+                
+                debug.log(f"[DEBUG] Decoded slice shape: {sub_sample.shape}", category="vae", indent_level=1)
+                
+                # Move to CPU immediately to free VRAM
+                sub_sample = sub_sample.cpu().detach()
+                batch_decoded_samples.append(sub_sample)
+                
+                # CRUCIAL: Strict VRAM cleanup after EACH slice
+                del sub_latent
+                gc.collect()
+                if is_cuda_available():
+                    torch.cuda.empty_cache()
             
-            # Get decoded sample
-            sub_sample = sub_samples[0]
-            del sub_samples
-            
-            # Move to CPU immediately to free VRAM
-            sub_sample = sub_sample.cpu().detach()
-            all_decoded_samples.append(sub_sample)
-            
-            # CRUCIAL: Strict VRAM cleanup after EACH slice
-            del sub_latent
+            # Free the batch latent
+            del upscaled_latent
             gc.collect()
             if is_cuda_available():
                 torch.cuda.empty_cache()
+            
+            # Concatenate all slices from this batch
+            with torch.no_grad():
+                batch_sample = torch.cat(batch_decoded_samples, dim=0)
+            del batch_decoded_samples
+            
+            debug.log(f"[DEBUG] Batch {batch_idx+1} decoded sample shape: {batch_sample.shape}", category="vae", indent_level=1)
+            
+            # Process through video rearrange
+            samples = optimized_video_rearrange([batch_sample])
+            sample = samples[0]
+            del samples, batch_sample
+            
+            # Get original length for this batch
+            ori_length = original_batch_lengths[batch_idx] if batch_idx < len(original_batch_lengths) else sample.shape[0]
+            
+            # Trim temporal padding
+            if ori_length < sample.shape[0]:
+                sample = sample[:ori_length]
+            
+            # Trim spatial padding
+            current_h, current_w = sample.shape[-2:]
+            if current_h != true_h or current_w != true_w:
+                sample = sample[:, :, :true_h, :true_w]
+            
+            # Convert to output format: [T, C, H, W] → [T, H, W, C]
+            sample = optimized_sample_to_image_format(sample)
+            
+            # Move to target device
+            sample = manage_tensor(
+                tensor=sample,
+                target_device=target_device,
+                tensor_name=f"sample_{batch_idx+1}",
+                dtype=ctx['compute_dtype'],
+                non_blocking=True,
+                debug=debug,
+                reason="writing to final_video",
+                indent_level=1
+            )
+            
+            # Write to final_video
+            batch_frames_out = sample.shape[0]
+            write_start = current_write_idx
+            write_end = current_write_idx + batch_frames_out
+            
+            if ctx.get('is_rgba', False):
+                ctx['final_video'][write_start:write_end, :, :, :3] = sample
+            else:
+                ctx['final_video'][write_start:write_end] = sample
+            
+            ctx['decode_batch_info'].append((write_start, write_end, batch_idx, ori_length))
+            current_write_idx = write_end
+            
+            debug.log(f"Wrote {batch_frames_out} frames to positions {write_start}-{write_end}", 
+                     category="video", indent_level=1)
+            
+            del sample
+            
+            # Free memory from original latents list
+            release_tensor_memory(ctx['all_upscaled_latents'][batch_idx])
+            ctx['all_upscaled_latents'][batch_idx] = None
+            
+            if progress_callback:
+                progress_callback(batch_idx+1, len(valid_latents), 1, "Phase 3: Decoding")
         
         # Restore original tiling settings
         runner.decode_tiled = original_decode_tiled
-        debug.end_timer("vae_decode", "VAE decode (global slicing)")
-        
-        # Free the global latent tensor
-        del all_latents
-        gc.collect()
-        if is_cuda_available():
-            torch.cuda.empty_cache()
-        
-        # ============ REASSEMBLE DECODED FRAMES ============
-        # Concatenate all decoded samples on CPU
-        debug.log("Reassembling decoded frames...", category="vae", force=True)
-        debug.log(f"[DEBUG] Number of decoded slices: {len(all_decoded_samples)}", category="vae", force=True)
-        for i, s in enumerate(all_decoded_samples):
-            debug.log(f"[DEBUG] Decoded slice {i+1} shape: {s.shape}", category="vae", indent_level=1)
-        
-        sample = torch.cat(all_decoded_samples, dim=0)
-        debug.log(f"[DEBUG] Reassembled sample shape: {sample.shape}", category="vae", force=True)
-        del all_decoded_samples
-        
-        # Process samples through video rearrange
-        debug.start_timer("optimized_video_rearrange")
-        samples = optimized_video_rearrange([sample])
-        debug.end_timer("optimized_video_rearrange", "Video rearrange")
-        
-        sample = samples[0]
-        del samples
-        
-        # ============ WRITE TO FINAL VIDEO ============
-        # Calculate how many frames we actually have vs expected
-        decoded_frames = sample.shape[0]
-        
-        # Trim spatial padding to true target dimensions
-        current_h, current_w = sample.shape[-2:]
-        if current_h != true_h or current_w != true_w:
-            debug.log(f"Trimming spatial padding: {current_w}x{current_h} → {true_w}x{true_h}", 
-                     category="video", indent_level=1)
-            sample = sample[:, :, :true_h, :true_w]
-        
-        # Convert to output format: [T, C, H, W] → [T, H, W, C]
-        sample = optimized_sample_to_image_format(sample)
-        
-        # Move to target device for writing
-        sample = manage_tensor(
-            tensor=sample,
-            target_device=target_device,
-            tensor_name="decoded_video",
-            dtype=ctx['compute_dtype'],
-            non_blocking=True,
-            debug=debug,
-            reason="writing to final_video",
-            indent_level=1
-        )
-        
-        # Write to final_video
-        write_frames = min(sample.shape[0], total_output_frames)
-        if ctx.get('is_rgba', False):
-            ctx['final_video'][:write_frames, :, :, :3] = sample[:write_frames]
-        else:
-            ctx['final_video'][:write_frames] = sample[:write_frames]
-        
-        # Store batch info for Phase 4 - reconstruct original batch structure for compatibility
-        # Map the global decoded frames back to original batch boundaries
-        current_pos = 0
-        for batch_idx, ori_length in enumerate(original_batch_lengths):
-            batch_end = min(current_pos + ori_length, write_frames)
-            if current_pos < write_frames:
-                ctx['decode_batch_info'].append((current_pos, batch_end, batch_idx, ori_length))
-            current_pos = batch_end
-        
-        # If no batch info was created, add a single global entry
-        if not ctx['decode_batch_info']:
-            ctx['decode_batch_info'].append((0, write_frames, 0, write_frames))
-        
-        debug.log(f"Wrote {write_frames} frames to final_video", category="video", force=True)
-        
-        del sample
+        debug.end_timer("vae_decode", "VAE decode")
         
         # Sync async transfers
         if is_cuda_available():
             torch.cuda.synchronize()
             debug.log("Synchronized async transfers to final_video", category="cleanup", indent_level=1)
         
-        # Store padding stats for Phase 4 final summary
-        # With global flattening, padding removal happens at the end based on total_output_frames
-        ctx['total_padding_removed'] = max(0, total_latent_frames - total_output_frames)
+        # Store padding stats for Phase 4
+        ctx['total_padding_removed'] = 0
             
     except Exception as e:
         debug.log(f"Error in Phase 3 (Decoding): {e}", level="ERROR", category="error", force=True)
         raise
     finally:
-        # Restore VAE slicing settings if we changed them
+        # Restore VAE settings
         if original_use_slicing is not None and hasattr(runner.vae, 'use_slicing'):
             runner.vae.use_slicing = original_use_slicing
+        if original_use_tiling is not None and hasattr(runner.vae, 'use_tiling'):
+            runner.vae.use_tiling = original_use_tiling
         
         # Cleanup VAE as it's no longer needed
         cleanup_vae(runner=runner, debug=debug, cache_model=cache_model)
