@@ -54,7 +54,8 @@ from ..optimization.memory_manager import (
     release_tensor_collection,
     clear_memory,
     is_cuda_available,
-    get_basic_vram_info
+    get_basic_vram_info,
+    get_vram_usage
 )
 from ..optimization.nvfp4 import is_blackwell_gpu
 from ..optimization.performance import (
@@ -927,14 +928,16 @@ def upscale_all_batches(
     )
     debug.log(f"TOTAL FRAMES COLLECTED: {total_collected_frames}", category="cleanup", force=True)
     
-    # Log VRAM after wipe
+    # Log VRAM after wipe using get_vram_usage() which returns (allocated, reserved, peak_alloc, peak_reserved)
+    allocated_gb, reserved_gb, _, _ = get_vram_usage()
     vram_info = get_basic_vram_info()
-    if "error" not in vram_info:
-        debug.log(f"VRAM after wipe: {vram_info['allocated_gb']:.2f}GB allocated / {vram_info['free_gb']:.2f}GB free", 
-                  category="cleanup", force=True)
-        if vram_info['allocated_gb'] > 1.0:
-            debug.log(f"WARNING: {vram_info['allocated_gb']:.2f}GB still allocated - ghost memory detected!", 
-                     level="WARNING", category="cleanup", force=True)
+    free_gb = vram_info.get('free_gb', 0.0) if "error" not in vram_info else 0.0
+    
+    debug.log(f"VRAM after wipe: {allocated_gb:.2f}GB allocated / {free_gb:.2f}GB free", 
+              category="cleanup", force=True)
+    if allocated_gb > 1.0:
+        debug.log(f"WARNING: {allocated_gb:.2f}GB still allocated - ghost memory detected!", 
+                 level="WARNING", category="cleanup", force=True)
     
     return ctx
 
@@ -1006,13 +1009,17 @@ def decode_all_batches(
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
     
-    vram_info = get_basic_vram_info(device=ctx.get('vae_device'))
-    if "error" not in vram_info:
-        debug.log(f"[VAE] VRAM after pre-cleanup: {vram_info['allocated_gb']:.2f}GB allocated / {vram_info['free_gb']:.2f}GB free", 
-                  category="cleanup", force=True)
-        if vram_info['allocated_gb'] > 1.0:
-            debug.log(f"[VAE] WARNING: Ghost VRAM detected ({vram_info['allocated_gb']:.2f}GB) - may cause OOM!", 
-                     level="WARNING", category="cleanup", force=True)
+    # Log VRAM after pre-cleanup using get_vram_usage() (returns tuple)
+    vae_device = ctx.get('vae_device')
+    allocated_gb_pre, reserved_gb_pre, _, _ = get_vram_usage(device=vae_device)
+    vram_info_pre = get_basic_vram_info(device=vae_device)
+    free_gb_pre = vram_info_pre.get('free_gb', 0.0) if "error" not in vram_info_pre else 0.0
+    
+    debug.log(f"[VAE] VRAM after pre-cleanup: {allocated_gb_pre:.2f}GB allocated / {free_gb_pre:.2f}GB free", 
+              category="cleanup", force=True)
+    if allocated_gb_pre > 1.0:
+        debug.log(f"[VAE] WARNING: Ghost VRAM detected ({allocated_gb_pre:.2f}GB) - may cause OOM!", 
+                 level="WARNING", category="cleanup", force=True)
     
     # Get output dimensions from context (set during Phase 1)
     if 'true_target_dims' not in ctx:
