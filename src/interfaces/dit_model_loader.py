@@ -8,7 +8,6 @@ from comfy_execution.utils import get_executing_context
 from typing import Dict, Any, Tuple
 from ..utils.model_registry import get_available_dit_models, DEFAULT_DIT
 from ..optimization.memory_manager import get_device_list
-from ..optimization.compatibility import NVFP4_AVAILABLE, BLACKWELL_GPU_DETECTED
 
 
 class SeedVR2LoadDiTModel(io.ComfyNode):
@@ -191,6 +190,9 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
                 "Please set offload_device to specify where the cached DiT model should be stored "
                 "(e.g., 'cpu' or another device). Set cache_model=False if you don't want to cache the model."
             )
+        
+        # Lazy import to avoid loading torch at module level (breaks ComfyUI node registration)
+        from ..optimization.compatibility import NVFP4_AVAILABLE, BLACKWELL_GPU_DETECTED
         
         # Validate NVFP4 availability - only actually enable if hardware supports it
         nvfp4_active = enable_nvfp4 and NVFP4_AVAILABLE
