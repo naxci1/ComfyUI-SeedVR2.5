@@ -1063,11 +1063,18 @@ def decode_all_batches(
             debug.log("Blackwell GPU detected: using bfloat16 for maximum decode performance", 
                      category="vae", force=True)
         
-        # ============ PROCESS EACH BATCH WITH DIVISION ============
-        all_decoded_samples = []
+        # ============ PROCESS EACH BATCH WITH DIVISION (Nested Slicing) ============
+        # Iterate through each batch individually - no global concatenation to avoid VRAM spikes
+        
+        debug.log(f"[VAE] Total batches to decode: {len(valid_latents)}", category="vae", force=True)
+        
         current_write_idx = 0
         
         debug.start_timer("vae_decode")
+        
+        # Pre-decode: Ensure VAE is on CUDA and clear cache
+        if hasattr(runner.vae, 'clear_cache'):
+            runner.vae.clear_cache()
         
         for batch_idx, upscaled_latent in enumerate(valid_latents):
             if upscaled_latent is None:
@@ -1089,39 +1096,38 @@ def decode_all_batches(
                 )
             
             batch_frames = upscaled_latent.shape[0]
+            debug.log(f"[VAE] Batch {batch_idx+1}/{len(valid_latents)}: {batch_frames} frames, shape {upscaled_latent.shape}", 
+                     category="vae", force=True)
             
-            # Calculate slices based on division factor
+            # Split batch using torch.chunk based on division factor
             if division_factor == 1:
                 # No division - process entire batch at once
-                slices = [(0, batch_frames)]
-                debug.log(f"[VAE] Batch {batch_idx+1}/{len(valid_latents)}: Processing all {batch_frames} frames at once", 
-                         category="vae", force=True)
+                sub_slices = [upscaled_latent]
+                debug.log(f"[VAE] No division: processing all {batch_frames} frames at once", 
+                         category="vae", indent_level=1)
             else:
-                # Divide batch into equal parts
-                slice_size = max(1, batch_frames // division_factor)
-                slices = []
-                for i in range(0, batch_frames, slice_size):
-                    end = min(i + slice_size, batch_frames)
-                    slices.append((i, end))
-                debug.log(f"[VAE] Batch {batch_idx+1}/{len(valid_latents)}: Dividing {batch_frames} frames into {len(slices)} slices (factor={division_factor})", 
-                         category="vae", force=True)
+                # Use torch.chunk to split batch into equal parts along temporal dimension (dim=0)
+                # Note: latent format is [T, C, H, W] so temporal is dim=0
+                sub_slices = list(torch.chunk(upscaled_latent, chunks=division_factor, dim=0))
+                debug.log(f"[VAE] Using torch.chunk to split into {len(sub_slices)} sub-slices (factor={division_factor})", 
+                         category="vae", indent_level=1)
             
             batch_decoded_samples = []
             
-            for slice_idx, (start, end) in enumerate(slices):
+            for slice_idx, sub_slice in enumerate(sub_slices):
                 # Log VRAM before slice
                 vram_info = get_basic_vram_info(device=ctx['vae_device'])
                 if "error" not in vram_info:
                     debug.log(f"[VAE] VRAM Free: {vram_info['free_gb']:.2f}GB", category="vae", indent_level=1)
                 
-                debug.log(f"[VAE] Slice {slice_idx+1}/{len(slices)} (Frames {start}-{end})", 
+                # Explicit logging format as requested
+                debug.log(f"[VAE] Processing Batch {batch_idx+1}, Sub-slice {slice_idx+1}/{len(sub_slices)}", 
                          category="vae", force=True)
+                debug.log(f"[VAE] Sub-slice frames: {sub_slice.shape[0]}", category="vae", indent_level=1)
                 
-                # Extract sub-latent slice
+                # Ensure sub_slice is detached and no gradients
                 with torch.no_grad():
-                    sub_latent = upscaled_latent[start:end].detach()
-                
-                debug.log(f"[DEBUG] Sub-latent shape: {sub_latent.shape}", category="vae", indent_level=1)
+                    sub_latent = sub_slice.detach()
                 
                 # Blackwell Optimization: Use bfloat16
                 if use_bfloat16 and sub_latent.dtype != torch.bfloat16:
@@ -1134,30 +1140,30 @@ def decode_all_batches(
                 sub_sample = sub_samples[0]
                 del sub_samples
                 
-                debug.log(f"[DEBUG] Decoded slice shape: {sub_sample.shape}", category="vae", indent_level=1)
+                debug.log(f"[VAE] Decoded sub-slice shape: {sub_sample.shape}", category="vae", indent_level=1)
                 
-                # Move to CPU immediately to free VRAM
+                # Move to CPU immediately to free VRAM (Blackwell memory management)
                 sub_sample = sub_sample.cpu().detach()
                 batch_decoded_samples.append(sub_sample)
                 
-                # CRUCIAL: Strict VRAM cleanup after EACH slice
+                # CRUCIAL: Strict VRAM cleanup after EACH sub-slice (not just each batch)
                 del sub_latent
                 gc.collect()
                 if is_cuda_available():
                     torch.cuda.empty_cache()
             
-            # Free the batch latent
-            del upscaled_latent
+            # Free the batch latent and sub_slices
+            del upscaled_latent, sub_slices
             gc.collect()
             if is_cuda_available():
                 torch.cuda.empty_cache()
             
-            # Concatenate all slices from this batch
+            # Concatenate all sub-slices from this batch
             with torch.no_grad():
                 batch_sample = torch.cat(batch_decoded_samples, dim=0)
             del batch_decoded_samples
             
-            debug.log(f"[DEBUG] Batch {batch_idx+1} decoded sample shape: {batch_sample.shape}", category="vae", indent_level=1)
+            debug.log(f"[VAE] Batch {batch_idx+1} decoded sample shape: {batch_sample.shape}", category="vae", indent_level=1)
             
             # Process through video rearrange
             samples = optimized_video_rearrange([batch_sample])
