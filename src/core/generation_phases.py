@@ -721,6 +721,15 @@ def upscale_all_batches(
         ctx['all_upscaled_latents'] = []
         return ctx
     
+    # ============ VERIFY INPUT LATENTS FROM PHASE 1 ============
+    total_input_frames = sum(l.shape[0] for l in ctx['all_latents'] if l is not None)
+    debug.log(f"[DiT] Phase 2 Input: {num_valid_latents} latent packets, {total_input_frames} total frames", 
+              category="dit", force=True)
+    for lat_idx, lat in enumerate(ctx['all_latents']):
+        if lat is not None:
+            debug.log(f"[DiT] Input Packet {lat_idx+1}: shape {list(lat.shape)}, frames: {lat.shape[0]}", 
+                     category="dit", indent_level=1)
+    
     # Pre-allocate list for upscaled latents
     ctx['all_upscaled_latents'] = [None] * num_valid_latents
     
@@ -1085,21 +1094,27 @@ def decode_all_batches(
         
         debug.log_memory_state("After VAE loading for decoding", detailed_tensors=False)
         
-        # ============ DISABLE VAE INTERNAL SLICING/TILING ============
-        # We manually control slicing with division factor - no double allocation
+        # ============ ENABLE VAE INTERNAL SLICING/TILING ============
+        # CRITICAL: Enable VAE's internal optimizations to reduce VRAM spikes during Upsample3D
+        # The 9.16GB + 6.92GB = 16.08GB spike happens INSIDE the VAE decoder (Upsample3D.upscale_conv)
+        # VAE tiling/slicing breaks these internal operations into smaller chunks
         original_use_slicing = getattr(runner.vae, 'use_slicing', None)
         original_use_tiling = getattr(runner.vae, 'use_tiling', None)
         
-        if hasattr(runner.vae, 'use_slicing'):
-            runner.vae.use_slicing = False
-        if hasattr(runner.vae, 'use_tiling'):
-            runner.vae.use_tiling = False
-        if hasattr(runner.vae, 'disable_slicing'):
-            runner.vae.disable_slicing()
-        if hasattr(runner.vae, 'disable_tiling'):
-            runner.vae.disable_tiling()
+        # ENABLE internal VAE optimizations for Blackwell
+        if hasattr(runner.vae, 'enable_slicing'):
+            runner.vae.enable_slicing()
+            debug.log("[VAE] Enabled VAE internal slicing", category="vae", force=True)
+        elif hasattr(runner.vae, 'use_slicing'):
+            runner.vae.use_slicing = True
         
-        debug.log("[VAE] Disabled internal slicing/tiling (manual control via division factor)", category="vae", force=True)
+        if hasattr(runner.vae, 'enable_tiling'):
+            runner.vae.enable_tiling()
+            debug.log("[VAE] Enabled VAE internal tiling", category="vae", force=True)
+        elif hasattr(runner.vae, 'use_tiling'):
+            runner.vae.use_tiling = True
+        
+        debug.log("[VAE] Enabled internal slicing/tiling + manual control via division factor", category="vae", force=True)
         
         original_decode_tiled = runner.decode_tiled
         runner.decode_tiled = False
@@ -1242,11 +1257,21 @@ def decode_all_batches(
                     del decoded_output
                     
                 except torch.cuda.OutOfMemoryError as oom_e:
-                    # OOM GUARD: If sub-slice too large, log and re-raise
+                    # OOM GUARD: If sub-slice too large, suggest higher division
                     debug.log(f"[VAE] OOM on Sub-slice {packet_id}.{slice_id} ({sub_slice_frames} frames)! VRAM insufficient.", 
                              level="ERROR", category="vae", force=True)
-                    debug.log(f"[VAE] HINT: Increase decode_vae_divide from {division_factor} to 4 or higher.", 
+                    
+                    # Calculate recommended division based on current sub-slice size
+                    if division_factor <= 2:
+                        recommended = 4
+                    else:
+                        recommended = division_factor * 2  # Double the division
+                    
+                    debug.log(f"[VAE] HINT: Set decode_vae_divide to {recommended} (currently {division_factor})", 
                              level="WARNING", category="vae", force=True)
+                    debug.log(f"[VAE] {sub_slice_frames} frames caused 6.92GB+ allocation - try ~{packet_frames // recommended} frames per sub-slice", 
+                             level="WARNING", category="vae", force=True)
+                    
                     # Cleanup before re-raising
                     if 'sub_slice_cuda' in dir():
                         del sub_slice_cuda
