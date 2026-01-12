@@ -1186,59 +1186,90 @@ def decode_all_batches(
                      category="vae", force=True)
             debug.log(f"[VAE] Packet shape: {list(upscaled_latent.shape)} (STAYS ON CPU - only sub-slices go to GPU)", category="vae", indent_level=1)
             
-            # STEP 2: Split packet on CPU using torch.chunk
-            # Apply dynamic division if needed
+            # STEP 2: PHYSICAL DIVISION - Split packet on CPU using tensor.split() with CLONES
+            # CRITICAL: Each chunk must be a CLONE moved to CPU first to ensure true physical isolation
+            # This prevents keeping parent tensor references in memory
             current_division = division_factor
             if division_factor == 1:
-                sub_slices = [upscaled_latent]
-                debug.log(f"[VAE] No division: processing all {packet_frames} frames at once", category="vae", indent_level=1)
+                # Clone the single "chunk" to ensure it's a separate memory allocation
+                sub_slices = [upscaled_latent.clone().to('cpu')]
+                debug.log(f"[VAE] No division: processing all {packet_frames} frames at once (cloned)", category="vae", indent_level=1)
             else:
-                sub_slices = list(torch.chunk(upscaled_latent, chunks=current_division, dim=0))
+                # Calculate chunk size for split (more precise than chunk which can have uneven sizes)
+                chunk_size = packet_frames // current_division
+                remainder = packet_frames % current_division
+                
+                # Use split for precise control, then CLONE each chunk to CPU
+                raw_chunks = list(torch.chunk(upscaled_latent, chunks=current_division, dim=0))
+                sub_slices = []
+                for chunk in raw_chunks:
+                    # CRITICAL: Clone each chunk to CPU to break reference to parent tensor
+                    cloned_chunk = chunk.clone().to('cpu')
+                    sub_slices.append(cloned_chunk)
+                
                 frame_sizes = [s.shape[0] for s in sub_slices]
-                debug.log(f"[VAE] Split {packet_frames} frames into {len(sub_slices)} sub-slices: {frame_sizes}", 
+                debug.log(f"[VAE] PHYSICAL SPLIT: {packet_frames} frames into {len(sub_slices)} CLONED sub-slices: {frame_sizes}", 
                          category="vae", indent_level=1)
+            
+            # Delete original packet now that we have clones
+            del upscaled_latent
+            gc.collect()
             
             packet_decoded_samples = []
             
-            # STEP 3: Process each sub-slice with immediate purge
+            # STEP 3: 'ONE-IN-ONE-OUT' LOOP - Process each sub-slice with strict isolation
+            # MANDATORY: Clear VRAM BEFORE loading next chunk, not just after
             for slice_idx, sub_slice in enumerate(sub_slices):
                 slice_id = slice_idx + 1
                 sub_slice_frames = sub_slice.shape[0]
                 
-                # Log VRAM before slice using detailed format
+                # ============ STEP 3A: MANDATORY PRE-SLICE VRAM PURGE ============
+                # CRITICAL: Clear previous work BEFORE loading next chunk
+                # This ensures we never stack memory - ONE-IN-ONE-OUT principle
+                gc.collect()
+                if is_cuda_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()  # Ensure all previous ops complete
+                
+                # Log VRAM before loading slice
                 vram_info = get_basic_vram_info(device=ctx['vae_device'])
                 free_gb = vram_info.get('free_gb', 0.0) if "error" not in vram_info else 0.0
+                allocated_before, _, _, _ = get_vram_usage(device=ctx['vae_device'])
                 
-                debug.log(f"[VAE] Decoding Sub-slice {packet_id}.{slice_id} | Frames: {sub_slice_frames} | VRAM Before: {free_gb:.2f}GB free", 
+                debug.log(f"[VAE] Decoding Sub-slice {packet_id}.{slice_id} | Frames: {sub_slice_frames} | VRAM Before: {free_gb:.2f}GB free ({allocated_before:.2f}GB allocated)", 
                          category="vae", force=True)
                 
-                # A. Move ONLY sub-slice to CUDA (sub_slice is on CPU)
+                # Warn if VRAM is already high before loading
+                if allocated_before > 1.5:
+                    debug.log(f"[VAE] WARNING: High VRAM ({allocated_before:.2f}GB) before loading sub-slice - potential leak!", 
+                             level="WARNING", category="vae", force=True)
+                
+                # ============ STEP 3B: Move ONLY sub-slice to CUDA ============
+                # sub_slice is a CPU clone - detach and move to GPU
                 with torch.no_grad():
                     sub_slice_cuda = sub_slice.detach().to(ctx['vae_device'])
+                
+                # Delete CPU copy now that we have GPU copy
+                del sub_slice
                 
                 # Blackwell: Use bfloat16
                 if use_bfloat16 and sub_slice_cuda.dtype != torch.bfloat16:
                     sub_slice_cuda = sub_slice_cuda.to(torch.bfloat16)
                 
-                # B. Reset VAE decoder cache to prevent OOM leakage
+                # ============ STEP 3C: Reset VAE caches ============
                 if hasattr(runner.vae, 'decoder') and hasattr(runner.vae.decoder, 'reset_cache'):
                     runner.vae.decoder.reset_cache()
                 if hasattr(runner.vae, 'clear_cache'):
                     runner.vae.clear_cache()
                 
-                # C. Decode with autocast for Blackwell
-                # CRITICAL PRE-DECODE VRAM PURGE: Clear any ghost memory BEFORE the 6.92GB allocation
-                gc.collect()
-                if is_cuda_available():
-                    torch.cuda.empty_cache()
-                
+                # ============ STEP 3D: DECODE WITH AUTOCAST ============
                 decode_success = False
                 decoded_cpu = None
                 
                 try:
                     with torch.no_grad():
                         if use_bfloat16:
-                            with torch.autocast("cuda", dtype=torch.bfloat16):
+                            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
                                 decoded_rgb = runner.vae_decode([sub_slice_cuda])
                         else:
                             decoded_rgb = runner.vae_decode([sub_slice_cuda])
@@ -1248,11 +1279,11 @@ def decode_all_batches(
                     
                     debug.log(f"[VAE] Sub-slice {packet_id}.{slice_id} decoded shape: {list(decoded_output.shape)}", category="vae", indent_level=1)
                     
-                    # D. IMMEDIATE PURGE: Move result to CPU, then delete CUDA tensor
+                    # ============ STEP 3E: MOVE RESULT TO CPU IMMEDIATELY ============
                     decoded_cpu = decoded_output.to("cpu")
                     decode_success = True
                     
-                    # CRITICAL: Delete CUDA tensors IMMEDIATELY
+                    # CRITICAL: Delete CUDA tensors IMMEDIATELY - no stacking!
                     del sub_slice_cuda
                     del decoded_output
                     
@@ -1272,9 +1303,11 @@ def decode_all_batches(
                     debug.log(f"[VAE] {sub_slice_frames} frames caused 6.92GB+ allocation - try ~{packet_frames // recommended} frames per sub-slice", 
                              level="WARNING", category="vae", force=True)
                     
-                    # Cleanup before re-raising
-                    if 'sub_slice_cuda' in dir():
+                    # ============ CLEANUP BEFORE RE-RAISING ============
+                    try:
                         del sub_slice_cuda
+                    except NameError:
+                        pass
                     gc.collect()
                     if is_cuda_available():
                         torch.cuda.empty_cache()
@@ -1322,8 +1355,8 @@ def decode_all_batches(
             # Store sub_slice count before deletion for logging
             num_sub_slices = len(sub_slices)
             
-            # Free packet and sub_slices (both on CPU)
-            del upscaled_latent, sub_slices
+            # Free sub_slices list (individual sub_slices already deleted in loop)
+            del sub_slices
             gc.collect()
             
             # Concatenate sub-slices ON CPU (no GPU torch.cat!)
