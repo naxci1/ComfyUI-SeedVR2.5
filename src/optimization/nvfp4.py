@@ -32,6 +32,7 @@ Usage:
 """
 
 import os
+import time
 import torch
 import torch.nn as nn
 from typing import Dict, Any, Optional, Tuple, List, Set
@@ -42,6 +43,36 @@ NVFP4_EXPONENT_BITS = 2  # E2M1 format
 NVFP4_MANTISSA_BITS = 1
 NVFP4_BLOCK_SIZE = 16  # Weights per scaling block
 NVFP4_SCALE_FORMAT = torch.float8_e4m3fn  # E4M3 scaling factors
+
+# Dtype to element size mapping (more efficient than creating empty tensors)
+_DTYPE_SIZES: Dict[torch.dtype, int] = {
+    torch.float32: 4,
+    torch.float64: 8,
+    torch.float16: 2,
+    torch.bfloat16: 2,
+    torch.int8: 1,
+    torch.int16: 2,
+    torch.int32: 4,
+    torch.int64: 8,
+    torch.uint8: 1,
+    torch.bool: 1,
+    torch.complex64: 8,
+    torch.complex128: 16,
+}
+
+# Add FP8 types if available
+if hasattr(torch, 'float8_e4m3fn'):
+    _DTYPE_SIZES[torch.float8_e4m3fn] = 1
+if hasattr(torch, 'float8_e5m2'):
+    _DTYPE_SIZES[torch.float8_e5m2] = 1
+
+
+def _get_dtype_size(dtype: torch.dtype) -> int:
+    """Get element size in bytes for a dtype"""
+    if dtype in _DTYPE_SIZES:
+        return _DTYPE_SIZES[dtype]
+    # Fallback for unknown dtypes
+    return torch.tensor([], dtype=dtype).element_size()
 
 # Layers that should NOT be quantized (kept in FP16 for quality)
 PRESERVED_LAYER_PATTERNS = {
@@ -718,7 +749,6 @@ class PinnedMemoryPool:
         if not self._enabled:
             return None
         
-        import time
         key = self._make_key(shape, dtype)
         
         if key in self._buffers:
@@ -728,7 +758,7 @@ class PinnedMemoryPool:
         
         # Need to allocate new buffer
         self._misses += 1
-        size_bytes = shape.numel() * torch.tensor([], dtype=dtype).element_size()
+        size_bytes = shape.numel() * _get_dtype_size(dtype)
         
         # Check if we have room
         if self._total_allocated + size_bytes > self._max_size:
@@ -759,8 +789,6 @@ class PinnedMemoryPool:
     
     def _evict_lru(self, needed_bytes: int) -> None:
         """Evict least recently used buffers to free space"""
-        import time
-        
         if not self._buffer_last_used:
             return
         
@@ -1158,18 +1186,11 @@ def ensure_native_fp4_dispatch() -> bool:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         
-        # Set CUDA memory allocator to be more efficient
-        if hasattr(torch.cuda, 'memory') and hasattr(torch.cuda.memory, 'set_per_process_memory_fraction'):
-            # Don't limit memory - let the allocator use what's available
-            pass
-        
         # Enable cudnn benchmark for optimal kernel selection
         torch.backends.cudnn.benchmark = True
         
-        # For Blackwell, ensure we're using the native compute path
-        # This helps the dispatcher select the right kernels
-        if hasattr(torch._C, '_cuda_setBlackwellOptimizations'):
-            torch._C._cuda_setBlackwellOptimizations(True)
+        # Note: We only use public PyTorch APIs to ensure compatibility
+        # Future PyTorch versions may expose native Blackwell optimization APIs
         
         return True
         

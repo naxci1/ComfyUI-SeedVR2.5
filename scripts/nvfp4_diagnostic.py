@@ -358,15 +358,23 @@ def test_fp4_support():
         if has_fp8:
             try:
                 # Create FP8 tensors
-                a_fp8 = torch.randn(m, k, dtype=torch.float16, device='cuda').to(torch.float8_e4m3fn)
-                b_fp8 = torch.randn(k, n, dtype=torch.float16, device='cuda').to(torch.float8_e4m3fn)
+                a_fp16 = torch.randn(m, k, dtype=torch.float16, device='cuda')
+                a_fp8 = a_fp16.to(torch.float8_e4m3fn)
                 
-                # FP8 matmul requires explicit scaling in most implementations
-                # For now, just verify we can create and convert FP8 tensors
-                fp8_working = True
-                fp8_details = "FP8 tensor creation successful"
+                b_fp16 = torch.randn(k, n, dtype=torch.float16, device='cuda')
+                b_fp8 = b_fp16.to(torch.float8_e4m3fn)
                 
-                del a_fp8, b_fp8
+                # Verify tensors are actually in FP8 format
+                fp8_dtype_correct = (a_fp8.dtype == torch.float8_e4m3fn and 
+                                    b_fp8.dtype == torch.float8_e4m3fn)
+                
+                if fp8_dtype_correct:
+                    fp8_working = True
+                    fp8_details = f"FP8 tensor creation verified (dtype: {a_fp8.dtype})"
+                else:
+                    fp8_details = f"FP8 conversion failed (got: {a_fp8.dtype}, expected: {torch.float8_e4m3fn})"
+                
+                del a_fp16, a_fp8, b_fp16, b_fp8
             except Exception as e:
                 fp8_details = f"FP8 test error: {str(e)}"
         
