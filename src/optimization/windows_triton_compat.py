@@ -154,6 +154,96 @@ def find_msvc_compiler() -> Optional[str]:
     return None
 
 
+@lru_cache(maxsize=1)
+def check_openmp_availability() -> bool:
+    """
+    Check if OpenMP headers are available in the MSVC installation.
+    
+    The Triton/Inductor backend compiles C++ code with OpenMP flags (/openmp).
+    If omp.h is not available (common with minimal VS Build Tools installs),
+    compilation will fail with 'Cannot open include file: omp.h'.
+    
+    Returns:
+        True if OpenMP appears to be available, False otherwise
+    """
+    if not is_windows():
+        return True  # Assume available on Linux/Mac
+    
+    # Find cl.exe path to locate include directories
+    cl_path = find_msvc_compiler()
+    if cl_path is None:
+        return False
+    
+    # From cl.exe path, navigate to include directory
+    # cl.exe is at: .../MSVC/<version>/bin/Hostx64/x64/cl.exe
+    # omp.h is at: .../MSVC/<version>/include/omp.h
+    try:
+        cl_exe_path = Path(cl_path)
+        # Go up from bin/Hostx64/x64/cl.exe to MSVC/<version>
+        msvc_root = cl_exe_path.parent.parent.parent.parent
+        omp_header = msvc_root / "include" / "omp.h"
+        
+        if omp_header.exists():
+            return True
+        
+        # Also check in the parallel patterns library location
+        # Some VS installations put it elsewhere
+        alternate_locations = [
+            msvc_root / "include" / "openmp" / "omp.h",
+            msvc_root.parent.parent / "Auxiliary" / "VS" / "include" / "omp.h",
+        ]
+        
+        for alt_path in alternate_locations:
+            if alt_path.exists():
+                return True
+        
+        return False
+        
+    except Exception:
+        return False
+
+
+def configure_inductor_for_windows(debug: Optional[DebugLogger] = None) -> None:
+    """
+    Configure PyTorch Inductor environment variables for Windows compatibility.
+    
+    Sets environment variables to work around common Windows issues:
+    - Disables OpenMP if omp.h is not available
+    - Configures temp directories
+    - Sets reasonable defaults for Windows
+    
+    Args:
+        debug: Optional debug instance for logging
+    """
+    if not is_windows():
+        return
+    
+    # Check OpenMP availability
+    openmp_available = check_openmp_availability()
+    
+    if not openmp_available:
+        # Disable OpenMP in Inductor C++ compilation
+        # This prevents the 'omp.h not found' error
+        os.environ["TORCHINDUCTOR_CPP_OPENMP"] = "0"
+        
+        if debug:
+            debug.log(
+                "OpenMP headers (omp.h) not found in MSVC installation. "
+                "Disabled OpenMP for torch.compile C++ compilation. "
+                "For better performance, install VS Build Tools with 'Desktop development with C++' workload.",
+                level="WARNING", category="setup", force=True
+            )
+    
+    # Set reasonable defaults for Windows
+    # Disable freezing which can cause issues
+    os.environ.setdefault("TORCHINDUCTOR_FREEZING", "0")
+    
+    # Use a safe temp directory
+    if "TORCHINDUCTOR_OUTPUT_CODE" not in os.environ:
+        # Don't change if user has set it
+        pass
+
+
 def get_vcvars_path() -> Optional[str]:
     """
     Find vcvars64.bat for VS environment setup.
@@ -292,7 +382,8 @@ def ensure_windows_triton_compat(debug: Optional[DebugLogger] = None) -> bool:
     This function:
     1. Sets up MSVC compiler in PATH (if available)
     2. Checks Triton availability
-    3. Configures torch.compile environment variables
+    3. Configures Inductor environment variables (including OpenMP workaround)
+    4. Sets torch.compile environment variables
     
     Should be called once at application startup before using torch.compile.
     
@@ -325,7 +416,12 @@ def ensure_windows_triton_compat(debug: Optional[DebugLogger] = None) -> bool:
     elif debug:
         debug.log(triton_msg, category="setup")
     
-    # 3. Set environment variables for Windows torch.compile
+    # 3. Configure Inductor for Windows (including OpenMP workaround)
+    # This must be called even if Triton is not available, as it sets
+    # environment variables that prevent crashes when torch.compile is attempted
+    configure_inductor_for_windows(debug)
+    
+    # 4. Set additional environment variables for Windows torch.compile
     if all_ok:
         # Disable some features that cause issues on Windows
         os.environ.setdefault("TORCH_COMPILE_DEBUG", "0")
@@ -510,9 +606,12 @@ def get_compilation_status() -> Dict[str, Any]:
     
     if is_windows():
         cl_path = find_msvc_compiler()
+        openmp_available = check_openmp_availability()
         status['msvc_available'] = cl_path is not None
         status['msvc_path'] = cl_path
         status['msvc_setup_done'] = _MSVC_SETUP_DONE
+        status['openmp_available'] = openmp_available
+        status['openmp_disabled'] = os.environ.get("TORCHINDUCTOR_CPP_OPENMP") == "0"
     
     return status
 
@@ -526,6 +625,8 @@ __all__ = [
     'get_vcvars_path',
     'setup_msvc_environment',
     'check_triton_availability',
+    'check_openmp_availability',
+    'configure_inductor_for_windows',
     'ensure_windows_triton_compat',
     'get_torch_compile_backend',
     'safe_compile_model',
