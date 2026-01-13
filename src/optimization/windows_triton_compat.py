@@ -31,12 +31,21 @@ import sys
 import platform
 import subprocess
 import warnings
-from typing import Optional, Tuple, Dict, Any, Callable
+from typing import Optional, Tuple, Dict, Any, Callable, Protocol, runtime_checkable
 from pathlib import Path
 from functools import lru_cache
 
 import torch
 import torch.nn as nn
+
+
+@runtime_checkable
+class DebugLogger(Protocol):
+    """Protocol defining the debug logger interface"""
+    def log(self, message: str, level: str = "INFO", category: str = "general", 
+            force: bool = False, indent_level: int = 0) -> None: ...
+    def start_timer(self, name: str) -> None: ...
+    def end_timer(self, name: str, label: str = "") -> None: ...
 
 
 # Module state
@@ -179,7 +188,7 @@ def get_vcvars_path() -> Optional[str]:
     return None
 
 
-def setup_msvc_environment(debug: Optional[Any] = None) -> bool:
+def setup_msvc_environment(debug: Optional[DebugLogger] = None) -> bool:
     """
     Setup MSVC environment for Triton JIT compilation.
     
@@ -264,17 +273,19 @@ def check_triton_availability() -> Tuple[bool, str]:
         _TRITON_AVAILABLE = False
         
         if is_windows():
+            # Note: PyTorch wheel URLs may change. Check https://pytorch.org/get-started/locally/
+            # for current installation instructions.
             return (False, 
                 "Triton not installed. For Windows, install triton-windows:\n"
                 "  pip install triton-windows\n"
-                "Or for CUDA 12.8+:\n"
+                "Or for CUDA 12.8+ (check pytorch.org for current URLs):\n"
                 "  pip install --pre triton --index-url https://download.pytorch.org/whl/nightly/cu128"
             )
         else:
             return (False, f"Triton not installed: {e}")
 
 
-def ensure_windows_triton_compat(debug: Optional[Any] = None) -> bool:
+def ensure_windows_triton_compat(debug: Optional[DebugLogger] = None) -> bool:
     """
     Ensure Windows environment is properly configured for Triton/torch.compile.
     
@@ -331,7 +342,7 @@ def ensure_windows_triton_compat(debug: Optional[Any] = None) -> bool:
 def get_torch_compile_backend(
     preferred_backend: str = "inductor",
     fallback_to_eager: bool = True,
-    debug: Optional[Any] = None
+    debug: Optional[DebugLogger] = None
 ) -> Optional[str]:
     """
     Get the best available torch.compile backend.
@@ -394,7 +405,7 @@ def safe_compile_model(
     backend: str = "inductor",
     fullgraph: bool = False,
     dynamic: bool = False,
-    debug: Optional[Any] = None,
+    debug: Optional[DebugLogger] = None,
     model_name: str = "model"
 ) -> nn.Module:
     """

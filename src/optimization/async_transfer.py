@@ -29,10 +29,17 @@ Author: SeedVR2 Team
 
 import torch
 import torch.nn as nn
-from typing import Iterator, List, Optional, Tuple, Dict, Any, Union, Generator
+from typing import Iterator, List, Optional, Tuple, Dict, Any, Union, Generator, Protocol, runtime_checkable
 from collections import OrderedDict
 import threading
 import time
+
+
+@runtime_checkable
+class DebugLogger(Protocol):
+    """Protocol defining the debug logger interface"""
+    def log(self, message: str, level: str = "INFO", category: str = "general", 
+            force: bool = False, indent_level: int = 0) -> None: ...
 
 
 class PinnedTensorAllocator:
@@ -54,7 +61,7 @@ class PinnedTensorAllocator:
         self,
         max_pool_mb: float = 2048.0,
         enable_pooling: bool = True,
-        debug: Optional[Any] = None
+        debug: Optional[DebugLogger] = None
     ):
         """
         Initialize pinned tensor allocator.
@@ -219,6 +226,7 @@ class StreamedTransferManager:
     - Host-to-Device (H2D) transfers - loading next batch while computing
     - Device-to-Host (D2H) transfers - offloading results while computing next
     - Compute operations - main inference stream
+    - Prefetch operations - high-priority stream for layer prefetching
     
     This enables the "double-buffering" pattern:
     While GPU computes on batch N, CPU prepares batch N+1 in pinned memory,
@@ -228,7 +236,7 @@ class StreamedTransferManager:
     def __init__(
         self,
         device: Optional[torch.device] = None,
-        debug: Optional[Any] = None
+        debug: Optional[DebugLogger] = None
     ):
         """
         Initialize stream manager.
@@ -408,7 +416,7 @@ class AsyncDataLoader:
         device: torch.device,
         prefetch_count: int = 2,
         use_pinned_memory: bool = True,
-        debug: Optional[Any] = None
+        debug: Optional[DebugLogger] = None
     ):
         """
         Initialize async data loader.
@@ -538,7 +546,7 @@ def prefetch_next_batch(
 def create_async_transfer_context(
     device: Optional[torch.device] = None,
     max_pool_mb: float = 2048.0,
-    debug: Optional[Any] = None
+    debug: Optional[DebugLogger] = None
 ) -> Dict[str, Any]:
     """
     Create a context with all async transfer components.

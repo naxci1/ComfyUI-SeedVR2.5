@@ -47,6 +47,16 @@ import torch
 import torch.nn as nn
 
 
+# ============================================================================
+# Constants for unit conversions
+# ============================================================================
+MS_TO_SECONDS = 1000.0  # Convert milliseconds to seconds (divide by this)
+MB_TO_GB = 1024.0  # Convert MB to GB (divide by this)
+BYTES_PER_FLOAT32 = 4  # Size of float32 in bytes
+BYTES_TO_GB = 1024 ** 3  # Convert bytes to GB (divide by this)
+BYTES_TO_MB = 1024 ** 2  # Convert bytes to MB (divide by this)
+
+
 @dataclass
 class BenchmarkResult:
     """Container for benchmark results"""
@@ -87,7 +97,7 @@ def get_gpu_info() -> Dict[str, Any]:
     return {
         'available': True,
         'name': props.name,
-        'total_memory_gb': props.total_memory / (1024**3),
+        'total_memory_gb': props.total_memory / BYTES_TO_GB,
         'compute_capability': f"{compute_cap[0]}.{compute_cap[1]}",
         'is_blackwell': compute_cap[0] >= 10,
         'is_hopper': compute_cap[0] == 9,
@@ -112,8 +122,8 @@ def get_vram_usage() -> Tuple[float, float]:
     if not torch.cuda.is_available():
         return (0.0, 0.0)
     
-    current = torch.cuda.memory_allocated() / (1024**3)
-    peak = torch.cuda.max_memory_allocated() / (1024**3)
+    current = torch.cuda.memory_allocated() / BYTES_TO_GB
+    peak = torch.cuda.max_memory_allocated() / BYTES_TO_GB
     return (current, peak)
 
 
@@ -140,7 +150,7 @@ def benchmark_pinned_memory(
         result.extra_metrics['status'] = 'CUDA not available'
         return result
     
-    tensor_size = (size_mb * 1024 * 1024) // 4  # float32 = 4 bytes
+    tensor_size = (size_mb * int(BYTES_TO_MB)) // BYTES_PER_FLOAT32  # float32 = 4 bytes
     
     # Create tensors
     pageable_tensor = torch.randn(tensor_size, dtype=torch.float32)
@@ -183,7 +193,9 @@ def benchmark_pinned_memory(
     result.avg_latency_ms = avg_pinned
     result.min_latency_ms = min(pinned_times)
     result.max_latency_ms = max(pinned_times)
-    result.transfer_bandwidth_gbs = size_mb / (avg_pinned / 1000) / 1024  # GB/s
+    # Calculate bandwidth: size_mb / (time_in_seconds) / MB_TO_GB = GB/s
+    time_in_seconds = avg_pinned / MS_TO_SECONDS
+    result.transfer_bandwidth_gbs = size_mb / time_in_seconds / MB_TO_GB
     
     result.extra_metrics = {
         'size_mb': size_mb,
