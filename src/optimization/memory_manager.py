@@ -409,6 +409,91 @@ def clear_memory(debug: Optional['Debug'] = None, deep: bool = False, force: boo
         debug.end_timer(main_timer, completion_msg)
 
 
+def perform_hard_reset(device: Optional[torch.device] = None, debug: Optional['Debug'] = None,
+                       threshold_gb: float = 2.0) -> bool:
+    """
+    Perform hard VRAM reset if allocated memory exceeds threshold.
+    
+    This is a PREVENTION protocol for Blackwell GPUs (16GB VRAM):
+    - Check if allocated VRAM is above threshold (default 2GB = "dirty" VRAM)
+    - If dirty, perform aggressive cleanup to drop below 1GB
+    - This prevents ghost memory from causing OOM during large allocations
+    
+    Args:
+        device: Optional CUDA device. If None, uses cuda:0
+        debug: Optional debug instance for logging
+        threshold_gb: Trigger cleanup if allocated >= this value (default 2.0GB)
+        
+    Returns:
+        bool: True if reset was performed, False if not needed
+    """
+    if not is_cuda_available():
+        return False
+    
+    try:
+        if device is None:
+            device = torch.device("cuda:0")
+        elif not isinstance(device, torch.device):
+            device = torch.device(device)
+        
+        # Check current allocated memory
+        allocated_gb = torch.cuda.memory_allocated(device) / (1024**3)
+        
+        if allocated_gb < threshold_gb:
+            return False
+        
+        if debug:
+            debug.log(f"[VRAM] Dirty VRAM detected: {allocated_gb:.2f}GB allocated (threshold: {threshold_gb:.2f}GB)", 
+                     level="WARNING", category="memory", force=True)
+            debug.log("[VRAM] Executing hard reset to prevent OOM...", category="memory", force=True)
+        
+        # Triple garbage collection for maximum cleanup
+        for wipe_pass in range(3):
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize(device)
+        
+        # Log result
+        new_allocated_gb = torch.cuda.memory_allocated(device) / (1024**3)
+        if debug:
+            debug.log(f"[VRAM] Hard reset complete: {allocated_gb:.2f}GB -> {new_allocated_gb:.2f}GB", 
+                     category="memory", force=True)
+        
+        return True
+        
+    except Exception as e:
+        if debug:
+            debug.log(f"[VRAM] Hard reset failed: {e}", level="WARNING", category="memory", force=True)
+        return False
+
+
+def check_vram_dirty(device: Optional[torch.device] = None, threshold_gb: float = 2.0) -> bool:
+    """
+    Check if VRAM has "dirty" (leaked) memory above threshold.
+    
+    Args:
+        device: Optional CUDA device. If None, uses cuda:0
+        threshold_gb: Consider VRAM dirty if allocated >= this value
+        
+    Returns:
+        bool: True if VRAM is dirty (allocated >= threshold)
+    """
+    if not is_cuda_available():
+        return False
+    
+    try:
+        if device is None:
+            device = torch.device("cuda:0")
+        elif not isinstance(device, torch.device):
+            device = torch.device(device)
+        
+        allocated_gb = torch.cuda.memory_allocated(device) / (1024**3)
+        return allocated_gb >= threshold_gb
+        
+    except Exception:
+        return False
+
+
 def retry_on_oom(func, *args, debug=None, operation_name="operation", **kwargs):
     """
     Execute function with single OOM retry after memory cleanup.
