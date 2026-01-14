@@ -779,6 +779,8 @@ def configure_runner(
     tile_debug: str = "false",
     attention_mode: str = 'sdpa',
     sparsity_threshold: float = 0.5,
+    vae_sparge_enabled: bool = False,
+    vae_sparsity_threshold: float = 0.5,
     torch_compile_args_dit: Optional[Dict[str, Any]] = None,
     torch_compile_args_vae: Optional[Dict[str, Any]] = None
 ) -> Tuple[VideoDiffusionInfer, Dict[str, Any]]:
@@ -808,6 +810,8 @@ def configure_runner(
         attention_mode: Attention computation backend ('sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3')
         sparsity_threshold: Sparsity threshold for sparge_sage2 attention (0.0-1.0, default 0.5)
                            Maps to performance modes: Fast=0.3, Balanced=0.5, High Quality=0.7
+        vae_sparge_enabled: Enable Sparge block-sparse attention for VAE decoding (Blackwell)
+        vae_sparsity_threshold: Sparsity threshold for VAE Sparge attention (0.0-1.0, default 0.5)
         torch_compile_args_dit: Optional torch.compile configuration for DiT model
         torch_compile_args_vae: Optional torch.compile configuration for VAE model
         
@@ -820,6 +824,7 @@ def configure_runner(
         - Optional torch.compile optimization for inference speedup
         - Separate encode/decode tiling configuration for optimal performance
         - Memory optimization and BlockSwap integration
+        - Blackwell GPU optimization with Sparge attention for VAE
         
     Raises:
         ValueError: If debug instance is not provided
@@ -854,6 +859,7 @@ def configure_runner(
         encode_tiled, encode_tile_size, encode_tile_overlap,
         decode_tiled, decode_tile_size, decode_tile_overlap,
         tile_debug, attention_mode, sparsity_threshold,
+        vae_sparge_enabled, vae_sparsity_threshold,
         torch_compile_args_dit, torch_compile_args_vae,
         block_swap_config, debug
     )
@@ -879,6 +885,8 @@ def _configure_runner_settings(
     tile_debug: str,
     attention_mode: str,
     sparsity_threshold: float,
+    vae_sparge_enabled: bool,
+    vae_sparsity_threshold: float,
     torch_compile_args_dit: Optional[Dict[str, Any]],
     torch_compile_args_vae: Optional[Dict[str, Any]],
     block_swap_config: Optional[Dict[str, Any]],
@@ -905,6 +913,8 @@ def _configure_runner_settings(
         attention_mode: Attention computation backend ('sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3')
         sparsity_threshold: Sparsity threshold for sparge_sage2 attention (0.0-1.0)
                            Maps to performance modes: Fast=0.3, Balanced=0.5, High Quality=0.7
+        vae_sparge_enabled: Enable Sparge block-sparse attention for VAE decoding
+        vae_sparsity_threshold: Sparsity threshold for VAE Sparge attention (0.0-1.0)
         torch_compile_args_dit: torch.compile configuration for DiT model or None
         torch_compile_args_vae: torch.compile configuration for VAE model or None
         block_swap_config: BlockSwap configuration for DiT model or None
@@ -934,6 +944,10 @@ def _configure_runner_settings(
         'decode_tile_size': decode_tile_size,
         'decode_tile_overlap': decode_tile_overlap
     }
+    
+    # VAE Sparge attention settings (Blackwell optimization)
+    runner._vae_sparge_enabled = vae_sparge_enabled
+    runner._vae_sparsity_threshold = vae_sparsity_threshold
     
     # Store device configuration on runner for submodule access (e.g., BlockSwap, Cleanup)
     runner._dit_device = ctx['dit_device']
@@ -1309,6 +1323,24 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
             debug.start_timer("vae_set_memory_limit")
             model.set_memory_limit(**config.vae.memory_limit)
             debug.end_timer("vae_set_memory_limit", "VAE memory limits configured")
+        
+        # Inject Sparge attention for Blackwell GPUs if enabled
+        if hasattr(runner, '_vae_sparge_enabled') and runner._vae_sparge_enabled:
+            try:
+                from ..optimization.vae_attention import inject_sparge_into_vae, set_vae_sparsity_threshold, reset_vae_attention_logging
+                
+                # Reset logging state for new generation
+                reset_vae_attention_logging()
+                
+                # Get sparsity threshold from runner config
+                vae_sparsity = getattr(runner, '_vae_sparsity_threshold', 0.5)
+                set_vae_sparsity_threshold(vae_sparsity)
+                
+                debug.start_timer("vae_sparge_inject")
+                patched_count = inject_sparge_into_vae(model, topk=vae_sparsity, debug=debug)
+                debug.end_timer("vae_sparge_inject", f"VAE Sparge attention injection ({patched_count} blocks)")
+            except ImportError as e:
+                debug.log(f"VAE Sparge attention not available: {e}", level="WARNING", category="vae", force=True)
 
         # Apply torch.compile if configured (only if not already compiled)
         if hasattr(runner, '_vae_compile_args') and runner._vae_compile_args:

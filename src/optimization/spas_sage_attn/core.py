@@ -86,11 +86,14 @@ def get_blackwell_config():
     is_hopper = major == 9
     
     if is_blackwell:
-        # Blackwell configuration
-        # Use Hopper-compatible kernels as Blackwell supports them natively
+        # Blackwell configuration (RTX 5070 Ti, SM 12.0)
+        # Hardcoded parameters for maximum Blackwell throughput:
+        # - num_warps=8: Optimal for Blackwell SM architecture
+        # - num_stages=3: Tuned for Blackwell memory pipeline (reduced from 4)
+        # - block_m=128, block_n=64: Matches block-sparse row/col sizes
         return {
             'num_warps': 8,
-            'num_stages': 4,
+            'num_stages': 3,  # Tuned for Blackwell (3 stages for better throughput)
             'BLOCK_M': 128,
             'BLOCK_N': 64,
             'prefer_fp8': True,

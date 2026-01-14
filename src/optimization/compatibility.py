@@ -282,10 +282,10 @@ class Sage2BlackwellConfig:
     BLOCK_ROWS = 128      # Query block size
     BLOCK_COLS = 64       # Key/Value block size
     
-    # Triton kernel parameters tuned for Blackwell architecture
-    # These leverage the increased SM count and L1 cache
+    # Triton kernel parameters tuned for Blackwell architecture (SM 12.0)
+    # Hardcoded for maximum RTX 5070 Ti throughput
     TRITON_NUM_WARPS = 8          # Optimal for Blackwell SM architecture
-    TRITON_NUM_STAGES = 4         # Memory pipeline stages
+    TRITON_NUM_STAGES = 3         # Memory pipeline stages (3 for better Blackwell throughput)
     TRITON_BLOCK_M = 128          # Matches block-sparse row size
     TRITON_BLOCK_N = 64           # Matches block-sparse col size
     

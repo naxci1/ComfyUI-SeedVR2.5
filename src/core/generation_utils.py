@@ -438,6 +438,8 @@ def prepare_runner(
     tile_debug: str = "false",
     attention_mode: str = 'sdpa',
     sparsity_threshold: float = 0.5,
+    vae_sparge_enabled: bool = False,
+    vae_sparsity_threshold: float = 0.5,
     torch_compile_args_dit: Optional[Dict[str, Any]] = None,
     torch_compile_args_vae: Optional[Dict[str, Any]] = None
 ) -> Tuple['VideoDiffusionInfer', Dict[str, Any]]:
@@ -466,6 +468,8 @@ def prepare_runner(
         attention_mode: Attention computation backend ('sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3')
         sparsity_threshold: Sparsity threshold for sparge_sage2 attention (0.0-1.0, default 0.5)
                            Maps to performance modes: Fast=0.3, Balanced=0.5, High Quality=0.7
+        vae_sparge_enabled: Enable Sparge block-sparse attention for VAE decoding (Blackwell GPUs)
+        vae_sparsity_threshold: Sparsity threshold for VAE Sparge attention (0.0-1.0, default 0.5)
         torch_compile_args_dit: Optional torch.compile configuration for DiT model
         torch_compile_args_vae: Optional torch.compile configuration for VAE model
         
@@ -485,6 +489,7 @@ def prepare_runner(
         - Optional torch.compile optimization for inference speedup
         - Separate encode/decode tiling configuration for optimal performance
         - Memory optimization and BlockSwap integration
+        - Blackwell GPU optimization with Sparge attention for VAE
     """
     dit_changed = False
     vae_changed = False
@@ -511,6 +516,8 @@ def prepare_runner(
         tile_debug=tile_debug,
         attention_mode=attention_mode,
         sparsity_threshold=sparsity_threshold,
+        vae_sparge_enabled=vae_sparge_enabled,
+        vae_sparsity_threshold=vae_sparsity_threshold,
         torch_compile_args_dit=torch_compile_args_dit,
         torch_compile_args_vae=torch_compile_args_vae
     )
