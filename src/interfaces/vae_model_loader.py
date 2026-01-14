@@ -163,17 +163,17 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                     )
                 ),
                 io.Boolean.Input("enable_sparge_attention",
-                    default=True,
+                    default=False,
                     optional=True,
                     tooltip=(
-                        "Enable optimized attention for VAE encoding/decoding (Blackwell GPUs).\n"
-                        "• Requires RTX 50-series (Blackwell) GPU with Triton\n"
-                        "• SeedVR2 VAE has head_dim=512, which is not compatible with Sparge kernel\n"
-                        "• Automatically falls back to memory-efficient sliced SDPA\n"
-                        "• Sliced SDPA processes attention in 4096-token chunks to prevent OOM\n"
-                        "• Falls back to standard SDPA on any kernel error\n"
+                        "Enable Sparge/Sage attention for VAE (EXPERIMENTAL - disabled by default).\n"
+                        "• SeedVR2 VAE has head_dim=512, which is incompatible with Sparge kernel\n"
+                        "• Sparge kernel requires head_dim in [64, 128]\n"
+                        "• When enabled, automatically falls back to sliced SDPA for head_dim=512\n"
+                        "• This fallback path may cause memory leaks on some systems\n"
                         "\n"
-                        "Enable for memory-efficient attention. Disable to use standard SDPA.\n"
+                        "RECOMMENDED: Keep disabled (False) to use standard SDPA with\n"
+                        "Causal Slicing mode for best stability and memory efficiency.\n"
                         "If you encounter OOM errors, enable tiling (encode_tiled/decode_tiled)."
                     )
                 ),

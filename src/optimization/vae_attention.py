@@ -358,6 +358,11 @@ def inject_sparge_into_vae(vae, topk: Optional[float] = None, debug=None) -> int
     """
     Inject Sparge attention processors into a VAE model's decoder attention blocks.
     
+    NOTE: This function should only be called if enable_sparge_attention is True.
+    For SeedVR2 VAE (head_dim=512), Sparge kernel is incompatible and will fall back
+    to sliced SDPA, which may cause memory leaks. It is recommended to keep
+    enable_sparge_attention=False for best stability.
+    
     This function finds all Attention modules in the VAE decoder (MidBlock and UpBlocks)
     and replaces their attention processors with SpargeVAEAttnProcessor.
     
@@ -372,8 +377,8 @@ def inject_sparge_into_vae(vae, topk: Optional[float] = None, debug=None) -> int
     if not is_vae_sparge_available():
         if debug:
             debug.log(
-                "Sparge attention not available for VAE - using standard attention",
-                level="WARNING", category="vae", force=True
+                "Sparge attention not available for VAE - using standard SDPA (recommended)",
+                level="INFO", category="vae", force=True
             )
         return 0
     
