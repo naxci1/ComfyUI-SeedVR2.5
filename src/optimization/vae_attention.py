@@ -1,13 +1,14 @@
 """
-VAE Standard Attention Module for Blackwell GPUs
+VAE Standard Attention Module for Blackwell GPUs (Speed Optimized)
 
 This module provides standard PyTorch SDPA (Scaled Dot-Product Attention) for VAE attention blocks.
 The experimental Sparge/SageAttention 2 kernels have been removed for stability.
 
 Key Features:
 - Uses standard torch.nn.functional.scaled_dot_product_attention (natively optimized for all GPUs)
+- Fast-path SDPA with sdp_kernel context manager for maximum speed
 - Sliced SDPA fallback for very large sequence lengths (> 4096)
-- Memory-efficient processing compatible with tiling/slicing workflow
+- Verbose logging to show which backend is being used (FlashAttention, Memory Efficient, etc.)
 - Stable operation on 16GB GPUs (Blackwell RTX 50xx)
 
 NOTE: Sparge attention is no longer used for VAE. The original 1 head × 512 dim structure
@@ -24,6 +25,9 @@ logger = logging.getLogger("SeedVR2.VAE.Attention")
 
 # Track if we've logged kernel info once (avoid per-call logging overhead on Windows)
 _vae_kernel_logged_once = False
+
+# Enable verbose logging for SDPA backend selection
+_verbose_sdpa_logging = True
 
 
 def is_vae_sparge_available() -> bool:
@@ -120,10 +124,12 @@ def standard_vae_attention(
     scale: Optional[float] = None,
 ) -> torch.Tensor:
     """
-    Compute VAE attention using standard PyTorch SDPA.
+    Compute VAE attention using standard PyTorch SDPA with Fast-Path optimization.
     
     This is the stable, production-ready path for VAE attention on all GPUs.
     PyTorch's SDPA is natively optimized for Blackwell GPUs.
+    
+    Uses sdp_kernel context manager to force the fastest available backend.
     
     Args:
         query: Query tensor (batch, heads, seq_len, head_dim) in HND layout
@@ -135,33 +141,72 @@ def standard_vae_attention(
     Returns:
         Attention output tensor (batch, heads, seq_len, head_dim)
     """
-    global _vae_kernel_logged_once
+    global _vae_kernel_logged_once, _verbose_sdpa_logging
     
     batch, heads, seq_len, head_dim = query.shape
     
     if scale is None:
         scale = head_dim ** -0.5
     
-    # Log kernel parameters only on first call
+    # Verbose SDPA logging - show backend selection on first call
     if not _vae_kernel_logged_once:
         _vae_kernel_logged_once = True
+        
+        # Determine which backend will be used
+        backend_info = "Unknown"
+        try:
+            # Check available backends
+            flash_available = hasattr(torch.backends.cuda, 'flash_sdp_enabled') and torch.backends.cuda.flash_sdp_enabled()
+            mem_efficient_available = hasattr(torch.backends.cuda, 'mem_efficient_sdp_enabled') and torch.backends.cuda.mem_efficient_sdp_enabled()
+            math_available = hasattr(torch.backends.cuda, 'math_sdp_enabled') and torch.backends.cuda.math_sdp_enabled()
+            
+            # FlashAttention requires head_dim in [8, 128] and power of 2, or 64/128
+            if flash_available and head_dim in [64, 128]:
+                backend_info = "FlashAttention (Fastest)"
+            elif mem_efficient_available:
+                backend_info = "Memory Efficient"
+            elif math_available:
+                backend_info = "Math (Fallback)"
+            else:
+                backend_info = "CUDA Default"
+        except Exception:
+            backend_info = "PyTorch Default"
+        
+        # Print verbose debug info to terminal
+        print(f"[DEBUG] VAE Attention: Executing via Native SDPA (1 head x {head_dim} dim)")
+        print(f"[DEBUG] VAE Attention Backend: {backend_info}")
+        print(f"[DEBUG] VAE Attention Shape: Q/K/V = ({batch}, {heads}, {seq_len}, {head_dim})")
+        print(f"[DEBUG] VAE Attention Scale: {scale:.6f}")
+        
         logger.info(
             f"VAE Standard SDPA: heads={heads}, head_dim={head_dim}, "
-            f"seq_len={seq_len}, scale={scale:.4f}"
+            f"seq_len={seq_len}, scale={scale:.4f}, backend={backend_info}"
         )
     
     # Use sliced SDPA for very large sequence lengths to prevent OOM
     if seq_len > 4096:
         return _sliced_sdpa(query, key, value, attention_mask=attention_mask, scale=scale)
     
-    # Standard SDPA - natively optimized for Blackwell GPUs by PyTorch
-    return F.scaled_dot_product_attention(
-        query, key, value, 
-        attn_mask=attention_mask, 
-        dropout_p=0.0, 
-        is_causal=False,
-        scale=scale
-    )
+    # Fast-Path SDPA with sdp_kernel context manager
+    # Force the fastest available backend: Flash > Memory Efficient > Math
+    try:
+        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
+            return F.scaled_dot_product_attention(
+                query, key, value, 
+                attn_mask=attention_mask, 
+                dropout_p=0.0, 
+                is_causal=False,
+                scale=scale
+            )
+    except Exception:
+        # Fallback to standard SDPA without context manager
+        return F.scaled_dot_product_attention(
+            query, key, value, 
+            attn_mask=attention_mask, 
+            dropout_p=0.0, 
+            is_causal=False,
+            scale=scale
+        )
 
 
 def inject_sparge_into_vae(vae, topk: Optional[float] = None, debug=None) -> int:

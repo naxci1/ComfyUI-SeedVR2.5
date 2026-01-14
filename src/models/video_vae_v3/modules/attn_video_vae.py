@@ -12,7 +12,6 @@
 
 from contextlib import nullcontext
 from typing import Literal, Optional, Tuple, Union
-import gc
 import diffusers
 import torch
 import torch.nn as nn
@@ -847,11 +846,8 @@ class Encoder3D(nn.Module):
                 sample = down_block(sample, memory_state=memory_state)
                 if extra_block is not None:
                     sample = sample + safe_interpolate_operation(extra_block(extra_cond), size=sample.shape[2:])
-                # Aggressive cache clearing between ResnetBlock3D and next block to prevent OOM
-                # This is critical for 16GB GPUs (Blackwell) at high resolutions (720p+, 81+ frames)
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    gc.collect()
+                # NOTE: empty_cache() removed from loop for speed optimization
+                # VRAM cleanup now happens only once before Phase 3 in generation_phases.py
 
             # middle
             sample = self.mid_block(sample, memory_state=memory_state)
@@ -1033,15 +1029,11 @@ class Decoder3D(nn.Module):
             # middle
             sample = self.mid_block(sample, latent_embeds, memory_state=memory_state)
 
-            # up - aggressive cache clearing INSIDE the loop to prevent VRAM accumulation
-            # This is critical for 16GB GPUs (Blackwell) at high resolutions (720p+, 162 frames)
-            # Each up_block can allocate significant intermediate feature maps in ResnetBlock3D
+            # up - fast path without mid-block cache clearing
+            # NOTE: empty_cache() removed from loop for speed optimization
+            # VRAM cleanup now happens only once before Phase 3 in generation_phases.py
             for i, up_block in enumerate(self.up_blocks):
                 sample = up_block(sample, latent_embeds, memory_state=memory_state)
-                # Clear GPU cache after each major up_block to prevent VRAM fragmentation
-                # This slows down processing slightly but prevents the 17GB reservation spike
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
 
         # post-process
         sample = causal_norm_wrapper(self.conv_norm_out, sample)
@@ -1287,10 +1279,8 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                                 if isinstance(m, InflatedCausalConv3d) and m.memory is not None]
             for m in modules_with_memory:
                 m.memory = None
-            # Aggressive garbage collection at the end of slicing loops
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # NOTE: empty_cache/gc.collect removed for speed optimization
+            # VRAM cleanup happens once before Phase 3 in generation_phases.py
             return out
         else:
             return self._encode(x)
@@ -1315,10 +1305,8 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                                 if isinstance(m, InflatedCausalConv3d) and m.memory is not None]
             for m in modules_with_memory:
                 m.memory = None
-            # Aggressive garbage collection at the end of slicing loops
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # NOTE: empty_cache/gc.collect removed for speed optimization
+            # VRAM cleanup happens once before Phase 3 in generation_phases.py
             return out
         else:
             return self._decode(z)
