@@ -172,17 +172,122 @@ except (ImportError, AttributeError, OSError):
 SAGE_ATTN_AVAILABLE = SAGE_ATTN_2_AVAILABLE or SAGE_ATTN_3_AVAILABLE
 
 
+def get_optimal_attention_mode(debug=None) -> str:
+    """
+    Detect GPU architecture and return the optimal attention mode.
+    
+    This function implements hybrid logic that automatically selects the best
+    attention backend based on the detected GPU:
+    
+    - Blackwell (RTX 50xx, SM100+): sageattn_3 → sageattn_2 → flash_attn_3 → flash_attn_2 → sdpa
+    - Hopper (H100, SM90+): flash_attn_3 → sageattn_2 → flash_attn_2 → sdpa
+    - Ampere+ (RTX 30xx/40xx, A100, SM80+): flash_attn_2 → sageattn_2 → sdpa
+    - Older/Unknown: sdpa
+    
+    Args:
+        debug: Optional debug instance for logging
+        
+    Returns:
+        Optimal attention mode string for the detected GPU
+    """
+    import torch
+    
+    # Default fallback
+    if not torch.cuda.is_available():
+        return 'sdpa'
+    
+    try:
+        capability = torch.cuda.get_device_capability(0)
+        major, minor = capability
+    except Exception:
+        return 'sdpa'
+    
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "Unknown"
+    
+    # Blackwell (SM100+, compute capability 10.0+) - RTX 50xx series
+    if major >= 10:
+        if SAGE_ATTN_3_AVAILABLE:
+            if debug:
+                debug.log(
+                    f"Blackwell GPU detected ({gpu_name}). "
+                    f"Using SageAttention 3 for maximum performance.",
+                    category="setup", force=True
+                )
+            return 'sageattn_3'
+        elif SAGE_ATTN_2_AVAILABLE:
+            if debug:
+                debug.log(
+                    f"Blackwell GPU detected ({gpu_name}). "
+                    f"SageAttention 3 not installed, using SageAttention 2.\n"
+                    f"For best performance: pip install sageattn3",
+                    category="setup", force=True
+                )
+            return 'sageattn_2'
+        elif FLASH_ATTN_3_AVAILABLE:
+            if debug:
+                debug.log(
+                    f"Blackwell GPU detected ({gpu_name}). "
+                    f"Using Flash Attention 3.\n"
+                    f"For best performance: pip install sageattn3 or sageattention",
+                    category="setup", force=True
+                )
+            return 'flash_attn_3'
+        elif FLASH_ATTN_2_AVAILABLE:
+            return 'flash_attn_2'
+        return 'sdpa'
+    
+    # Hopper (SM90, compute capability 9.0+) - H100, etc.
+    if major >= 9:
+        if FLASH_ATTN_3_AVAILABLE:
+            if debug:
+                debug.log(
+                    f"Hopper GPU detected ({gpu_name}). "
+                    f"Using Flash Attention 3 for optimal performance.",
+                    category="setup"
+                )
+            return 'flash_attn_3'
+        elif SAGE_ATTN_2_AVAILABLE:
+            return 'sageattn_2'
+        elif FLASH_ATTN_2_AVAILABLE:
+            return 'flash_attn_2'
+        return 'sdpa'
+    
+    # Ampere (SM80+, compute capability 8.0+) - RTX 30xx, RTX 40xx, A100
+    if major >= 8:
+        if FLASH_ATTN_2_AVAILABLE:
+            if debug:
+                debug.log(
+                    f"Ampere+ GPU detected ({gpu_name}). "
+                    f"Using Flash Attention 2.",
+                    category="setup"
+                )
+            return 'flash_attn_2'
+        elif SAGE_ATTN_2_AVAILABLE:
+            return 'sageattn_2'
+        return 'sdpa'
+    
+    # Turing and older - use SDPA
+    return 'sdpa'
+
+
 def validate_attention_mode(requested_mode: str, debug=None) -> str:
     """
     Validate attention mode availability with automatic fallback.
     
     Args:
-        requested_mode: 'sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3'
+        requested_mode: 'auto', 'sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3'
         debug: Optional debug instance for logging
         
     Returns:
         Validated mode that is available
     """
+    # Handle 'auto' mode - use optimal backend for detected GPU
+    if requested_mode == 'auto':
+        optimal_mode = get_optimal_attention_mode(debug)
+        if debug:
+            debug.log(f"Auto-detected optimal attention mode: {optimal_mode}", category="setup")
+        return optimal_mode
+    
     # Flash Attention 3
     if requested_mode == 'flash_attn_3':
         if FLASH_ATTN_3_AVAILABLE:

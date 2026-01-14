@@ -464,7 +464,12 @@ Configure the DiT (Diffusion Transformer) model for video upscaling.
   - Requires offload_device to be set and different from device
 
 - **attention_mode**: Attention computation backend
-  - `sdpa`: PyTorch scaled_dot_product_attention (default, always available)
+  - `auto`: Automatically select optimal backend based on detected GPU (recommended, default)
+    - Blackwell (RTX 50xx): Uses SageAttention 3 for maximum performance
+    - Hopper (H100): Uses Flash Attention 3
+    - Ampere+ (RTX 30xx/40xx): Uses Flash Attention 2
+    - Older GPUs: Falls back to PyTorch SDPA
+  - `sdpa`: PyTorch scaled_dot_product_attention (stable, always available)
   - `flash_attn_2`: Flash Attention 2 (Ampere+, requires flash-attn package)
   - `flash_attn_3`: Flash Attention 3 (Hopper+, requires flash-attn with FA3 support)
   - `sageattn_2`: SageAttention 2 (requires sageattention package)
@@ -932,7 +937,7 @@ python inference_cli.py media_folder/ \
 
 **Performance Optimization:**
 - `--allow_vram_overflow`: Allow VRAM overflow to system RAM. Prevents OOM but may cause severe slowdown
-- `--attention_mode`: Attention backend: 'sdpa' (default), 'flash_attn_2' (Ampere+), 'flash_attn_3' (Hopper+), 'sageattn_2', or 'sageattn_3' (Blackwell)
+- `--attention_mode`: Attention backend: 'auto' (default, selects best for your GPU), 'sdpa', 'flash_attn_2' (Ampere+), 'flash_attn_3' (Hopper+), 'sageattn_2', or 'sageattn_3' (Blackwell)
 - `--compile_dit`: Enable torch.compile for DiT model (20-40% speedup, requires PyTorch 2.0+ and Triton)
 - `--compile_vae`: Enable torch.compile for VAE model (15-25% speedup, requires PyTorch 2.0+ and Triton)
 - `--compile_backend`: Compilation backend: 'inductor' (full optimization) or 'cudagraphs' (lightweight) (default: inductor)

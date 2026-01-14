@@ -102,18 +102,23 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
                     )
                 ),
                 io.Combo.Input("attention_mode",
-                    options=["sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3"],
-                    default="sdpa",
+                    options=["auto", "sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3"],
+                    default="auto",
                     optional=True,
                     tooltip=(
                         "Attention computation backend:\n"
-                        "• sdpa: PyTorch scaled_dot_product_attention (default, stable, always available)\n"
+                        "• auto: Automatically select optimal backend based on detected GPU (recommended)\n"
+                        "  - Blackwell (RTX 50xx): Uses SageAttention 3 for maximum performance\n"
+                        "  - Hopper (H100): Uses Flash Attention 3\n"
+                        "  - Ampere+ (RTX 30xx/40xx): Uses Flash Attention 2\n"
+                        "  - Older GPUs: Falls back to PyTorch SDPA\n"
+                        "• sdpa: PyTorch scaled_dot_product_attention (stable, always available)\n"
                         "• flash_attn_2: Flash Attention 2 (Ampere+, requires flash-attn package)\n"
                         "• flash_attn_3: Flash Attention 3 (Hopper+, requires flash-attn with FA3 support)\n"
                         "• sageattn_2: SageAttention 2 (requires sageattention package)\n"
                         "• sageattn_3: SageAttention 3 (Blackwell/RTX 50xx only, requires sageattn3 package)\n"
                         "\n"
-                        "SDPA is recommended - stable and works everywhere.\n"
+                        "'auto' is now the default - it selects the best available backend for your GPU.\n"
                         "Flash Attention and SageAttention provide speedup through optimized CUDA kernels on compatible GPUs."
                     )
                 ),
@@ -158,7 +163,7 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
     @classmethod
     def execute(cls, model: str, device: str, offload_device: str = "none",
                      cache_model: bool = False, blocks_to_swap: int = 0, 
-                     swap_io_components: bool = False, attention_mode: str = "sdpa",
+                     swap_io_components: bool = False, attention_mode: str = "auto",
                      torch_compile_args: Dict[str, Any] = None,
                      enable_nvfp4: bool = True, nvfp4_async_offload: bool = True) -> io.NodeOutput:
         """
@@ -171,7 +176,7 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
             cache_model: Whether to keep model loaded between runs
             blocks_to_swap: Number of transformer blocks to swap (requires offload_device != device)
             swap_io_components: Whether to offload I/O components (requires offload_device != device)
-            attention_mode: Attention computation backend ('sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3')
+            attention_mode: Attention computation backend ('auto', 'sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3')
             torch_compile_args: Optional torch.compile configuration from settings node
             enable_nvfp4: Enable NVFP4 quantization for Blackwell GPUs (default: True)
             nvfp4_async_offload: Enable async offloading with pinned memory for NVFP4 (default: True)
@@ -192,10 +197,15 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
             )
         
         # Lazy import to avoid loading torch at module level (breaks ComfyUI node registration)
-        from ..optimization.compatibility import NVFP4_AVAILABLE, BLACKWELL_GPU_DETECTED
+        from ..optimization.compatibility import NVFP4_AVAILABLE, BLACKWELL_GPU_DETECTED, get_optimal_attention_mode
         
         # Validate NVFP4 availability - only actually enable if hardware supports it
         nvfp4_active = enable_nvfp4 and NVFP4_AVAILABLE
+        
+        # Handle 'auto' attention mode - select optimal backend for detected GPU
+        resolved_attention_mode = attention_mode
+        if attention_mode == 'auto':
+            resolved_attention_mode = get_optimal_attention_mode()
         
         config = {
             "model": model,
@@ -204,7 +214,7 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
             "cache_model": cache_model,
             "blocks_to_swap": blocks_to_swap,
             "swap_io_components": swap_io_components,
-            "attention_mode": attention_mode,
+            "attention_mode": resolved_attention_mode,
             "torch_compile_args": torch_compile_args,
             "enable_nvfp4": nvfp4_active,
             "nvfp4_async_offload": nvfp4_async_offload and nvfp4_active,
