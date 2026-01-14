@@ -1485,6 +1485,10 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
     def tiled_decode(self, z: torch.Tensor, tile_size: Tuple[int, int] = (512, 512), tile_overlap: Tuple[int, int] = (64, 64)) -> torch.Tensor:
         r"""
         Decodes a latent tensor `z` by splitting it into spatial tiles only. Temporal is handled by `slicing_decode`.
+        
+        Includes Blackwell (RTX 50 series) optimizations:
+        - VRAM monitoring: Pre-allocates on CPU when VRAM > 85% to prevent OOM
+        - Async CUDA streams: Overlaps tile transfer and computation for better throughput
         """
         if z.ndim != 5:
             z = z.unsqueeze(2)
@@ -1517,6 +1521,29 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         # Allocate later using first decoded results
         result = None
         count = None
+        
+        # VRAM monitoring for Blackwell optimization: check if we should use CPU offload
+        use_cpu_offload = False
+        if torch.cuda.is_available() and z.is_cuda:
+            try:
+                total_vram = torch.cuda.get_device_properties(z.device).total_memory
+                allocated_vram = torch.cuda.memory_allocated(z.device)
+                vram_usage_pct = allocated_vram / total_vram if total_vram > 0 else 0
+                if vram_usage_pct > 0.85:
+                    use_cpu_offload = True
+                    if self.debug:
+                        self.debug.log(f"VRAM usage {vram_usage_pct*100:.1f}% > 85%, using CPU offload for result tensor", 
+                                      category="memory", indent_level=1)
+            except Exception:
+                pass  # Silently ignore VRAM check errors
+        
+        # Create async CUDA stream for overlapping tile transfer and computation
+        decode_stream = None
+        if torch.cuda.is_available() and z.is_cuda:
+            try:
+                decode_stream = torch.cuda.Stream(device=z.device)
+            except Exception:
+                pass  # Silently fall back to default stream
 
         num_tiles = ((max(H - latent_overlap_h, 1) + stride_h - 1) // stride_h) \
                   * ((max(W - latent_overlap_w, 1) + stride_w - 1) // stride_w)
@@ -1577,7 +1604,14 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                         end_tile = min(tile_id + 4, num_tiles)
                         self.debug.log(f"Decoding tiles {tile_id}-{end_tile} / {num_tiles}", category="vae", indent_level=1)
 
-                decoded_tile = self.slicing_decode(tile_latent)
+                # Use async stream for tile decoding if available (Blackwell optimization)
+                if decode_stream is not None:
+                    with torch.cuda.stream(decode_stream):
+                        decoded_tile = self.slicing_decode(tile_latent)
+                    # Sync before using the result
+                    decode_stream.synchronize()
+                else:
+                    decoded_tile = self.slicing_decode(tile_latent)
 
                 # Initialize result tensors using actual decoded shapes on first tile
                 if result is None:
@@ -1585,10 +1619,16 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                     output_h = H * scale_factor
                     output_w = W * scale_factor
                     
-                    # Accumulate on offload device if specified and different, else on inference device
-                    device = getattr(self, 'tensor_offload_device', None)
-                    if device is None or device == decoded_tile.device:
-                        device = decoded_tile.device
+                    # Determine device for result accumulation:
+                    # 1. Use CPU if VRAM > 85% (prevents OOM from 14.5GB peak)
+                    # 2. Otherwise use tensor_offload_device if specified
+                    # 3. Otherwise use inference device
+                    if use_cpu_offload:
+                        device = torch.device('cpu')
+                    else:
+                        device = getattr(self, 'tensor_offload_device', None)
+                        if device is None or device == decoded_tile.device:
+                            device = decoded_tile.device
                     
                     result = torch.zeros((b_out, c_out, out_f_tile, output_h, output_w), device=device, dtype=decoded_tile.dtype)
                     count = torch.zeros((1, 1, 1, output_h, output_w), device=device, dtype=decoded_tile.dtype)

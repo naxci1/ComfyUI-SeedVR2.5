@@ -28,6 +28,13 @@ import os
 import torch
 from typing import Dict, List, Optional, Tuple, Any, Callable
 
+# Enable TensorFloat-32 (TF32) for faster matrix multiplications on Ampere+ GPUs (including Blackwell)
+# TF32 provides up to 10x speedup for matmul operations with minimal precision loss
+# This is safe for inference and particularly beneficial for RTX 30/40/50 series GPUs
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
 from .generation_utils import (
     setup_video_transform,
     pad_video_temporal,
@@ -927,6 +934,14 @@ def decode_all_batches(
                 continue
             
             check_interrupt(ctx)
+            
+            # Fix for memory inconsistency: explicit sync and cache clear before Batch 1
+            # This addresses the 53s vs 29s performance gap between first and subsequent batches
+            # caused by CUDA cache fragmentation from DiT residue
+            if decode_idx == 0 and torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                debug.log("Cleared CUDA cache before first decode batch", category="memory", indent_level=1)
             
             debug.log(f"Decoding batch {decode_idx+1}/{num_valid_latents}", category="vae", force=True)
             debug.start_timer(f"decode_batch_{decode_idx+1}")
