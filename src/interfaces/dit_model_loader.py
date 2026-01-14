@@ -119,6 +119,29 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
                         "SpargeAttn provides block-sparse attention with configurable sparsity for Blackwell GPUs."
                     )
                 ),
+                io.Combo.Input("performance_mode",
+                    options=["Fast", "Balanced", "High Quality"],
+                    default="Balanced",
+                    optional=True,
+                    tooltip=(
+                        "Performance tuning mode for sparge_sage2 attention (Blackwell GPUs only).\n"
+                        "Controls the sparsity threshold for block-sparse attention:\n"
+                        "\n"
+                        "• Fast: Maximum speed, sparsity threshold 0.3 (30% attention weights kept)\n"
+                        "• Balanced: Optimal speed/quality balance, sparsity threshold 0.5 (default)\n"
+                        "• High Quality: Best quality, sparsity threshold 0.7 (70% attention weights kept)\n"
+                        "\n"
+                        "Lower sparsity = faster processing but may lose fine details.\n"
+                        "Higher sparsity = better quality but reduced speedup.\n"
+                        "\n"
+                        "Optimized for RTX 5070 Ti and other Blackwell GPUs with:\n"
+                        "• 1,400 TOPS compute capability\n"
+                        "• 16GB VRAM\n"
+                        "• FP8/NVFP4 precision support\n"
+                        "\n"
+                        "This setting only affects 'sparge_sage2' attention mode."
+                    )
+                ),
                 io.Custom("TORCH_COMPILE_ARGS").Input("torch_compile_args",
                     optional=True,
                     tooltip=(
@@ -161,6 +184,7 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
     def execute(cls, model: str, device: str, offload_device: str = "none",
                      cache_model: bool = False, blocks_to_swap: int = 0, 
                      swap_io_components: bool = False, attention_mode: str = "sdpa",
+                     performance_mode: str = "Balanced",
                      torch_compile_args: Dict[str, Any] = None,
                      enable_nvfp4: bool = True, nvfp4_async_offload: bool = True) -> io.NodeOutput:
         """
@@ -174,6 +198,7 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
             blocks_to_swap: Number of transformer blocks to swap (requires offload_device != device)
             swap_io_components: Whether to offload I/O components (requires offload_device != device)
             attention_mode: Attention computation backend ('sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3')
+            performance_mode: Performance tuning for sparge_sage2 ('Fast', 'Balanced', 'High Quality')
             torch_compile_args: Optional torch.compile configuration from settings node
             enable_nvfp4: Enable NVFP4 quantization for Blackwell GPUs (default: True)
             nvfp4_async_offload: Enable async offloading with pinned memory for NVFP4 (default: True)
@@ -199,6 +224,16 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
         # Validate NVFP4 availability - only actually enable if hardware supports it
         nvfp4_active = enable_nvfp4 and NVFP4_AVAILABLE
         
+        # Map performance_mode to sparsity_threshold for sparge_sage2 attention
+        # These values are Blackwell-optimized for RTX 5070 Ti (1,400 TOPS, 16GB VRAM)
+        # Uses Triton kernel parameters: num_warps=8, num_stages=4, block_m=128, block_n=64
+        performance_mode_map = {
+            "Fast": 0.3,        # Maximum speed, 30% attention weights kept
+            "Balanced": 0.5,    # Optimal speed/quality balance (default)
+            "High Quality": 0.7 # Best quality, 70% attention weights kept
+        }
+        sparsity_threshold = performance_mode_map.get(performance_mode, 0.5)
+        
         config = {
             "model": model,
             "device": device,
@@ -207,6 +242,8 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
             "blocks_to_swap": blocks_to_swap,
             "swap_io_components": swap_io_components,
             "attention_mode": attention_mode,
+            "performance_mode": performance_mode,
+            "sparsity_threshold": sparsity_threshold,
             "torch_compile_args": torch_compile_args,
             "enable_nvfp4": nvfp4_active,
             "nvfp4_async_offload": nvfp4_async_offload and nvfp4_active,

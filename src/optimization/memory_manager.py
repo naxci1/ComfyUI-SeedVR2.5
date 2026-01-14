@@ -1279,6 +1279,8 @@ def cleanup_dit(runner: Any, debug: Optional['Debug'] = None, cache_model: bool 
             delattr(runner, '_dit_block_swap_config')
         if hasattr(runner, '_dit_attention_mode'):
             delattr(runner, '_dit_attention_mode')
+        if hasattr(runner, '_dit_sparsity_threshold'):
+            delattr(runner, '_dit_sparsity_threshold')
     
     # 5. Clear DiT temporary attributes (should be already cleared in materialize_model)
     runner._dit_checkpoint = None
