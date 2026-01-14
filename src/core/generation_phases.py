@@ -23,6 +23,7 @@ Key Features:
 - Each phase handles its own cleanup in finally blocks
 """
 
+import gc
 import os
 import torch
 from typing import Dict, List, Optional, Tuple, Any, Callable
@@ -851,11 +852,14 @@ def decode_all_batches(
     debug.log("━━━━━━━━ Phase 3: VAE decoding ━━━━━━━━", category="none", force=True)
     debug.start_timer("phase3_decoding")
     
-    # Clear GPU memory before Phase 3 to prevent OOM from DiT residue
-    # This is especially important on 16GB GPUs (Blackwell) where Phase 2 uses significant VRAM
+    # Aggressive GPU memory cleanup before Phase 3 to prevent OOM from DiT residue
+    # This is critical on 16GB GPUs (Blackwell) where Phase 2 uses significant VRAM
+    # Order matters: gc.collect() first to break Python reference cycles, then empty_cache()
+    gc.collect()  # Force Python GC to release PyTorch tensor references
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        debug.log("GPU memory cleared before Phase 3", category="memory")
+        torch.cuda.synchronize()  # Ensure all GPU operations are complete before proceeding
+        debug.log("GPU memory aggressively cleared before Phase 3 (gc + empty_cache + sync)", category="memory")
 
     # Count valid latents
     num_valid_latents = len([l for l in ctx['all_upscaled_latents'] if l is not None])

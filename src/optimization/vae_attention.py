@@ -139,15 +139,15 @@ def sparge_vae_attention(
     topk: Optional[float] = None,
 ) -> torch.Tensor:
     """
-    Compute VAE attention using Sparge Sage2 Triton kernels.
+    Compute VAE attention using memory-efficient methods.
     
     This function is designed to be a drop-in replacement for standard attention
-    in VAE decoder blocks. It maps the spatial attention tensors to the sequence
-    format expected by the Sparge kernel.
+    in VAE decoder blocks. For SeedVR2 VAE, which has head_dim=block_out_channels[-1]
+    (typically 512), we use memory-efficient sliced SDPA instead of Sparge kernel
+    since Sparge requires head_dim in [64, 128].
     
-    Uses block_m=64 and num_stages=2 specifically for VAE to fit within Blackwell
-    shared memory limit (101376 bytes) when running in BF16/FP8.
-    DiT uses block_m=128, num_stages=3 with NVFP4/FP8.
+    Uses block_m=64 and num_stages=2 specifically for VAE if Sparge is attempted,
+    but the primary path is sliced SDPA due to head_dim incompatibility.
     
     Args:
         query: Query tensor (batch, heads, seq_len, head_dim) in HND layout
@@ -173,16 +173,19 @@ def sparge_vae_attention(
     
     # Check head_dim compatibility with Sparge kernel
     # Sparge requires head_dim in [64, 128]
+    # SeedVR2 VAE has head_dim=512 (block_out_channels[-1]), so we use sliced SDPA
     if head_dim not in [64, 128]:
         if not _vae_head_dim_logged:
             _vae_head_dim_logged = True
             logger.info(
                 f"VAE head_dim={head_dim} not in [64, 128]. Using memory-efficient sliced SDPA. "
-                f"This is expected for VAE models with attention_head_dim=block_out_channels."
+                f"This is normal for SeedVR2 VAE with attention_head_dim=block_out_channels."
             )
         # Use sliced SDPA for memory efficiency with unsupported head_dim
+        # This is the expected path for SeedVR2 VAE
         return _sliced_sdpa(query, key, value, attention_mask=attention_mask, scale=scale)
     
+    # Only reach here if head_dim is 64 or 128 (compatible with Sparge)
     # Log kernel parameters only on first call
     if not _vae_kernel_logged_once:
         _vae_kernel_logged_once = True

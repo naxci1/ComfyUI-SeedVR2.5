@@ -70,15 +70,15 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                     )
                 ),
                 io.Int.Input("encode_tile_size",
-                    default=512,
+                    default=448,
                     min=64,
                     step=32,
                     optional=True,
                     tooltip=(
-                        "Encoding tile size in pixels (default: 512).\n"
+                        "Encoding tile size in pixels (default: 448).\n"
                         "Applied to both height and width.\n"
                         "Lower values reduce VRAM usage but may increase processing time.\n"
-                        "Recommended: 512 for 16GB VRAM GPUs (Blackwell).\n"
+                        "Recommended: 448 for 16GB VRAM GPUs (Blackwell), 512 for 24GB+.\n"
                         "Only used when encode_tiled is enabled."
                     )
                 ),
@@ -105,15 +105,15 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                     )
                 ),
                 io.Int.Input("decode_tile_size",
-                    default=512,
+                    default=448,
                     min=64,
                     step=32,
                     optional=True,
                     tooltip=(
-                        "Decoding tile size in pixels (default: 512).\n"
+                        "Decoding tile size in pixels (default: 448).\n"
                         "Applied to both height and width.\n"
                         "Lower values reduce VRAM usage but may increase processing time.\n"
-                        "Recommended: 512 for 16GB VRAM GPUs (Blackwell).\n"
+                        "Recommended: 448 for 16GB VRAM GPUs (Blackwell), 512 for 24GB+.\n"
                         "Only used when decode_tiled is enabled."
                     )
                 ),
@@ -166,14 +166,14 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                     default=True,
                     optional=True,
                     tooltip=(
-                        "Enable Sparge block-sparse attention for VAE encoding/decoding (Blackwell GPUs).\n"
+                        "Enable optimized attention for VAE encoding/decoding (Blackwell GPUs).\n"
                         "• Requires RTX 50-series (Blackwell) GPU with Triton\n"
-                        "• Provides 2-3x speedup for VAE attention operations\n"
-                        "• Uses VAE-optimized parameters: num_warps=8, num_stages=2, block_m=64\n"
-                        "  (Lower values than DiT to fit in Blackwell shared memory)\n"
+                        "• SeedVR2 VAE has head_dim=512, which is not compatible with Sparge kernel\n"
+                        "• Automatically falls back to memory-efficient sliced SDPA\n"
+                        "• Sliced SDPA processes attention in 4096-token chunks to prevent OOM\n"
                         "• Falls back to standard SDPA on any kernel error\n"
                         "\n"
-                        "Automatically enabled when supported. Disable to use standard SDPA.\n"
+                        "Enable for memory-efficient attention. Disable to use standard SDPA.\n"
                         "If you encounter OOM errors, enable tiling (encode_tiled/decode_tiled)."
                     )
                 ),
@@ -233,8 +233,8 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
     @classmethod
     def execute(cls, model: str, device: str, offload_device: str = "none",
                      cache_model: bool = False, encode_tiled: bool = True,
-                     encode_tile_size: int = 512, encode_tile_overlap: int = 64,
-                     decode_tiled: bool = True, decode_tile_size: int = 512, 
+                     encode_tile_size: int = 448, encode_tile_overlap: int = 64,
+                     decode_tiled: bool = True, decode_tile_size: int = 448, 
                      decode_tile_overlap: int = 64, tile_debug: str = "false",
                      enable_sparge_attention: bool = True, performance_mode: str = "Balanced",
                      vae_precision: str = "auto", torch_compile_args: Dict[str, Any] = None
