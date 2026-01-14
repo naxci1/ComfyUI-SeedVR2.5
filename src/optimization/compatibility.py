@@ -175,23 +175,37 @@ SAGE_ATTN_AVAILABLE = SAGE_ATTN_2_AVAILABLE or SAGE_ATTN_3_AVAILABLE
 # 5. SpargeAttn / Sage2 (Block-sparse attention for Blackwell optimization)
 # Provides spas_sage2_attn_meansim_topk_cuda for plug-and-play SDPA replacement
 # and block_sparse_sage2_attn_cuda for custom block-sparse patterns
+# Uses local vendored implementation with Triton JIT compilation (no global install required)
 spas_sage2_attn_meansim_topk = None
 block_sparse_sage2_attn = None
 SPARGE_SAGE2_AVAILABLE = False
 SPARGE_SAGE2_VERSION = None
+
+# Try local vendored implementation first (Triton JIT, no compilation needed)
 try:
-    from spas_sage_attn import spas_sage2_attn_meansim_topk_cuda as _spas_sage2
-    from spas_sage_attn import block_sparse_sage2_attn_cuda as _block_sparse_sage2
-    spas_sage2_attn_meansim_topk = _spas_sage2
-    block_sparse_sage2_attn = _block_sparse_sage2
-    SPARGE_SAGE2_AVAILABLE = True
+    from .spas_sage_attn import spas_sage2_attn_meansim_topk_cuda as _spas_sage2
+    from .spas_sage_attn import block_sparse_sage2_attn_cuda as _block_sparse_sage2
+    from .spas_sage_attn import SPARGE_LOCAL_AVAILABLE, SPARGE_LOCAL_VERSION
+    if SPARGE_LOCAL_AVAILABLE:
+        spas_sage2_attn_meansim_topk = _spas_sage2
+        block_sparse_sage2_attn = _block_sparse_sage2
+        SPARGE_SAGE2_AVAILABLE = True
+        SPARGE_SAGE2_VERSION = SPARGE_LOCAL_VERSION
+except (ImportError, AttributeError, OSError) as e:
+    # Fall back to globally installed package if local fails
     try:
-        import spas_sage_attn
-        SPARGE_SAGE2_VERSION = getattr(spas_sage_attn, '__version__', 'unknown')
-    except (ImportError, AttributeError):
-        SPARGE_SAGE2_VERSION = 'unknown'
-except (ImportError, AttributeError, OSError):
-    pass
+        from spas_sage_attn import spas_sage2_attn_meansim_topk_cuda as _spas_sage2
+        from spas_sage_attn import block_sparse_sage2_attn_cuda as _block_sparse_sage2
+        spas_sage2_attn_meansim_topk = _spas_sage2
+        block_sparse_sage2_attn = _block_sparse_sage2
+        SPARGE_SAGE2_AVAILABLE = True
+        try:
+            import spas_sage_attn
+            SPARGE_SAGE2_VERSION = getattr(spas_sage_attn, '__version__', 'unknown')
+        except (ImportError, AttributeError):
+            SPARGE_SAGE2_VERSION = 'unknown'
+    except (ImportError, AttributeError, OSError):
+        pass
 
 
 # Blackwell-specific Sage2 configuration for RTX 50xx GPUs

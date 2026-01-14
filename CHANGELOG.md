@@ -11,9 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### SpargeAttn/Sage2 Block-Sparse Attention Integration
 - **New attention mode: `sparge_sage2`** - Block-sparse attention optimized for NVIDIA Blackwell (RTX 50xx) GPUs
+- **Local vendored implementation** - No global installation required, uses Triton JIT compilation
 - Plug-and-play replacement for PyTorch SDPA using `spas_sage2_attn_meansim_topk_cuda`
 - Custom block-sparse patterns via `block_sparse_sage2_attn_cuda` with strict mask geometry (128x64 blocks)
 - Automatic fallback chain: `sparge_sage2` → `sageattn_3` → `sageattn_2` → `sdpa`
+
+#### Local SpargeAttn Module (`src/optimization/spas_sage_attn/`)
+- **Triton JIT compilation** - Kernels compile on first use, optimized for CUDA 12.8+ and 13.x
+- Pure Python/Triton implementation - No MSVC/NVCC compilation conflicts
+- Files included:
+  - `core.py` - Main API functions (`spas_sage2_attn_meansim_topk_cuda`, `block_sparse_sage2_attn_cuda`)
+  - `utils.py` - Utility functions for block map computation
+  - `quant_per_block.py` - INT8 quantization kernels
+  - `autotune.py` - Triton autotuning utilities
+- Automatic GPU architecture detection (Blackwell sm100+, Hopper sm90, Ampere sm80+)
 
 #### Blackwell (RTX 50xx) Specific Optimizations
 - **`Sage2BlackwellConfig`** class with Blackwell-tuned parameters:
@@ -23,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - FP8/BF16 precision optimization settings
 - Automatic Blackwell GPU detection with compute capability checks
 - Native FP8 dispatch integration for 4-bit Tensor Core acceleration
+- `get_blackwell_config()` function for architecture-specific kernel tuning
 
 #### Verification & Benchmarking Scripts
 - `scripts/sage2_verification.py` - Numerical parity verification against SDPA baseline
@@ -42,6 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `call_sparge_sage2_varlen()` - Variable-length sequence support
 - Mask geometry validation with `Sage2BlackwellConfig.validate_mask_geometry()`
 - SpargeAttn availability detection and version reporting
+- **Dual import strategy**: Tries local vendored module first, falls back to global package
 
 ### Changed
 
@@ -89,19 +102,29 @@ The block-sparse API requires masks with specific geometry:
 ### Installation
 
 #### Prerequisites
-- NVIDIA GPU with CUDA 12.8+ (Blackwell for optimal performance)
+- NVIDIA GPU with CUDA 12.8+ (Blackwell for optimal performance, also supports CUDA 13.x)
 - PyTorch 2.3.0 or later
-- Ninja build system 1.11+
+- Triton (included with PyTorch, used for JIT kernel compilation)
 
-#### Installing SpargeAttn
+#### Local Integration (Recommended - No Build Required)
+The SpargeAttn implementation is now vendored locally in `src/optimization/spas_sage_attn/`.
+No separate installation is needed - Triton kernels compile JIT on first use.
+
+```bash
+# Just ensure Triton is available (usually bundled with PyTorch)
+pip install triton
+
+# The local implementation will be used automatically
+python -c "from src.optimization.compatibility import SPARGE_SAGE2_AVAILABLE, SPARGE_SAGE2_VERSION; print(f'Available: {SPARGE_SAGE2_AVAILABLE}, Version: {SPARGE_SAGE2_VERSION}')"
+```
+
+#### Global Installation (Optional - For Full CUDA Kernel Support)
+For maximum performance with precompiled CUDA kernels (if local JIT has issues):
 ```bash
 # Install dependencies
 pip install ninja>=1.11
 
-# Install SpargeAttn (may require building from source for CUDA 12.8+)
-pip install spas-sage-attn
-
-# Or build from source:
+# Build from source:
 git clone https://github.com/thu-ml/SpargeAttn
 cd SpargeAttn
 python setup.py install
