@@ -850,6 +850,12 @@ def decode_all_batches(
     debug.log("", category="none", force=True)
     debug.log("━━━━━━━━ Phase 3: VAE decoding ━━━━━━━━", category="none", force=True)
     debug.start_timer("phase3_decoding")
+    
+    # Clear GPU memory before Phase 3 to prevent OOM from DiT residue
+    # This is especially important on 16GB GPUs (Blackwell) where Phase 2 uses significant VRAM
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        debug.log("GPU memory cleared before Phase 3", category="memory")
 
     # Count valid latents
     num_valid_latents = len([l for l in ctx['all_upscaled_latents'] if l is not None])

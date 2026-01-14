@@ -247,6 +247,40 @@ def _triton_forward(q, k, k_block_id, v, q_scale, k_scale, pvthreshd, is_causal=
     num_warps = config.get('num_warps', 4)
     num_stages = num_stages_override if num_stages_override is not None else config.get('num_stages', 4)
     
+    # Memory limit guard for Blackwell GPUs (shared memory limit: 101376 bytes)
+    # Formula: shared_mem ≈ BLOCK_M * head_dim * 2 * num_stages (for BF16)
+    # With safety factor: BLOCK_M * head_dim * 2 * num_stages < 101376
+    BLACKWELL_SHARED_MEM_LIMIT = 101376
+    dtype_bytes = 2  # BF16/FP16
+    actual_head_dim = q.size(-1)  # Get actual head_dim from tensor
+    
+    # Estimate shared memory usage: Q_block + K_block + V_block for each stage
+    # More accurate formula: BLOCK_M * HEAD_DIM * 2 * num_stages (for Q rows per stage)
+    # Plus K/V blocks: BLOCK_N * HEAD_DIM * 2 * num_stages
+    estimated_shared = (BLOCK_M * actual_head_dim * dtype_bytes + BLOCK_N * actual_head_dim * dtype_bytes * 2) * num_stages
+    
+    if estimated_shared > BLACKWELL_SHARED_MEM_LIMIT:
+        # Downscale: first try reducing num_stages, then block_m
+        original_block_m = BLOCK_M
+        original_stages = num_stages
+        
+        # Try reducing num_stages first
+        while num_stages > 1 and estimated_shared > BLACKWELL_SHARED_MEM_LIMIT:
+            num_stages -= 1
+            estimated_shared = (BLOCK_M * actual_head_dim * dtype_bytes + BLOCK_N * actual_head_dim * dtype_bytes * 2) * num_stages
+        
+        # If still too high, reduce BLOCK_M
+        while BLOCK_M > 32 and estimated_shared > BLACKWELL_SHARED_MEM_LIMIT:
+            BLOCK_M = BLOCK_M // 2
+            estimated_shared = (BLOCK_M * actual_head_dim * dtype_bytes + BLOCK_N * actual_head_dim * dtype_bytes * 2) * num_stages
+        
+        if original_block_m != BLOCK_M or original_stages != num_stages:
+            logger.warning(
+                f"Triton kernel params auto-downscaled to fit shared memory limit "
+                f"(BLOCK_M: {original_block_m}→{BLOCK_M}, stages: {original_stages}→{num_stages}, "
+                f"estimated: {estimated_shared} bytes, limit: {BLACKWELL_SHARED_MEM_LIMIT})"
+            )
+    
     stage = 3 if is_causal else 1
     o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
 
@@ -344,14 +378,20 @@ def spas_sage_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=N
     cdfthreshd = 0.9 + topk * 0.08        # Range 0.9-0.98
     pvthreshd = int(10 + topk * 40)       # Range 10-50
     
+    # Determine actual BLKQ to use (override or default 128)
+    # This MUST be consistent across get_block_map_meansim, per_block_int8, and _triton_forward
+    blkq = block_m_override if block_m_override is not None else 128
+    blkk = 64  # BLKK is always 64 per the Sparge algorithm
+    
     k_block_indices = get_block_map_meansim(q, k, is_causal=is_causal, 
+                                            BLKQ=blkq, BLKK=blkk,
                                             simthreshd1=simthreshd1, 
                                             cdfthreshd=cdfthreshd)
     headdim = q.size(-1)
 
     assert headdim in [64, 128], "headdim should be in [64, 128]."
 
-    q_int8, q_scale, k_int8, k_scale = per_block_int8(q, k)
+    q_int8, q_scale, k_int8, k_scale = per_block_int8(q, k, BLKQ=blkq, BLKK=blkk)
     pvthreshd_tensor = hyperparameter_check(pvthreshd, q.size(-3), q.device)
     
     o = _triton_forward(q_int8, k_int8, k_block_indices, v, q_scale, k_scale, 

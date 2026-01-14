@@ -65,14 +65,15 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                     tooltip="Enable tiled encoding to reduce VRAM usage during the encoding phase"
                 ),
                 io.Int.Input("encode_tile_size",
-                    default=1024,
+                    default=512,
                     min=64,
                     step=32,
                     optional=True,
                     tooltip=(
-                        "Encoding tile size in pixels (default: 1024).\n"
+                        "Encoding tile size in pixels (default: 512).\n"
                         "Applied to both height and width.\n"
                         "Lower values reduce VRAM usage but may increase processing time.\n"
+                        "Recommended: 512 for 16GB VRAM GPUs (Blackwell).\n"
                         "Only used when encode_tiled is enabled."
                     )
                 ),
@@ -94,14 +95,15 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                     tooltip="Enable tiled decoding to reduce VRAM usage during the decoding phase"
                 ),
                 io.Int.Input("decode_tile_size",
-                    default=1024,
+                    default=512,
                     min=64,
                     step=32,
                     optional=True,
                     tooltip=(
-                        "Decoding tile size in pixels (default: 1024).\n"
+                        "Decoding tile size in pixels (default: 512).\n"
                         "Applied to both height and width.\n"
                         "Lower values reduce VRAM usage but may increase processing time.\n"
+                        "Recommended: 512 for 16GB VRAM GPUs (Blackwell).\n"
                         "Only used when decode_tiled is enabled."
                     )
                 ),
