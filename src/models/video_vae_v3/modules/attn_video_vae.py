@@ -1024,9 +1024,15 @@ class Decoder3D(nn.Module):
             # middle
             sample = self.mid_block(sample, latent_embeds, memory_state=memory_state)
 
-            # up
-            for up_block in self.up_blocks:
+            # up - aggressive cache clearing INSIDE the loop to prevent VRAM accumulation
+            # This is critical for 16GB GPUs (Blackwell) at high resolutions (720p+, 162 frames)
+            # Each up_block can allocate significant intermediate feature maps in ResnetBlock3D
+            for i, up_block in enumerate(self.up_blocks):
                 sample = up_block(sample, latent_embeds, memory_state=memory_state)
+                # Clear GPU cache after each major up_block to prevent VRAM fragmentation
+                # This slows down processing slightly but prevents the 17GB reservation spike
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         # post-process
         sample = causal_norm_wrapper(self.conv_norm_out, sample)
