@@ -118,6 +118,43 @@ ensure_bitsandbytes_safe()
 import torch
 import os
 import math
+import logging
+
+# Configure logging for Blackwell optimization verification
+logger = logging.getLogger("SeedVR2.Blackwell")
+
+# Global frame counter for per-frame verification logging
+_sparge_sage2_frame_counter = 0
+
+# Windows/Performance optimization: control logging and cache behavior via environment variables
+# Set SEEDVR2_VERBOSE_LOGGING=1 to enable detailed per-call logging (for debugging)
+# Set SEEDVR2_CACHE_CLEARING=1 to enable torch.cuda.empty_cache() between phases
+ENABLE_VERBOSE_LOGGING = os.environ.get('SEEDVR2_VERBOSE_LOGGING', '0') == '1'
+ENABLE_CACHE_CLEARING = os.environ.get('SEEDVR2_CACHE_CLEARING', '0') == '1'
+
+
+def reset_sparge_sage2_verification(clear_cache: bool = None):
+    """
+    Reset the sparge_sage2 frame counter and optionally clear CUDA cache.
+    Call this before starting a new DiT phase to ensure clean kernel execution.
+    
+    Args:
+        clear_cache: Override cache clearing behavior. If None, uses ENABLE_CACHE_CLEARING.
+                     Cache clearing is disabled by default for performance.
+    """
+    global _sparge_sage2_frame_counter
+    _sparge_sage2_frame_counter = 0
+    
+    # Determine if we should clear cache
+    should_clear = clear_cache if clear_cache is not None else ENABLE_CACHE_CLEARING
+    
+    # Clear CUDA cache only if explicitly requested (disabled by default for performance)
+    if should_clear and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        if ENABLE_VERBOSE_LOGGING:
+            print(">> MEMORY ISOLATION: CUDA cache cleared before DiT phase", flush=True)
+            logger.info("CUDA cache cleared before DiT phase for memory isolation")
 
 
 # Flash/Sage Attention & Triton Compatibility Layer
@@ -902,9 +939,40 @@ def call_sparge_sage2_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
     heads = q.shape[1]
     dim = q.shape[2]
     
-    # Get sparsity parameters
+    # Get sparsity parameters with explicit mapping
+    # Performance Mode Mapping: Fast=0.3, Balanced=0.5, High Quality=0.7
     topk = kwargs.get('topk', Sage2BlackwellConfig.DEFAULT_TOPK)
     is_causal = kwargs.get('causal', False)
+    
+    # STRICT VERIFICATION: Assert sparsity_threshold is a valid float
+    assert isinstance(topk, (int, float)), f"sparsity_threshold must be a float, got {type(topk)}"
+    assert 0.0 < topk <= 1.0, f"sparsity_threshold must be in (0.0, 1.0], got {topk}"
+    
+    # Update frame counter (always, for tracking)
+    global _sparge_sage2_frame_counter
+    _sparge_sage2_frame_counter += 1
+    
+    # Logging only on first call OR if verbose logging is explicitly enabled
+    # This eliminates Python-side overhead during normal execution
+    if _sparge_sage2_frame_counter == 1:
+        # Map topk value to performance mode name for logging
+        if abs(topk - 0.3) < 0.01:
+            perf_mode = "Fast"
+        elif abs(topk - 0.5) < 0.01:
+            perf_mode = "Balanced"
+        elif abs(topk - 0.7) < 0.01:
+            perf_mode = "High Quality"
+        else:
+            perf_mode = f"Custom({topk})"
+        
+        blackwell_msg = (f"!!! BLACKWELL EXECUTION: Mode={perf_mode}, Threshold={topk}, "
+                         f"Warps={Sage2BlackwellConfig.TRITON_NUM_WARPS}, Stages={Sage2BlackwellConfig.TRITON_NUM_STAGES}, "
+                         f"BlockM={Sage2BlackwellConfig.TRITON_BLOCK_M}, BlockN={Sage2BlackwellConfig.TRITON_BLOCK_N}")
+        print(blackwell_msg, flush=True)
+        logger.info(blackwell_msg)
+    elif ENABLE_VERBOSE_LOGGING and _sparge_sage2_frame_counter % 100 == 0:
+        # Verbose logging every 100th call (only when SEEDVR2_VERBOSE_LOGGING=1)
+        print(f">> KERNEL #{_sparge_sage2_frame_counter}: topk={topk}", flush=True)
     
     # SpargeAttn requires half precision (fp16/bf16)
     out_dtype = q.dtype
@@ -924,8 +992,15 @@ def call_sparge_sage2_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
     k_batched = k.view(batch_size, seq_len_k, heads, dim).transpose(1, 2)
     v_batched = v.view(batch_size, seq_len_k, heads, dim).transpose(1, 2)
     
-    # Call SpargeAttn Sage2
-    out = spas_sage2_attn_meansim_topk(q_batched, k_batched, v_batched, topk=topk, is_causal=is_causal)
+    # Call SpargeAttn Sage2 - STRICT: raise error if kernel fails
+    try:
+        out = spas_sage2_attn_meansim_topk(q_batched, k_batched, v_batched, topk=topk, is_causal=is_causal)
+    except Exception as e:
+        raise RuntimeError(
+            f"SpargeAttn Sage2 kernel FAILED with Blackwell parameters "
+            f"(num_warps={Sage2BlackwellConfig.TRITON_NUM_WARPS}, topk={topk}). "
+            f"Error: {e}. No silent fallback - fix the kernel or use a different attention_mode."
+        ) from e
     
     # Reshape back to varlen format (total_seq, heads, dim)
     out = out.transpose(1, 2).reshape(-1, heads, dim).contiguous()
