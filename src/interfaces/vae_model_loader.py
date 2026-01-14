@@ -177,6 +177,27 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                         "This setting only affects VAE when enable_sparge_attention is True."
                     )
                 ),
+                io.Combo.Input("vae_precision",
+                    options=["auto", "fp16", "bf16", "fp8_e4m3fn"],
+                    default="auto",
+                    optional=True,
+                    tooltip=(
+                        "VAE model precision override:\n"
+                        "\n"
+                        "• auto: Detect precision from filename (default)\n"
+                        "  - Files with 'fp8' or 'e4m3fn' → FP8 loading\n"
+                        "  - Other files → Use compute dtype (fp16/bf16)\n"
+                        "• fp16: Force FP16 (16-bit floating point)\n"
+                        "• bf16: Force BF16 (Brain Float 16)\n"
+                        "• fp8_e4m3fn: Force FP8 E4M3 format (8-bit float)\n"
+                        "  - E4M3FN = 4 exponent bits, 3 mantissa bits, no infinity\n"
+                        "  - Optimized for RTX 50xx (Blackwell) Tensor Cores\n"
+                        "  - Also works on RTX 40xx (Ada) with reduced precision\n"
+                        "\n"
+                        "Use 'fp8_e4m3fn' to force the FP8 Tensor Core path\n"
+                        "even if the filename doesn't contain 'fp8'."
+                    )
+                ),
                 io.Custom("TORCH_COMPILE_ARGS").Input("torch_compile_args",
                     optional=True,
                     tooltip=(
@@ -201,7 +222,7 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                      decode_tiled: bool = False, decode_tile_size: int = 512, 
                      decode_tile_overlap: int = 64, tile_debug: str = "false",
                      enable_sparge_attention: bool = True, performance_mode: str = "Balanced",
-                     torch_compile_args: Dict[str, Any] = None
+                     vae_precision: str = "auto", torch_compile_args: Dict[str, Any] = None
                      ) -> io.NodeOutput:
         """
         Create VAE model configuration for SeedVR2 main node
@@ -220,6 +241,7 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
             tile_debug: Tile visualization mode (false/encode/decode)
             enable_sparge_attention: Enable Sparge block-sparse attention for VAE
             performance_mode: Performance tuning for Sparge ('Fast', 'Balanced', 'High Quality')
+            vae_precision: Precision override ('auto', 'fp16', 'bf16', 'fp8_e4m3fn')
             torch_compile_args: Optional torch.compile configuration from settings node
             
         Returns:
@@ -254,8 +276,17 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
         }
         vae_sparsity_threshold = performance_mode_map.get(performance_mode, 0.5)
         
-        # Detect if this is an FP8 model (for native FP8 loading)
-        is_fp8_model = "fp8" in model.lower() or "e4m3fn" in model.lower()
+        # Determine FP8 model status based on precision setting
+        # Priority: manual precision override > filename detection
+        if vae_precision == "fp8_e4m3fn":
+            # Force FP8 path regardless of filename
+            is_fp8_model = True
+        elif vae_precision in ("fp16", "bf16"):
+            # Force non-FP8 path regardless of filename
+            is_fp8_model = False
+        else:
+            # Auto-detect from filename
+            is_fp8_model = "fp8" in model.lower() or "e4m3fn" in model.lower()
         
         config = {
             "model": model,
@@ -275,6 +306,7 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
             "enable_sparge_attention": sparge_active,
             "vae_sparsity_threshold": vae_sparsity_threshold,
             "performance_mode": performance_mode,
+            "vae_precision": vae_precision,
             "is_fp8_model": is_fp8_model,
             "blackwell_detected": BLACKWELL_GPU_DETECTED,
         }

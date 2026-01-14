@@ -781,6 +781,8 @@ def configure_runner(
     sparsity_threshold: float = 0.5,
     vae_sparge_enabled: bool = False,
     vae_sparsity_threshold: float = 0.5,
+    vae_precision: str = "auto",
+    vae_is_fp8: bool = False,
     torch_compile_args_dit: Optional[Dict[str, Any]] = None,
     torch_compile_args_vae: Optional[Dict[str, Any]] = None
 ) -> Tuple[VideoDiffusionInfer, Dict[str, Any]]:
@@ -812,6 +814,8 @@ def configure_runner(
                            Maps to performance modes: Fast=0.3, Balanced=0.5, High Quality=0.7
         vae_sparge_enabled: Enable Sparge block-sparse attention for VAE decoding (Blackwell)
         vae_sparsity_threshold: Sparsity threshold for VAE Sparge attention (0.0-1.0, default 0.5)
+        vae_precision: VAE precision override ('auto', 'fp16', 'bf16', 'fp8_e4m3fn')
+        vae_is_fp8: Whether VAE should use FP8 loading (from UI detection or override)
         torch_compile_args_dit: Optional torch.compile configuration for DiT model
         torch_compile_args_vae: Optional torch.compile configuration for VAE model
         
@@ -860,6 +864,7 @@ def configure_runner(
         decode_tiled, decode_tile_size, decode_tile_overlap,
         tile_debug, attention_mode, sparsity_threshold,
         vae_sparge_enabled, vae_sparsity_threshold,
+        vae_precision, vae_is_fp8,
         torch_compile_args_dit, torch_compile_args_vae,
         block_swap_config, debug
     )
@@ -887,6 +892,8 @@ def _configure_runner_settings(
     sparsity_threshold: float,
     vae_sparge_enabled: bool,
     vae_sparsity_threshold: float,
+    vae_precision: str,
+    vae_is_fp8: bool,
     torch_compile_args_dit: Optional[Dict[str, Any]],
     torch_compile_args_vae: Optional[Dict[str, Any]],
     block_swap_config: Optional[Dict[str, Any]],
@@ -915,6 +922,8 @@ def _configure_runner_settings(
                            Maps to performance modes: Fast=0.3, Balanced=0.5, High Quality=0.7
         vae_sparge_enabled: Enable Sparge block-sparse attention for VAE decoding
         vae_sparsity_threshold: Sparsity threshold for VAE Sparge attention (0.0-1.0)
+        vae_precision: VAE precision override ('auto', 'fp16', 'bf16', 'fp8_e4m3fn')
+        vae_is_fp8: Whether VAE should use FP8 loading (from UI detection or override)
         torch_compile_args_dit: torch.compile configuration for DiT model or None
         torch_compile_args_vae: torch.compile configuration for VAE model or None
         block_swap_config: BlockSwap configuration for DiT model or None
@@ -948,6 +957,10 @@ def _configure_runner_settings(
     # VAE Sparge attention settings (Blackwell optimization)
     runner._vae_sparge_enabled = vae_sparge_enabled
     runner._vae_sparsity_threshold = vae_sparsity_threshold
+    
+    # VAE precision settings (from UI)
+    runner._vae_precision = vae_precision
+    runner._vae_is_fp8_override = vae_is_fp8
     
     # Store device configuration on runner for submodule access (e.g., BlockSwap, Cleanup)
     runner._dit_device = ctx['dit_device']
@@ -1180,27 +1193,39 @@ def _setup_vae_model(
 
         runner.config.vae.model = OmegaConf.merge(runner.config.vae.model, vae_config)
         
-        # Detect FP8 model for native loading on Blackwell GPUs
-        # FP8 models use naming pattern like 'ema_vae_fp8.safetensors' or '*_fp8_*.safetensors'
-        # Use stricter pattern matching to avoid false positives
-        vae_model_lower = vae_model.lower()
-        # Match patterns: '_fp8.', '_fp8_', '-fp8.', '-fp8-', 'fp8.' at end
-        is_fp8_model = any(pattern in vae_model_lower for pattern in ['_fp8.', '_fp8_', '-fp8.', '-fp8-']) or \
-                       vae_model_lower.endswith('_fp8') or \
-                       'e4m3fn' in vae_model_lower or 'e5m2' in vae_model_lower
+        # Get precision settings from runner (set by UI)
+        vae_precision = getattr(runner, '_vae_precision', 'auto')
+        vae_is_fp8_override = getattr(runner, '_vae_is_fp8_override', False)
+        
+        # Determine FP8 mode based on UI override or filename detection
+        if vae_is_fp8_override:
+            # UI explicitly set FP8 mode (either via vae_precision='fp8_e4m3fn' or is_fp8_model=True)
+            is_fp8_model = True
+            debug.log(f"FP8 VAE mode enabled via UI (precision: {vae_precision})", category="vae", force=True)
+        elif vae_precision in ('fp16', 'bf16'):
+            # UI explicitly disabled FP8 mode
+            is_fp8_model = False
+            debug.log(f"VAE precision forced to {vae_precision.upper()} via UI", category="vae", force=True)
+        else:
+            # Auto-detect from filename (legacy behavior)
+            vae_model_lower = vae_model.lower()
+            # Match patterns: '_fp8.', '_fp8_', '-fp8.', '-fp8-', 'fp8.' at end
+            is_fp8_model = any(pattern in vae_model_lower for pattern in ['_fp8.', '_fp8_', '-fp8.', '-fp8-']) or \
+                           vae_model_lower.endswith('_fp8') or \
+                           'e4m3fn' in vae_model_lower or 'e5m2' in vae_model_lower
         
         # Check PyTorch version supports FP8 (introduced in PyTorch 2.1+)
         fp8_supported = hasattr(torch, 'float8_e4m3fn')
         if is_fp8_model and not fp8_supported:
-            debug.log(f"FP8 VAE model detected but PyTorch {torch.__version__} does not support FP8. "
+            debug.log(f"FP8 VAE mode detected/requested but PyTorch {torch.__version__} does not support FP8. "
                      f"Upgrade to PyTorch 2.1+ for native FP8 support. Falling back to FP16/BF16.",
                      level="WARNING", category="vae", force=True)
             is_fp8_model = False
         
         if is_fp8_model:
-            # Native FP8 VAE loading for Blackwell GPUs
-            # Keep weights in FP8 format to utilize Blackwell Tensor Cores
-            debug.log("Detected FP8 VAE model - loading with native FP8 format for Blackwell", 
+            # Native FP8 VAE loading for compatible GPUs (Blackwell, Ada, etc.)
+            # Keep weights in FP8 format to utilize Tensor Cores
+            debug.log("Loading VAE with native FP8 format for compatible Tensor Cores", 
                      category="vae", force=True)
             runner._vae_is_fp8 = True
             # Don't override dtype for FP8 models - load as-is
@@ -1210,8 +1235,13 @@ def _setup_vae_model(
         else:
             # Standard VAE loading
             runner._vae_is_fp8 = False
-            # Set VAE dtype from runner's compute_dtype
-            compute_dtype = getattr(runner, '_compute_dtype', torch.bfloat16)
+            # Set VAE dtype from precision override or runner's compute_dtype
+            if vae_precision == 'bf16':
+                compute_dtype = torch.bfloat16
+            elif vae_precision == 'fp16':
+                compute_dtype = torch.float16
+            else:
+                compute_dtype = getattr(runner, '_compute_dtype', torch.bfloat16)
             vae_dtype_str = str(compute_dtype).split('.')[-1]
             runner.config.vae.dtype = vae_dtype_str
             runner._vae_dtype_override = compute_dtype

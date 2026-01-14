@@ -349,6 +349,8 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
         # VAE Blackwell optimization settings
         vae_sparge_enabled = vae.get("enable_sparge_attention", False)
         vae_sparsity_threshold = vae.get("vae_sparsity_threshold", 0.5)
+        vae_precision = vae.get("vae_precision", "auto")
+        vae_is_fp8 = vae.get("is_fp8_model", False)
 
         # BlockSwap configuration - construct from individual values
         blocks_to_swap = dit.get("blocks_to_swap", 0)
@@ -441,6 +443,8 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 sparsity_threshold=sparsity_threshold,
                 vae_sparge_enabled=vae_sparge_enabled,
                 vae_sparsity_threshold=vae_sparsity_threshold,
+                vae_precision=vae_precision,
+                vae_is_fp8=vae_is_fp8,
                 torch_compile_args_dit=dit_torch_compile_args,
                 torch_compile_args_vae=vae_torch_compile_args
             )

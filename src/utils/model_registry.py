@@ -90,6 +90,23 @@ def get_available_dit_models() -> List[str]:
     return model_list
 
 def get_available_vae_models() -> List[str]:
-    """Get all available VAE models from the registry"""
+    """Get all available VAE models including those discovered on disk"""
     model_list = get_default_models("vae")
+    
+    try:
+        # Get all model files from all paths
+        model_files = get_all_model_files()
+        
+        # Add VAE files not in registry - look for 'vae' in filename
+        discovered_vae_models = [
+            filename for filename in model_files
+            if filename not in MODEL_REGISTRY and 'vae' in filename.lower()
+        ]
+        
+        # Add discovered VAE models to the list
+        model_list.extend(sorted(discovered_vae_models))
+    except (OSError, FileNotFoundError, PermissionError):
+        # Silently ignore filesystem errors during model discovery
+        pass
+    
     return model_list
