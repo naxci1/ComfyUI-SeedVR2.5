@@ -12,18 +12,40 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+
+Note: This module provides advanced autotuning functionality.
+Some features require the full SpargeAttn package to be installed globally.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import os
-from tqdm import tqdm
-import numpy as np
-from spas_sage_attn.utils import precision_metric
-from spas_sage_attn import spas_sage_attn_meansim_cuda, spas_sage2_attn_meansim_cuda
 import warnings
 from einops import rearrange
+
+# Try to import optional dependencies
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = lambda x, **kwargs: x  # Simple fallback
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+# Use local imports instead of global package
+try:
+    from .utils import precision_metric
+    from .core import spas_sage_attn_meansim_topk_cuda as spas_sage_attn_meansim_cuda
+    from .core import spas_sage2_attn_meansim_topk_cuda as spas_sage2_attn_meansim_cuda
+    AUTOTUNE_AVAILABLE = True
+except ImportError:
+    AUTOTUNE_AVAILABLE = False
+    precision_metric = None
+    spas_sage_attn_meansim_cuda = None
+    spas_sage2_attn_meansim_cuda = None
 
 def extract_sparse_attention_state_dict(model, verbose=False):
     saved_state_dict = {}
@@ -71,9 +93,14 @@ def partition_points_into_line(points, block_size, min_dim1=-1, max_dim1=1):
         blocks[key].append(point)
     return blocks
 
-# 
-from tools.gpu_process import GPUProcessPoolExecutor
-executor = GPUProcessPoolExecutor()
+# GPUProcessPoolExecutor is an optional dependency for multi-GPU tuning
+# It's not required for basic SpargeAttn functionality
+try:
+    from tools.gpu_process import GPUProcessPoolExecutor
+    executor = GPUProcessPoolExecutor()
+except (ImportError, ModuleNotFoundError):
+    GPUProcessPoolExecutor = None
+    executor = None
 
 class SparseAttentionMeansim(nn.Module):
     def __init__(self, sim_rule="l1", l1=0.07, pv_l1=0.08, cos_sim=0.98, rmse=0.07, rearrange_kwargs={}, tune_pv=True):
