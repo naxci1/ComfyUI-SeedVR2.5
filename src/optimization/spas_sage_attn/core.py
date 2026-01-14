@@ -224,7 +224,7 @@ if TRITON_AVAILABLE:
         tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask = (offs_m[:, None] < qo_len))
 
 
-def _triton_forward(q, k, k_block_id, v, q_scale, k_scale, pvthreshd, is_causal=False, tensor_layout="HND", output_dtype=torch.float16, block_m_override=None):
+def _triton_forward(q, k, k_block_id, v, q_scale, k_scale, pvthreshd, is_causal=False, tensor_layout="HND", output_dtype=torch.float16, block_m_override=None, num_stages_override=None):
     """
     Execute sparse attention using Triton JIT kernels.
     
@@ -234,6 +234,8 @@ def _triton_forward(q, k, k_block_id, v, q_scale, k_scale, pvthreshd, is_causal=
     Args:
         block_m_override: Optional override for BLOCK_M (default uses Blackwell config).
                           Use block_m_override=64 for VAE BF16 to avoid shared memory errors.
+        num_stages_override: Optional override for num_stages (default uses Blackwell config).
+                             Use num_stages_override=2 for VAE BF16 to fit in shared memory.
     """
     if not TRITON_AVAILABLE:
         raise RuntimeError("Triton is required for local SpargeAttn. Install with: pip install triton")
@@ -243,7 +245,7 @@ def _triton_forward(q, k, k_block_id, v, q_scale, k_scale, pvthreshd, is_causal=
     BLOCK_M = block_m_override if block_m_override is not None else config.get('BLOCK_M', 128)
     BLOCK_N = config.get('BLOCK_N', 64)
     num_warps = config.get('num_warps', 4)
-    num_stages = config.get('num_stages', 4)
+    num_stages = num_stages_override if num_stages_override is not None else config.get('num_stages', 4)
     
     stage = 3 if is_causal else 1
     o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
@@ -291,7 +293,7 @@ def _triton_forward(q, k, k_block_id, v, q_scale, k_scale, pvthreshd, is_causal=
 def spas_sage_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=None, 
                                       smooth_k=True, tensor_layout="HND", 
                                       output_dtype=None, return_sparsity=False,
-                                      block_m_override=None):
+                                      block_m_override=None, num_stages_override=None):
     """
     SpargeAttn with mean-similarity based top-k block selection.
     
@@ -310,6 +312,8 @@ def spas_sage_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=N
         return_sparsity: Whether to return sparsity ratio
         block_m_override: Optional override for BLOCK_M (default: None uses Blackwell config).
                           Use block_m_override=64 for VAE BF16 to avoid shared memory errors.
+        num_stages_override: Optional override for num_stages (default: None uses Blackwell config).
+                             Use num_stages_override=2 for VAE BF16 to fit in shared memory.
         
     Returns:
         Attention output tensor
@@ -353,7 +357,8 @@ def spas_sage_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=N
     o = _triton_forward(q_int8, k_int8, k_block_indices, v, q_scale, k_scale, 
                         pvthreshd_tensor, is_causal=is_causal, 
                         tensor_layout="HND", output_dtype=output_dtype,
-                        block_m_override=block_m_override)
+                        block_m_override=block_m_override,
+                        num_stages_override=num_stages_override)
 
     if tensor_layout == 'NHD':
         o = rearrange(o, '... H L D -> ... L H D')
@@ -371,7 +376,7 @@ def spas_sage_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=N
 def spas_sage2_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=None,
                                        smooth_k=True, tensor_layout="HND",
                                        output_dtype=None, return_sparsity=False,
-                                       block_m_override=None):
+                                       block_m_override=None, num_stages_override=None):
     """
     SpargeAttn Sage2 with mean-similarity based top-k block selection.
     
@@ -395,6 +400,8 @@ def spas_sage2_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=
         return_sparsity: Whether to return sparsity ratio
         block_m_override: Optional override for BLOCK_M (default: None uses Blackwell config).
                           Use block_m_override=64 for VAE BF16 to avoid shared memory errors.
+        num_stages_override: Optional override for num_stages (default: None uses Blackwell config).
+                             Use num_stages_override=2 for VAE BF16 to fit in shared memory.
         
     Returns:
         Attention output tensor (same shape as input)
@@ -402,8 +409,8 @@ def spas_sage2_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=
         
     Example:
         >>> output = spas_sage2_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False)
-        >>> # For VAE (BF16), use smaller block size to avoid shared memory errors:
-        >>> output = spas_sage2_attn_meansim_topk_cuda(q, k, v, topk=0.5, block_m_override=64)
+        >>> # For VAE (BF16), use smaller block size and fewer stages to fit in shared memory:
+        >>> output = spas_sage2_attn_meansim_topk_cuda(q, k, v, topk=0.5, block_m_override=64, num_stages_override=2)
     """
     global _kernel_logged_once
     
@@ -411,17 +418,18 @@ def spas_sage2_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=
     config = get_blackwell_config()
     is_blackwell = config.get('is_blackwell', False)
     
-    # Determine actual block_m (override or config)
+    # Determine actual values (override or config)
     actual_block_m = block_m_override if block_m_override is not None else config.get('BLOCK_M', 128)
+    actual_num_stages = num_stages_override if num_stages_override is not None else config.get('num_stages', 4)
     
     # Log only once on first call to avoid Python overhead during execution
     if is_blackwell and not _kernel_logged_once:
         _kernel_logged_once = True
         num_warps = config.get('num_warps', 8)
-        num_stages = config.get('num_stages', 4)
         block_n = config.get('BLOCK_N', 64)
-        override_info = " (override)" if block_m_override is not None else ""
-        kernel_msg = f"!!! Sparge_Sage2 Kernel: topk={topk}, Blackwell=True, Warps={num_warps}, Stages={num_stages}, BlockM={actual_block_m}{override_info}, BlockN={block_n}"
+        block_m_info = f"{actual_block_m} (override)" if block_m_override is not None else str(actual_block_m)
+        stages_info = f"{actual_num_stages} (override)" if num_stages_override is not None else str(actual_num_stages)
+        kernel_msg = f"!!! Sparge_Sage2 Kernel: topk={topk}, Blackwell=True, Warps={num_warps}, Stages={stages_info}, BlockM={block_m_info}, BlockN={block_n}"
         print(kernel_msg, flush=True)
         logger.info(kernel_msg)
     
@@ -432,7 +440,8 @@ def spas_sage2_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=
         q, k, v, topk=topk, is_causal=is_causal, scale=scale,
         smooth_k=smooth_k, tensor_layout=tensor_layout,
         output_dtype=output_dtype, return_sparsity=return_sparsity,
-        block_m_override=block_m_override
+        block_m_override=block_m_override,
+        num_stages_override=num_stages_override
     )
 
 

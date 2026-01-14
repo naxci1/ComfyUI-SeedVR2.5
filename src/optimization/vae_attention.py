@@ -10,9 +10,9 @@ Key Features:
 - Uses spas_sage2_attn_meansim_topk_cuda Triton kernel for VAE attention
 - Maps VAE spatial attention (B, C, H, W) to sequence format (B, H, seq, D)
 - Targets Attention blocks in MidBlock2D and UpDecoderBlock2D of the VAE
-- VAE-specific tuning: num_warps=8, num_stages=3, block_m=64, block_n=64
-  (block_m=64 for VAE BF16 to avoid shared memory errors on Blackwell)
-- DiT keeps block_m=128 for maximum speed with NVFP4/FP8
+- VAE-specific tuning: num_warps=8, num_stages=2, block_m=64, block_n=64
+  (num_stages=2 and block_m=64 for VAE BF16 to fit in Blackwell shared memory limit of 101376 bytes)
+- DiT (Diffusion Transformer) keeps block_m=128, num_stages=3 for maximum speed with NVFP4/FP8
 """
 
 import torch
@@ -27,10 +27,11 @@ logger = logging.getLogger("SeedVR2.VAE.Blackwell")
 # Track if we've logged kernel info once (avoid per-call logging overhead on Windows)
 _vae_kernel_logged_once = False
 
-# VAE-specific block size override (64 instead of 128 to avoid shared memory errors)
-# DiT (Diffusion Transformer) uses block_m=128 (from Blackwell config) with NVFP4/FP8
-# VAE uses block_m=64 to avoid shared memory "Out of Resource" errors on Blackwell with BF16
+# VAE-specific kernel parameters to fit within Blackwell shared memory limit (101376 bytes)
+# DiT (Diffusion Transformer) uses block_m=128, num_stages=3 (from Blackwell config) with NVFP4/FP8
+# VAE uses block_m=64, num_stages=2 to avoid shared memory "Out of Resource" errors on Blackwell with BF16
 VAE_BLOCK_M = 64
+VAE_NUM_STAGES = 2
 
 # Import sparge attention functions
 from .spas_sage_attn import (
@@ -84,8 +85,9 @@ def sparge_vae_attention(
     in VAE decoder blocks. It maps the spatial attention tensors to the sequence
     format expected by the Sparge kernel.
     
-    Uses block_m=64 specifically for VAE to avoid shared memory errors on Blackwell
-    when running in BF16/FP8. DiT uses block_m=128 with NVFP4/FP8.
+    Uses block_m=64 and num_stages=2 specifically for VAE to fit within Blackwell
+    shared memory limit (101376 bytes) when running in BF16/FP8.
+    DiT uses block_m=128, num_stages=3 with NVFP4/FP8.
     
     Args:
         query: Query tensor (batch, heads, seq_len, head_dim) in HND layout
@@ -110,7 +112,7 @@ def sparge_vae_attention(
         if config.get('is_blackwell', False):
             logger.info(
                 f"VAE Sparge Kernel: topk={topk}, Blackwell=True, "
-                f"Warps={config.get('num_warps', 8)}, Stages={config.get('num_stages', 3)}, "
+                f"Warps={config.get('num_warps', 8)}, Stages={VAE_NUM_STAGES} (VAE-specific), "
                 f"BlockM={VAE_BLOCK_M} (VAE-specific), BlockN={config.get('BLOCK_N', 64)}"
             )
     
@@ -127,8 +129,9 @@ def sparge_vae_attention(
             scale = query.size(-1) ** -0.5
         return F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, scale=scale)
     
-    # Call Sparge Sage2 attention with VAE-specific block_m=64
-    # This avoids shared memory "Out of Resource" errors on Blackwell with BF16
+    # Call Sparge Sage2 attention with VAE-specific parameters:
+    # - block_m=64 and num_stages=2 to fit in Blackwell shared memory (101376 bytes limit)
+    # - DiT uses block_m=128, num_stages=3 (from Blackwell config)
     output = spas_sage2_attn_meansim_topk_cuda(
         query, key, value,
         topk=topk,
@@ -137,7 +140,8 @@ def sparge_vae_attention(
         smooth_k=True,
         tensor_layout="HND",
         output_dtype=query.dtype,
-        block_m_override=VAE_BLOCK_M,  # Use block_m=64 for VAE (vs 128 for DiT)
+        block_m_override=VAE_BLOCK_M,       # Use block_m=64 for VAE (vs 128 for DiT)
+        num_stages_override=VAE_NUM_STAGES,  # Use num_stages=2 for VAE (vs 3 for DiT)
     )
     
     return output
