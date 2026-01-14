@@ -923,7 +923,6 @@ class Decoder3D(nn.Module):
         temb_channels = in_channels if norm_type == "spatial" else None
 
         # mid
-        # mid
         # Note: attention_head_dim=block_out_channels[-1] creates 1 head x 512 dim
         # The VAE attention processor handles dynamic head splitting (512 → 8×64) in forward pass
         # This preserves the original weight structure while enabling Sparge/SageAttn compatibility

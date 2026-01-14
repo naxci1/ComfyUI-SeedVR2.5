@@ -51,12 +51,15 @@ from .spas_sage_attn import (
     get_blackwell_config,
 )
 
-# Import SageAttention 2 if available
+# Import SageAttention 2 if available (for future integration)
 try:
     from .compatibility import sageattn_varlen, SAGE_ATTN_2_AVAILABLE
 except ImportError:
     sageattn_varlen = None
     SAGE_ATTN_2_AVAILABLE = False
+
+# Maximum head dimension supported by Sparge/SageAttn kernels
+MAX_SUPPORTED_HEAD_DIM = 128
 
 # Default sparsity threshold for VAE attention - 0.3 for fast mode (saves massive VRAM)
 # Lower = more sparsity = faster but less accurate
@@ -256,9 +259,9 @@ def sparge_vae_attention(
     batch, original_heads, seq_len, original_head_dim = query.shape
     
     # Dynamic head splitting for Blackwell compatibility
-    # Sparge/SageAttn requires head_dim in [64, 128]
+    # Sparge/SageAttn requires head_dim in [64, MAX_SUPPORTED_HEAD_DIM]
     # SeedVR2 VAE has head_dim=512 → split to 8 heads × 64 dim
-    if original_head_dim > 128 and original_head_dim % BLACKWELL_TARGET_HEAD_DIM == 0:
+    if original_head_dim > MAX_SUPPORTED_HEAD_DIM and original_head_dim % BLACKWELL_TARGET_HEAD_DIM == 0:
         if not _vae_head_split_logged:
             _vae_head_split_logged = True
             split_factor = original_head_dim // BLACKWELL_TARGET_HEAD_DIM
@@ -283,7 +286,7 @@ def sparge_vae_attention(
             scale = original_head_dim ** -0.5
     
     # Check head_dim compatibility with Sparge kernel
-    if head_dim_for_kernel not in [64, 128]:
+    if head_dim_for_kernel not in [64, MAX_SUPPORTED_HEAD_DIM]:
         if not _vae_head_dim_logged:
             _vae_head_dim_logged = True
             logger.info(
