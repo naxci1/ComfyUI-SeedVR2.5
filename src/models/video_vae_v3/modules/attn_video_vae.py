@@ -780,15 +780,14 @@ class Encoder3D(nn.Module):
 
         # mid
         # Note: attention_head_dim=block_out_channels[-1] creates 1 head x 512 dim
-        # The VAE attention processor handles dynamic head splitting (512 → 8×64) in forward pass
-        # This preserves the original weight structure while enabling Sparge/SageAttn compatibility
+        # VAE uses standard PyTorch SDPA (natively optimized for Blackwell GPUs)
         self.mid_block = UNetMidBlock3D(
             in_channels=block_out_channels[-1],
             resnet_eps=1e-6,
             resnet_act_fn=act_fn,
             output_scale_factor=1,
             resnet_time_scale_shift="default",
-            attention_head_dim=block_out_channels[-1],  # Keep original structure, dynamic splitting in forward
+            attention_head_dim=block_out_channels[-1],  # Original structure: 1 head x 512 dim
             resnet_groups=norm_num_groups,
             temb_channels=None,
             add_attention=mid_block_add_attention,
@@ -929,15 +928,14 @@ class Decoder3D(nn.Module):
 
         # mid
         # Note: attention_head_dim=block_out_channels[-1] creates 1 head x 512 dim
-        # The VAE attention processor handles dynamic head splitting (512 → 8×64) in forward pass
-        # This preserves the original weight structure while enabling Sparge/SageAttn compatibility
+        # VAE uses standard PyTorch SDPA (natively optimized for Blackwell GPUs)
         self.mid_block = UNetMidBlock3D(
             in_channels=block_out_channels[-1],
             resnet_eps=1e-6,
             resnet_act_fn=act_fn,
             output_scale_factor=1,
             resnet_time_scale_shift="default" if norm_type == "group" else norm_type,
-            attention_head_dim=block_out_channels[-1],  # Keep original structure, dynamic splitting in forward
+            attention_head_dim=block_out_channels[-1],  # Original structure: 1 head x 512 dim
             resnet_groups=norm_num_groups,
             temb_channels=temb_channels,
             add_attention=mid_block_add_attention,

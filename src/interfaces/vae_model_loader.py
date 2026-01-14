@@ -163,57 +163,52 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                     )
                 ),
                 io.Boolean.Input("enable_sparge_attention",
-                    default=True,
+                    default=False,
                     optional=True,
                     tooltip=(
-                        "Enable Sparge + SageAttention 2 for VAE (Blackwell optimized).\n"
+                        "Enable experimental Sparge attention for VAE.\n"
                         "\n"
-                        "• Dynamic head splitting: 512-dim → 8 heads × 64 dim in forward pass\n"
-                        "• Preserves original model weights while enabling Sparge/SageAttn\n"
-                        "• Sparge Top-K selection (threshold=0.3) zeros out unimportant pixels\n"
-                        "• SageAttention 2 with INT8/FP8 for Blackwell Tensor Cores\n"
-                        "• torch.cuda.synchronize() after each tile to prevent scheduler hang\n"
+                        "⚠️ DISABLED BY DEFAULT - Not recommended for production use.\n"
                         "\n"
-                        "RECOMMENDED: Keep enabled (True) for RTX 50xx series GPUs.\n"
-                        "Falls back to sliced SDPA if Sparge kernel fails."
+                        "The SeedVR2 VAE has head_dim=512 which is incompatible with\n"
+                        "Sparge/SageAttention kernels (require 64 or 128).\n"
+                        "\n"
+                        "Standard PyTorch SDPA is used instead, which is:\n"
+                        "• Natively optimized for Blackwell GPUs by PyTorch\n"
+                        "• 100% stable with no memory leaks\n"
+                        "• Compatible with all GPU architectures\n"
+                        "\n"
+                        "Keep disabled (False) for best stability."
                     )
                 ),
                 io.Combo.Input("performance_mode",
                     options=["Fast", "Balanced", "High Quality"],
-                    default="Fast",
+                    default="Balanced",
                     optional=True,
                     tooltip=(
-                        "Performance tuning mode for Sparge attention (Blackwell GPUs only).\n"
-                        "Controls the sparsity threshold for VAE attention blocks:\n"
+                        "Performance mode (has no effect when Sparge is disabled).\n"
                         "\n"
-                        "• Fast: Maximum speed, sparsity threshold 0.3 (default for 16GB GPUs)\n"
-                        "  Zeros out 70% of attention weights to save massive VRAM\n"
-                        "• Balanced: Speed/quality balance, sparsity threshold 0.5\n"
-                        "• High Quality: Best quality, sparsity threshold 0.7\n"
-                        "\n"
-                        "This setting only affects VAE when enable_sparge_attention is True."
+                        "This setting only applies if enable_sparge_attention is True.\n"
+                        "With standard SDPA (default), this setting is ignored."
                     )
                 ),
                 io.Combo.Input("vae_precision",
                     options=["auto", "fp16", "bf16", "fp8_e4m3fn"],
-                    default="bf16",
+                    default="auto",
                     optional=True,
                     tooltip=(
                         "VAE model precision override:\n"
                         "\n"
-                        "• auto: Detect precision from filename\n"
+                        "• auto: Detect precision from filename (default)\n"
                         "  - Files with 'fp8' or 'e4m3fn' → FP8 loading\n"
                         "  - Other files → Use compute dtype (fp16/bf16)\n"
                         "• fp16: Force FP16 (16-bit floating point)\n"
-                        "• bf16: Force BF16 (Brain Float 16) - DEFAULT for Blackwell\n"
-                        "  - More memory-efficient on Blackwell GPUs\n"
-                        "  - Avoids 'forced to FP16' overhead\n"
+                        "• bf16: Force BF16 (Brain Float 16)\n"
+                        "  - Recommended for Blackwell GPUs if experiencing issues\n"
                         "• fp8_e4m3fn: Force FP8 E4M3 format (8-bit float)\n"
                         "  - E4M3FN = 4 exponent bits, 3 mantissa bits, no infinity\n"
                         "  - Optimized for RTX 50xx (Blackwell) Tensor Cores\n"
-                        "  - Also works on RTX 40xx (Ada) with reduced precision\n"
-                        "\n"
-                        "RECOMMENDED: Use 'bf16' for best stability on RTX 50xx."
+                        "  - Also works on RTX 40xx (Ada) with reduced precision"
                     )
                 ),
                 io.Custom("TORCH_COMPILE_ARGS").Input("torch_compile_args",
