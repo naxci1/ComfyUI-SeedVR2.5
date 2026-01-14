@@ -60,7 +60,7 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                     tooltip="GPU device for VAE model inference (encoding/decoding phases)"
                 ),
                 io.Boolean.Input("encode_tiled",
-                    default=True,
+                    default=False,
                     optional=True,
                     tooltip=(
                         "Enable tiled encoding to reduce VRAM usage during the encoding phase.\n"
@@ -95,7 +95,7 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                     )
                 ),
                 io.Boolean.Input("decode_tiled",
-                    default=True,
+                    default=False,
                     optional=True,
                     tooltip=(
                         "Enable tiled decoding to reduce VRAM usage during the decoding phase.\n"
@@ -194,7 +194,7 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                 ),
                 io.Combo.Input("vae_precision",
                     options=["auto", "fp16", "bf16", "fp8_e4m3fn"],
-                    default="auto",
+                    default="bf16",
                     optional=True,
                     tooltip=(
                         "VAE model precision override:\n"

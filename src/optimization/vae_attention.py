@@ -1,20 +1,21 @@
 """
-VAE Standard Attention Module for Blackwell GPUs (Speed Optimized)
+VAE SageAttention 2 (SA2) Optimized Module for Blackwell GPUs
 
-This module provides standard PyTorch SDPA (Scaled Dot-Product Attention) for VAE attention blocks.
-The experimental Sparge/SageAttention 2 kernels have been removed for stability.
+This module provides SA2-optimized attention for VAE attention blocks on Blackwell GPUs (RTX 50 series).
 
 Key Features:
-- Uses standard torch.nn.functional.scaled_dot_product_attention (natively optimized for all GPUs)
-- Fast-path SDPA with sdp_kernel context manager for maximum speed
-- Sliced SDPA fallback for very large sequence lengths (> 4096)
-- Verbose logging to show which backend is being used (FlashAttention, Memory Efficient, etc.)
-- Stable operation on 16GB GPUs (Blackwell RTX 50xx)
+- Dynamic head splitting: 512-dim → 8 heads × 64 dim (Blackwell Tensor Core sweet spot)
+- SageAttention 2 integration with INT8/FP8 quantization for maximum speed
+- Automatic fallback to standard SDPA if SA2 is unavailable
+- Verbose logging to show which backend is being used
+- Memory-efficient operation on 16GB GPUs (Blackwell RTX 50xx)
 
-NOTE: Sparge attention is no longer used for VAE. The original 1 head × 512 dim structure
-is maintained. Standard SDPA is natively optimized by PyTorch for Blackwell GPUs.
+NOTE: This implementation reshapes 1 head × 512 dim to 8 heads × 64 dim in the forward pass,
+preserving the original weights while enabling faster SA2/FlashAttention kernels.
 """
 
+import os
+import gc
 import torch
 import torch.nn.functional as F
 import logging
@@ -26,26 +27,46 @@ logger = logging.getLogger("SeedVR2.VAE.Attention")
 # Track if we've logged kernel info once (avoid per-call logging overhead on Windows)
 _vae_kernel_logged_once = False
 
-# Enable verbose logging for SDPA backend selection
-_verbose_sdpa_logging = True
+# Enable verbose logging for SA2 backend selection
+_verbose_sa2_logging = True
+
+# SA2 availability check (cached)
+_sa2_available = None
+
+# Blackwell memory guard: Set expandable_segments for better fragmentation handling
+try:
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+except Exception:
+    pass
+
+
+def _check_sa2_available() -> bool:
+    """Check if SageAttention 2 is available."""
+    global _sa2_available
+    if _sa2_available is None:
+        try:
+            from sageattention import sageattn
+            _sa2_available = True
+        except ImportError:
+            _sa2_available = False
+    return _sa2_available
 
 
 def is_vae_sparge_available() -> bool:
     """
-    Check if VAE Sparge attention is available.
+    Check if VAE SA2/Sparge attention is available.
     
-    Always returns False - Sparge attention has been disabled for VAE
-    in favor of standard SDPA for stability.
+    Returns True if SageAttention 2 is installed and can be used.
     """
-    return False
+    return _check_sa2_available()
 
 
 def set_vae_sparsity_threshold(threshold: float):
     """
     Set the global sparsity threshold for VAE attention.
     
-    NOTE: This function is kept for API compatibility but has no effect.
-    Sparge attention has been disabled for VAE.
+    NOTE: This function is kept for API compatibility.
+    SA2 does not use sparsity thresholds.
     """
     pass
 
@@ -55,9 +76,83 @@ def get_vae_sparsity_threshold() -> float:
     Get the current VAE sparsity threshold.
     
     NOTE: This function is kept for API compatibility.
-    Sparge attention has been disabled for VAE.
+    SA2 does not use sparsity thresholds.
     """
     return 0.5
+
+
+def _split_heads_for_blackwell(tensor: torch.Tensor, target_heads: int = 8) -> torch.Tensor:
+    """
+    Split 512-dim tensor into 8 heads × 64 dim for Blackwell Tensor Core optimization.
+    
+    Args:
+        tensor: Input tensor (batch, 1, seq_len, 512)
+        target_heads: Number of heads to split into (default: 8)
+        
+    Returns:
+        Reshaped tensor (batch, 8, seq_len, 64)
+    """
+    batch, heads, seq_len, dim = tensor.shape
+    assert heads == 1, f"Expected 1 head, got {heads}"
+    assert dim % target_heads == 0, f"Dimension {dim} not divisible by {target_heads}"
+    
+    new_head_dim = dim // target_heads
+    # Reshape: (batch, 1, seq_len, 512) -> (batch, seq_len, 8, 64) -> (batch, 8, seq_len, 64)
+    return tensor.squeeze(1).view(batch, seq_len, target_heads, new_head_dim).transpose(1, 2)
+
+
+def _merge_heads_from_blackwell(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Merge 8 heads × 64 dim back to 1 head × 512 dim after attention.
+    
+    Args:
+        tensor: Input tensor (batch, 8, seq_len, 64)
+        
+    Returns:
+        Merged tensor (batch, 1, seq_len, 512)
+    """
+    batch, heads, seq_len, head_dim = tensor.shape
+    # Reshape: (batch, 8, seq_len, 64) -> (batch, seq_len, 8, 64) -> (batch, seq_len, 512) -> (batch, 1, seq_len, 512)
+    return tensor.transpose(1, 2).contiguous().view(batch, seq_len, heads * head_dim).unsqueeze(1)
+
+
+def _sa2_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scale: Optional[float] = None,
+) -> torch.Tensor:
+    """
+    Compute attention using SageAttention 2 with INT8 quantization.
+    
+    Args:
+        query: Query tensor (batch, heads, seq_len, head_dim)
+        key: Key tensor (batch, heads, seq_len, head_dim)
+        value: Value tensor (batch, heads, seq_len, head_dim)
+        scale: Softmax scale (default: 1/sqrt(head_dim))
+        
+    Returns:
+        Attention output tensor (batch, heads, seq_len, head_dim)
+    """
+    from sageattention import sageattn
+    
+    batch, heads, seq_len, head_dim = query.shape
+    
+    if scale is None:
+        scale = head_dim ** -0.5
+    
+    # SA2 expects (batch, heads, seq_len, head_dim) format - which is what we have
+    # Use tensor_layout="HND" for proper shape handling
+    output = sageattn(
+        query.contiguous(),
+        key.contiguous(),
+        value.contiguous(),
+        tensor_layout="HND",
+        is_causal=False,
+        sm_scale=scale,
+    )
+    
+    return output
 
 
 def _sliced_sdpa(
@@ -124,12 +219,12 @@ def standard_vae_attention(
     scale: Optional[float] = None,
 ) -> torch.Tensor:
     """
-    Compute VAE attention using standard PyTorch SDPA with Fast-Path optimization.
+    Compute VAE attention using SA2-optimized path with dynamic head splitting.
     
-    This is the stable, production-ready path for VAE attention on all GPUs.
-    PyTorch's SDPA is natively optimized for Blackwell GPUs.
-    
-    Uses sdp_kernel context manager to force the fastest available backend.
+    For Blackwell GPUs, this:
+    1. Splits 1 head × 512 dim into 8 heads × 64 dim
+    2. Applies SageAttention 2 (or FlashAttention if SA2 unavailable)
+    3. Merges back to 1 head × 512 dim
     
     Args:
         query: Query tensor (batch, heads, seq_len, head_dim) in HND layout
@@ -141,54 +236,89 @@ def standard_vae_attention(
     Returns:
         Attention output tensor (batch, heads, seq_len, head_dim)
     """
-    global _vae_kernel_logged_once, _verbose_sdpa_logging
+    global _vae_kernel_logged_once, _verbose_sa2_logging
     
     batch, heads, seq_len, head_dim = query.shape
     
     if scale is None:
         scale = head_dim ** -0.5
     
-    # Verbose SDPA logging - show backend selection on first call
+    # Determine if we should use head splitting (only for 1 head × 512 dim VAE structure)
+    use_head_splitting = (heads == 1 and head_dim == 512)
+    sa2_available = _check_sa2_available()
+    
+    # Verbose logging - show backend selection on first call
     if not _vae_kernel_logged_once:
         _vae_kernel_logged_once = True
         
-        # Determine which backend will be used
-        backend_info = "Unknown"
-        try:
-            # Check available backends
-            flash_available = hasattr(torch.backends.cuda, 'flash_sdp_enabled') and torch.backends.cuda.flash_sdp_enabled()
-            mem_efficient_available = hasattr(torch.backends.cuda, 'mem_efficient_sdp_enabled') and torch.backends.cuda.mem_efficient_sdp_enabled()
-            math_available = hasattr(torch.backends.cuda, 'math_sdp_enabled') and torch.backends.cuda.math_sdp_enabled()
-            
-            # FlashAttention requires head_dim in [8, 128] and power of 2, or 64/128
-            if flash_available and head_dim in [64, 128]:
-                backend_info = "FlashAttention (Fastest)"
-            elif mem_efficient_available:
-                backend_info = "Memory Efficient"
-            elif math_available:
-                backend_info = "Math (Fallback)"
-            else:
-                backend_info = "CUDA Default"
-        except Exception:
-            backend_info = "PyTorch Default"
-        
-        # Print verbose debug info to terminal
-        print(f"[DEBUG] VAE Attention: Executing via Native SDPA (1 head x {head_dim} dim)")
-        print(f"[DEBUG] VAE Attention Backend: {backend_info}")
-        print(f"[DEBUG] VAE Attention Shape: Q/K/V = ({batch}, {heads}, {seq_len}, {head_dim})")
-        print(f"[DEBUG] VAE Attention Scale: {scale:.6f}")
-        
-        logger.info(
-            f"VAE Standard SDPA: heads={heads}, head_dim={head_dim}, "
-            f"seq_len={seq_len}, scale={scale:.4f}, backend={backend_info}"
-        )
+        if use_head_splitting and sa2_available:
+            print(f"[DEBUG] SA2 Optimized Forward Pass: Active")
+            print(f"[DEBUG] VAE Attention: Reshaping 1 head x 512 dim → 8 heads x 64 dim")
+            print(f"[DEBUG] VAE Attention Backend: SageAttention 2 (INT8 Quantized)")
+            print(f"[DEBUG] VAE Attention Shape: Q/K/V = ({batch}, 8, {seq_len}, 64)")
+            logger.info("VAE SA2 Optimized: heads=8, head_dim=64 (dynamic split from 512)")
+        elif use_head_splitting:
+            print(f"[DEBUG] VAE Attention: Reshaping 1 head x 512 dim → 8 heads x 64 dim")
+            print(f"[DEBUG] VAE Attention Backend: FlashAttention/SDPA (SA2 not available)")
+            print(f"[DEBUG] VAE Attention Shape: Q/K/V = ({batch}, 8, {seq_len}, 64)")
+            logger.info("VAE FlashAttention: heads=8, head_dim=64 (dynamic split from 512)")
+        else:
+            print(f"[DEBUG] VAE Attention: Executing via Native SDPA ({heads} head x {head_dim} dim)")
+            print(f"[DEBUG] VAE Attention Shape: Q/K/V = ({batch}, {heads}, {seq_len}, {head_dim})")
+            logger.info(f"VAE Standard SDPA: heads={heads}, head_dim={head_dim}")
     
     # Use sliced SDPA for very large sequence lengths to prevent OOM
     if seq_len > 4096:
         return _sliced_sdpa(query, key, value, attention_mask=attention_mask, scale=scale)
     
-    # Fast-Path SDPA with sdp_kernel context manager
-    # Force the fastest available backend: Flash > Memory Efficient > Math
+    # SA2-optimized path with dynamic head splitting for 1 head × 512 dim VAE
+    if use_head_splitting:
+        # Split to 8 heads × 64 dim
+        q_split = _split_heads_for_blackwell(query)
+        k_split = _split_heads_for_blackwell(key)
+        v_split = _split_heads_for_blackwell(value)
+        
+        # Adjust scale for new head dimension
+        new_scale = 64 ** -0.5
+        
+        if sa2_available:
+            # Use SageAttention 2
+            try:
+                out_split = _sa2_attention(q_split, k_split, v_split, scale=new_scale)
+            except Exception as e:
+                logger.warning(f"SA2 failed, falling back to SDPA: {e}")
+                with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
+                    out_split = F.scaled_dot_product_attention(
+                        q_split, k_split, v_split,
+                        attn_mask=None,
+                        dropout_p=0.0,
+                        is_causal=False,
+                        scale=new_scale
+                    )
+        else:
+            # Use FlashAttention via SDPA (head_dim=64 enables FlashAttention)
+            try:
+                with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
+                    out_split = F.scaled_dot_product_attention(
+                        q_split, k_split, v_split,
+                        attn_mask=None,
+                        dropout_p=0.0,
+                        is_causal=False,
+                        scale=new_scale
+                    )
+            except Exception:
+                out_split = F.scaled_dot_product_attention(
+                    q_split, k_split, v_split,
+                    attn_mask=None,
+                    dropout_p=0.0,
+                    is_causal=False,
+                    scale=new_scale
+                )
+        
+        # Merge back to 1 head × 512 dim
+        return _merge_heads_from_blackwell(out_split)
+    
+    # Standard path for non-512 dim VAE models
     try:
         with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
             return F.scaled_dot_product_attention(
