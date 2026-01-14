@@ -12,6 +12,7 @@
 
 from contextlib import nullcontext
 from typing import Literal, Optional, Tuple, Union
+import gc
 import diffusers
 import torch
 import torch.nn as nn
@@ -1271,6 +1272,10 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                                 if isinstance(m, InflatedCausalConv3d) and m.memory is not None]
             for m in modules_with_memory:
                 m.memory = None
+            # Aggressive garbage collection at the end of slicing loops
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             return out
         else:
             return self._encode(x)
@@ -1295,6 +1300,10 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                                 if isinstance(m, InflatedCausalConv3d) and m.memory is not None]
             for m in modules_with_memory:
                 m.memory = None
+            # Aggressive garbage collection at the end of slicing loops
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             return out
         else:
             return self._decode(z)
