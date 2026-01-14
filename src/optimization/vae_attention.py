@@ -40,6 +40,15 @@ _sa2_available = None
 # Current phase context
 _current_phase: Literal["encoder", "decoder", "unknown"] = "unknown"
 
+# NEW: UI-controlled SA2 toggles (set at runtime from node inputs)
+_encoder_sa2_enabled = True  # Default: True for Encoder
+_decoder_sa2_enabled = False  # Default: False for Decoder
+
+# Logging flags to avoid spam
+_encoder_logged_once = False
+_decoder_logged_once = False
+_attention_call_count = 0
+
 # Memory policy: expandable_segments for Blackwell
 try:
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -53,6 +62,33 @@ def set_vae_phase(phase: Literal["encoder", "decoder", "unknown"]):
     _current_phase = phase
     _attention_block_counter = 0  # Reset counter for each phase
     print(f"[GGUF-SA2] Phase set to: {phase.upper()}")
+
+
+def configure_vae_sa2(encoder_sa2: bool = True, decoder_sa2: bool = False):
+    """
+    Configure SA2 enablement for Encoder and Decoder from UI toggles.
+    
+    Called BEFORE VAE processing to set the runtime behavior based on node inputs.
+    
+    Args:
+        encoder_sa2: Enable SA2 for Encoder (Phase 1) - default True
+        decoder_sa2: Enable SA2 for Decoder (Phase 3) - default False
+    """
+    global _encoder_sa2_enabled, _decoder_sa2_enabled, _encoder_logged_once, _decoder_logged_once
+    
+    _encoder_sa2_enabled = encoder_sa2
+    _decoder_sa2_enabled = decoder_sa2
+    _encoder_logged_once = False
+    _decoder_logged_once = False
+    
+    encoder_backend = "SA2" if encoder_sa2 else "Stable FlashAttn"
+    decoder_backend = "SA2" if decoder_sa2 else "Stable FlashAttn"
+    
+    print("=" * 70)
+    print(f"[VAE-CTRL] CONFIGURATION APPLIED:")
+    print(f"[VAE-CTRL] Encoder (Phase 1): {encoder_backend}")
+    print(f"[VAE-CTRL] Decoder (Phase 3): {decoder_backend}")
+    print("=" * 70)
 
 
 def _check_sa2_available() -> bool:
@@ -464,24 +500,29 @@ def reset_vae_attention_logging():
 
 def _gguf_sa2_patched_forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, **kwargs):
     """
-    GGUF VAE CLASS-LEVEL PATCHED Attention.forward with SA2.
+    UNIVERSAL VAE CLASS-LEVEL PATCHED Attention.forward with CONDITIONAL SA2/FlashAttn.
     
-    This is the ULTIMATE patched forward that:
-    1. Works for GGUF VAE (ema_vae_fp16-f16.gguf) and safetensors
-    2. Forces num_heads=8, head_dim=64 for query_dim=512
-    3. Uses torch.bfloat16 for all attention computations
-    4. Prints [GGUF-SA2-CORE-ACTIVE] FOR EVERY SINGLE ATTENTION BLOCK
-    5. Forces sage_attn as primary backend
+    This patched forward:
+    1. Works for GGUF VAE (ema_vae_fp16-f16.gguf) and safetensors (FP16/BF16)
+    2. Uses UI toggles (vae_encoder_sa2, vae_decoder_sa2) to select backend
+    3. SA2 path: Forces num_heads=8, head_dim=64 for query_dim=512
+    4. FlashAttn path: Uses stable PyTorch FlashAttention/SDPA
+    5. Verbose logging for every attention block
     
     GOAL: Phase 1 ~5-8s, Phase 3 ~15-20s on RTX 5070 Ti
     """
-    global _current_phase, _attention_block_counter
+    global _current_phase, _attention_block_counter, _encoder_sa2_enabled, _decoder_sa2_enabled
     _attention_block_counter += 1
     
+    # Determine if SA2 should be used based on UI toggles
+    is_encoder = _current_phase == "encoder"
+    is_decoder = _current_phase == "decoder"
+    use_sa2 = (is_encoder and _encoder_sa2_enabled) or (is_decoder and _decoder_sa2_enabled)
+    
     # ========== MANDATORY VERBOSE LOGGING ==========
-    # This MUST print for EVERY SINGLE ATTENTION BLOCK
-    phase_name = "Encoder" if _current_phase == "encoder" else ("Decoder" if _current_phase == "decoder" else "VAE")
-    print(f"[GGUF-SA2-CORE-ACTIVE] Phase: {phase_name} | Block: {_attention_block_counter} | Heads: 8 | Dim: 64")
+    phase_name = "Encoder" if is_encoder else ("Decoder" if is_decoder else "VAE")
+    backend_name = "SA2" if use_sa2 else "FlashAttn"
+    print(f"[VAE-ATTN] Phase: {phase_name} | Block: {_attention_block_counter} | Backend: {backend_name} | Heads: 8 | Dim: 64")
     
     # Input processing
     residual = hidden_states
@@ -527,7 +568,7 @@ def _gguf_sa2_patched_forward(self, hidden_states, encoder_hidden_states=None, a
         num_heads = inner_dim // head_dim  # 512 / 64 = 8
     else:
         # Fallback for non-standard dimensions
-        print(f"[GGUF-SA2-WARNING] inner_dim={inner_dim} not divisible by 64")
+        print(f"[VAE-ATTN-WARNING] inner_dim={inner_dim} not divisible by 64")
         num_heads = self.heads
         head_dim = inner_dim // num_heads
     
@@ -539,10 +580,11 @@ def _gguf_sa2_patched_forward(self, hidden_states, encoder_hidden_states=None, a
     
     scale = head_dim ** -0.5
     
-    # ========== FORCE SAGE_ATTN AS PRIMARY BACKEND ==========
+    # ========== CONDITIONAL BACKEND BASED ON UI TOGGLES ==========
     sa2_available = _check_sa2_available()
     
-    if sa2_available:
+    if use_sa2 and sa2_available:
+        # SA2 PATH: Use SageAttention 2 (selected via UI toggle)
         try:
             from sageattention import sageattn
             # SA2 with bfloat16
@@ -555,7 +597,7 @@ def _gguf_sa2_patched_forward(self, hidden_states, encoder_hidden_states=None, a
                 sm_scale=scale,
             )
         except Exception as e:
-            print(f"[GGUF-SA2-FALLBACK] sage_attn failed: {e}, using FlashAttention")
+            print(f"[VAE-ATTN-FALLBACK] SA2 failed: {e}, using FlashAttention")
             try:
                 with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
                     hidden_states = F.scaled_dot_product_attention(
@@ -574,7 +616,7 @@ def _gguf_sa2_patched_forward(self, hidden_states, encoder_hidden_states=None, a
                     scale=scale
                 )
     else:
-        # FlashAttention/SDPA fallback
+        # FlashAttention/SDPA PATH: Stable attention (selected via UI toggle)
         try:
             with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
                 hidden_states = F.scaled_dot_product_attention(

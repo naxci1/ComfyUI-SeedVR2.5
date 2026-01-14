@@ -213,6 +213,46 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                         "  - Also works on RTX 40xx (Ada) with reduced precision"
                     )
                 ),
+                io.Boolean.Input("vae_encoder_sa2",
+                    default=True,
+                    optional=True,
+                    tooltip=(
+                        "Enable SageAttention 2 (SA2) for VAE Encoder (Phase 1).\n"
+                        "\n"
+                        "• True (default): Use SA2 with 8 heads × 64-dim for Blackwell optimization\n"
+                        "• False: Use stable FlashAttention/SDPA fallback\n"
+                        "\n"
+                        "SA2 provides faster encoding on RTX 50xx GPUs."
+                    )
+                ),
+                io.Boolean.Input("vae_decoder_sa2",
+                    default=False,
+                    optional=True,
+                    tooltip=(
+                        "Enable SageAttention 2 (SA2) for VAE Decoder (Phase 3).\n"
+                        "\n"
+                        "• True: Use SA2 with 8 heads × 64-dim for Blackwell optimization\n"
+                        "• False (default): Use stable FlashAttention/SDPA to prevent artifacts\n"
+                        "\n"
+                        "Recommended: Keep disabled for best quality output."
+                    )
+                ),
+                io.Int.Input("vae_tile_size",
+                    default=1024,
+                    min=256,
+                    max=2048,
+                    step=64,
+                    optional=True,
+                    tooltip=(
+                        "Override tile size for both encode and decode (default: 1024).\n"
+                        "\n"
+                        "• 1024: Allows bypassing tiles on 720p when SA2 is active\n"
+                        "• 512: Recommended for 16GB VRAM GPUs (Blackwell)\n"
+                        "• 256-384: Use for very limited VRAM or 4K resolutions\n"
+                        "\n"
+                        "This setting overrides encode_tile_size and decode_tile_size."
+                    )
+                ),
                 io.Custom("TORCH_COMPILE_ARGS").Input("torch_compile_args",
                     optional=True,
                     tooltip=(
@@ -237,7 +277,9 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                      decode_tiled: bool = True, decode_tile_size: int = 512, 
                      decode_tile_overlap: int = 64, tile_debug: str = "false",
                      enable_sparge_attention: bool = True, performance_mode: str = "Balanced",
-                     vae_precision: str = "auto", torch_compile_args: Dict[str, Any] = None
+                     vae_precision: str = "auto", vae_encoder_sa2: bool = True,
+                     vae_decoder_sa2: bool = False, vae_tile_size: int = 1024,
+                     torch_compile_args: Dict[str, Any] = None
                      ) -> io.NodeOutput:
         """
         Create VAE model configuration for SeedVR2 main node
@@ -257,6 +299,9 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
             enable_sparge_attention: Enable Sparge block-sparse attention for VAE
             performance_mode: Performance tuning for Sparge ('Fast', 'Balanced', 'High Quality')
             vae_precision: Precision override ('auto', 'fp16', 'bf16', 'fp8_e4m3fn')
+            vae_encoder_sa2: Enable SA2 for VAE Encoder (Phase 1)
+            vae_decoder_sa2: Enable SA2 for VAE Decoder (Phase 3)
+            vae_tile_size: Override tile size for both encode and decode
             torch_compile_args: Optional torch.compile configuration from settings node
             
         Returns:
@@ -303,16 +348,31 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
             # Auto-detect from filename
             is_fp8_model = "fp8" in model.lower() or "e4m3fn" in model.lower()
         
+        # Apply vae_tile_size override if set (overrides individual tile sizes)
+        effective_encode_tile_size = vae_tile_size if vae_tile_size != 1024 else encode_tile_size
+        effective_decode_tile_size = vae_tile_size if vae_tile_size != 1024 else decode_tile_size
+        
+        # If vae_tile_size is explicitly set to 1024, use it for both
+        if vae_tile_size == 1024:
+            effective_encode_tile_size = 1024
+            effective_decode_tile_size = 1024
+        
+        # Print VAE control status
+        encoder_backend = "SA2" if vae_encoder_sa2 else "Stable FlashAttn"
+        decoder_backend = "SA2" if vae_decoder_sa2 else "Stable FlashAttn"
+        print(f"[VAE-CTRL] Encoder: {encoder_backend} | Decoder: {decoder_backend}")
+        print(f"[VAE-CTRL] Tile Size: {vae_tile_size} | Precision: {vae_precision}")
+        
         config = {
             "model": model,
             "device": device,
             "offload_device": offload_device,
             "cache_model": cache_model,
             "encode_tiled": encode_tiled,
-            "encode_tile_size": encode_tile_size,
+            "encode_tile_size": effective_encode_tile_size,
             "encode_tile_overlap": encode_tile_overlap,
             "decode_tiled": decode_tiled,
-            "decode_tile_size": decode_tile_size,
+            "decode_tile_size": effective_decode_tile_size,
             "decode_tile_overlap": decode_tile_overlap,
             "tile_debug": tile_debug,
             "torch_compile_args": torch_compile_args,
@@ -324,5 +384,9 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
             "vae_precision": vae_precision,
             "is_fp8_model": is_fp8_model,
             "blackwell_detected": BLACKWELL_GPU_DETECTED,
+            # NEW: SA2 control per Encoder/Decoder
+            "vae_encoder_sa2": vae_encoder_sa2,
+            "vae_decoder_sa2": vae_decoder_sa2,
+            "vae_tile_size": vae_tile_size,
         }
         return io.NodeOutput(config)
