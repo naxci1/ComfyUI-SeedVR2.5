@@ -7,7 +7,7 @@ to accelerate decoding using block-sparse attention patterns. Optimized for NVID
 
 Key Features:
 - Monkey-patches diffusers.models.attention_processor.Attention.forward
-- Uses call_sparge_sage2 Triton kernel for VAE attention
+- Uses spas_sage2_attn_meansim_topk_cuda Triton kernel for VAE attention
 - Maps VAE spatial attention (B, C, H, W) to sequence format (B, H, seq, D)
 - Targets Attention blocks in MidBlock2D and UpDecoderBlock2D of the VAE
 - Hardcoded Blackwell tuning: num_warps=8, num_stages=3, block_m=128, block_n=64
@@ -41,7 +41,8 @@ def set_vae_sparsity_threshold(threshold: float):
     Set the global sparsity threshold for VAE attention.
     
     Args:
-        threshold: Sparsity ratio (0.0-1.0). Lower = more sparsity = faster but less accurate
+        threshold: Sparsity ratio (0.0, 1.0]. Lower = more sparsity = faster but less accurate.
+                   Note: 0.0 (full sparsity) is not allowed as it would zero out attention.
                    - 0.3: Fast mode
                    - 0.5: Balanced mode (default)
                    - 0.7: Quality mode
