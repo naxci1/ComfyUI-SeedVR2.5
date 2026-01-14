@@ -118,6 +118,10 @@ ensure_bitsandbytes_safe()
 import torch
 import os
 import math
+import logging
+
+# Configure logging for Blackwell optimization verification
+logger = logging.getLogger("SeedVR2.Blackwell")
 
 
 # Flash/Sage Attention & Triton Compatibility Layer
@@ -918,9 +922,12 @@ def call_sparge_sage2_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
         perf_mode = f"Custom({topk})"
     
     # Verification logging for Blackwell optimization using config constants
-    print(f"!!! Blackwell Optimization Active: Mode={perf_mode}, Threshold={topk}, "
-          f"Warps={Sage2BlackwellConfig.TRITON_NUM_WARPS}, Stages={Sage2BlackwellConfig.TRITON_NUM_STAGES}, "
-          f"BlockM={Sage2BlackwellConfig.TRITON_BLOCK_M}, BlockN={Sage2BlackwellConfig.TRITON_BLOCK_N}")
+    # Use both print (stdout) and logging.info (ComfyUI console) for maximum visibility
+    blackwell_msg = (f"!!! BLACKWELL EXECUTION: Mode={perf_mode}, Threshold={topk}, "
+                     f"Warps={Sage2BlackwellConfig.TRITON_NUM_WARPS}, Stages={Sage2BlackwellConfig.TRITON_NUM_STAGES}, "
+                     f"BlockM={Sage2BlackwellConfig.TRITON_BLOCK_M}, BlockN={Sage2BlackwellConfig.TRITON_BLOCK_N}")
+    print(blackwell_msg, flush=True)  # Force flush for immediate visibility
+    logger.info(blackwell_msg)
     
     # SpargeAttn requires half precision (fp16/bf16)
     out_dtype = q.dtype

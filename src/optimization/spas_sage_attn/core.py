@@ -15,6 +15,10 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 import math
+import logging
+
+# Configure logging for Blackwell kernel verification
+logger = logging.getLogger("SeedVR2.Blackwell")
 
 # Try to import Triton - required for JIT compilation
 # Supports both regular triton and triton-windows packages
@@ -392,7 +396,9 @@ def spas_sage2_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=
         num_stages = config.get('num_stages', 4)
         block_m = config.get('BLOCK_M', 128)
         block_n = config.get('BLOCK_N', 64)
-        print(f"!!! Sparge_Sage2 Kernel: topk={topk}, Blackwell=True, Warps={num_warps}, Stages={num_stages}, BlockM={block_m}, BlockN={block_n}")
+        kernel_msg = f"!!! Sparge_Sage2 Kernel: topk={topk}, Blackwell=True, Warps={num_warps}, Stages={num_stages}, BlockM={block_m}, BlockN={block_n}"
+        print(kernel_msg, flush=True)  # Force flush for immediate visibility
+        logger.info(kernel_msg)
     
     # Sage2 uses same implementation as Sage1 for Triton-only version
     # The difference is in CUDA kernel optimizations (Sage2++) which require compilation

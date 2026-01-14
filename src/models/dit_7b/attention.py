@@ -14,6 +14,10 @@
 
 import torch
 import torch.nn.functional as F
+import logging
+
+# Configure logging for attention mode verification
+logger = logging.getLogger("SeedVR2.Attention")
 
 # Import flash/sage attn with automatic fallback from compatibility layer
 from ...optimization.compatibility import (
@@ -154,7 +158,8 @@ class FlashAttentionVarlen(nn.Module):
                 max_seqlen_q, max_seqlen_k, topk=self.sparsity_threshold, **kwargs
             )
         else:
-            # PyTorch SDPA
+            # PyTorch SDPA - Log warning that Blackwell optimization is NOT active
+            logger.warning(f"!!! WARNING: Blackwell optimization skipped. Current attention_mode: {self.attention_mode}")
             return pytorch_varlen_attention(
                 q, k, v, cu_seqlens_q, cu_seqlens_k,
                 max_seqlen_q, max_seqlen_k, **kwargs
