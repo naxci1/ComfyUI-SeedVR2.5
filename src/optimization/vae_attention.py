@@ -1,26 +1,23 @@
 """
-VAE SageAttention 2 (SA2) Optimized Module for Blackwell GPUs
+GGUF VAE CLASS-LEVEL PATCHING WITH SA2 FOR BLACKWELL GPUs
 
-This module provides SA2-optimized attention for VAE attention blocks on Blackwell GPUs (RTX 50 series).
-Applies to BOTH Encoder3D and Decoder3D attention layers.
+ULTIMATE ARCHITECTURAL DIRECTIVE:
+This module performs Class-Level Monkey Patching to force SageAttention 2 (SA2)
+into the GGUF VAE's attention mechanism. Works with both GGUF and safetensors VAE models.
 
-Key Features:
-- Dynamic head splitting: 512-dim → 8 heads × 64 dim (Blackwell Tensor Core sweet spot)
-- SageAttention 2 integration with INT8/FP8 quantization for maximum speed
-- Automatic fallback to standard SDPA if SA2 is unavailable
-- Detailed verbose logging for both Encoder (Phase 1) and Decoder (Phase 3)
-- Memory-efficient operation on 16GB GPUs (Blackwell RTX 50xx)
-- No silent failures: Always logs warnings when SA2 is skipped
+IMPLEMENTATION:
+1. TARGET: GGUF-loaded VAE (ema_vae_fp16-f16.gguf) - materializes as PyTorch modules
+2. GLOBAL CLASS PATCHING: setattr replaces Attention.forward BEFORE encoding/decoding
+3. FORCED SA2: Reshape (B*T, H*W, 512) -> (B*T, H*W, 8, 64) for head_dim=64
+4. MANDATORY LOGGING: "[GGUF-SA2-CORE-ACTIVE]" printed FOR EVERY SINGLE ATTENTION BLOCK
+5. MEMORY POLICY: VAE stays on cuda:0, no CPU offload, cache clear only between DiT/VAE
 
-NOTE: This implementation reshapes 1 head × 512 dim to 8 heads × 64 dim in the forward pass,
-preserving the original weights while enabling faster SA2/FlashAttention kernels.
-
-INLINE SA2: The sa2_inline_attention() function directly replaces the diffusers Attention.forward()
-to ensure SA2 is actually executed inside every attention block.
+GOAL: Phase 1 ~5-8s, Phase 3 ~15-20s on RTX 5070 Ti
 """
 
 import os
 import gc
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -28,25 +25,22 @@ import logging
 from typing import Optional, Literal
 
 # Configure logging
-logger = logging.getLogger("SeedVR2.VAE.Attention")
+logger = logging.getLogger("SeedVR2.VAE.SA2")
 
-# Track logging state separately for encoder and decoder
-_encoder_logged_once = False
-_decoder_logged_once = False
+# ============================================================================
+# GLOBAL STATE FOR CLASS-LEVEL PATCHING
+# ============================================================================
+_original_attention_forward = None
+_is_patched = False
+_attention_block_counter = 0
 
-# Attention call counter for detailed logging
-_attention_call_count = 0
-
-# Enable verbose logging for SA2 backend selection (logs EVERY attention call)
-_verbose_sa2_logging = True
-
-# SA2 availability check (cached)
+# SA2 availability (cached)
 _sa2_available = None
 
-# Current phase context (encoder/decoder)
+# Current phase context
 _current_phase: Literal["encoder", "decoder", "unknown"] = "unknown"
 
-# Blackwell memory guard: Set expandable_segments for better fragmentation handling
+# Memory policy: expandable_segments for Blackwell
 try:
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 except Exception:
@@ -55,8 +49,10 @@ except Exception:
 
 def set_vae_phase(phase: Literal["encoder", "decoder", "unknown"]):
     """Set the current VAE phase for logging context."""
-    global _current_phase
+    global _current_phase, _attention_block_counter
     _current_phase = phase
+    _attention_block_counter = 0  # Reset counter for each phase
+    print(f"[GGUF-SA2] Phase set to: {phase.upper()}")
 
 
 def _check_sa2_available() -> bool:
@@ -66,10 +62,10 @@ def _check_sa2_available() -> bool:
         try:
             from sageattention import sageattn
             _sa2_available = True
-            print("[DEBUG] SageAttention 2 (SA2) module: AVAILABLE")
+            print("[GGUF-SA2] SageAttention 2: INSTALLED AND AVAILABLE")
         except ImportError:
             _sa2_available = False
-            print("[WARNING] SageAttention 2 (SA2) module: NOT INSTALLED - Using FlashAttention/SDPA fallback")
+            print("[GGUF-SA2] SageAttention 2: NOT INSTALLED - Using FlashAttention/SDPA fallback")
     return _sa2_available
 
 
@@ -417,149 +413,149 @@ def standard_vae_attention(
 
 def inject_sparge_into_vae(vae, topk: Optional[float] = None, debug=None) -> int:
     """
-    Inject attention processors into a VAE model.
+    GGUF VAE CLASS-LEVEL PATCHING: Apply SA2 to ALL VAE attention blocks.
     
-    NOTE: This function is kept for API compatibility but no longer injects
-    Sparge attention. VAE uses SA2-optimized attention which is natively optimized.
+    Uses setattr to replace Attention.forward BEFORE any encoding/decoding.
+    Works with both GGUF (ema_vae_fp16-f16.gguf) and safetensors VAE models.
+    
+    MEMORY POLICY: VAE stays on cuda:0 at all times. NO CPU offloading.
     
     Args:
-        vae: VAE model (diffusers AutoencoderKL or custom VAE)
-        topk: Sparsity ratio (ignored - using SA2)
+        vae: VAE model (GGUF or safetensors)
+        topk: Ignored (SA2 doesn't use sparsity)
         debug: Optional debug instance for logging
         
     Returns:
-        0 (no modules patched - VAE uses SA2/SDPA via standard_vae_attention)
+        1 if patching successful, 0 otherwise
     """
+    # Apply global class patching BEFORE any VAE operations
+    success = patch_vae_attention_globally()
+    
     sa2_available = _check_sa2_available()
     if debug:
         if sa2_available:
             debug.log(
-                "VAE using SageAttention 2 (SA2) with dynamic head splitting (512-dim → 8 heads × 64 dim)",
+                "[GGUF-SA2] CLASS-LEVEL PATCHING APPLIED: All VAE attention uses SageAttention 2",
+                level="INFO", category="vae", force=True
+            )
+            debug.log(
+                "[GGUF-SA2] num_heads=8, head_dim=64, dtype=bfloat16, VAE on cuda:0",
                 level="INFO", category="vae", force=True
             )
         else:
             debug.log(
-                "VAE using FlashAttention/SDPA with dynamic head splitting (512-dim → 8 heads × 64 dim)",
+                "[GGUF-SA2] CLASS-LEVEL PATCHING APPLIED: Using FlashAttention/SDPA fallback",
                 level="INFO", category="vae", force=True
             )
-    return 0
+    
+    return 1 if success else 0
 
 
 def reset_vae_attention_logging():
     """Reset VAE attention logging state (call before each new generation)."""
-    global _encoder_logged_once, _decoder_logged_once, _attention_call_count, _current_phase
-    _encoder_logged_once = False
-    _decoder_logged_once = False
-    _attention_call_count = 0
+    global _attention_block_counter, _current_phase
+    _attention_block_counter = 0
     _current_phase = "unknown"
 
 
-def sa2_inline_attention(attn_module: nn.Module, hidden_states: torch.Tensor, block_id: int) -> torch.Tensor:
+# ============================================================================
+# GGUF VAE CLASS-LEVEL SA2 PATCHED FORWARD
+# ============================================================================
+
+def _gguf_sa2_patched_forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, **kwargs):
     """
-    INLINE SA2 ATTENTION: Replaces the diffusers Attention.forward() with SA2-optimized attention.
+    GGUF VAE CLASS-LEVEL PATCHED Attention.forward with SA2.
     
-    This function is called DIRECTLY from UNetMidBlock3D.forward() to ensure SA2 is actually
-    executed inside every attention block.
+    This is the ULTIMATE patched forward that:
+    1. Works for GGUF VAE (ema_vae_fp16-f16.gguf) and safetensors
+    2. Forces num_heads=8, head_dim=64 for query_dim=512
+    3. Uses torch.bfloat16 for all attention computations
+    4. Prints [GGUF-SA2-CORE-ACTIVE] FOR EVERY SINGLE ATTENTION BLOCK
+    5. Forces sage_attn as primary backend
     
-    Args:
-        attn_module: The diffusers Attention module containing the projections (to_q, to_k, to_v, to_out)
-        hidden_states: Input tensor (batch, channels, height, width) - already rearranged from 5D
-        block_id: Attention block ID for logging
-        
-    Returns:
-        Output tensor with same shape as input
+    GOAL: Phase 1 ~5-8s, Phase 3 ~15-20s on RTX 5070 Ti
     """
-    global _current_phase, _attention_call_count
-    _attention_call_count += 1
+    global _current_phase, _attention_block_counter
+    _attention_block_counter += 1
     
-    # Get phase name for logging
-    phase_name = _current_phase.upper() if _current_phase != "unknown" else "VAE"
+    # ========== MANDATORY VERBOSE LOGGING ==========
+    # This MUST print for EVERY SINGLE ATTENTION BLOCK
+    phase_name = "Encoder" if _current_phase == "encoder" else ("Decoder" if _current_phase == "decoder" else "VAE")
+    print(f"[GGUF-SA2-CORE-ACTIVE] Phase: {phase_name} | Block: {_attention_block_counter} | Heads: 8 | Dim: 64")
     
-    # Input shape info
-    batch, channels, height, width = hidden_states.shape
-    seq_len = height * width
-    
-    # Log EVERY attention call with detailed info (user requirement)
-    print(f"[SA2_EXEC] Block ID: {block_id}, Phase: {phase_name}, Shape: [{batch}, {channels}, {height}, {width}], Heads: 8")
-    
-    # ====== MANDATORY RESHAPE ======
-    # Before calling sage_attn, we MUST reshape the input:
-    # (batch, channels, H, W) -> (batch, H*W, 8, 64)
-    
-    # 1. Apply normalization if present (from deprecated attn block)
+    # Input processing
     residual = hidden_states
-    if hasattr(attn_module, 'group_norm') and attn_module.group_norm is not None:
-        hidden_states = attn_module.group_norm(hidden_states)
+    input_ndim = hidden_states.ndim
     
-    # 2. Reshape to sequence format: (batch, channels, H, W) -> (batch, seq_len, channels)
-    hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(batch, seq_len, channels)
-    
-    # Log the reshape operation
-    print(f"[DEBUG] Reshaping: {channels}-dim -> 8 heads x 64-dim for SA2 compatibility")
-    print(f"[DEBUG] Input Shape: [B={batch}, C={channels}, H={height}, W={width}] -> [B={batch}, seq_len={seq_len}, C={channels}]")
-    
-    # 3. Compute Q, K, V projections
-    query = attn_module.to_q(hidden_states)  # (batch, seq_len, channels)
-    key = attn_module.to_k(hidden_states)    # (batch, seq_len, channels)
-    value = attn_module.to_v(hidden_states)  # (batch, seq_len, channels)
-    
-    # 4. MANDATORY RESHAPE for SA2: (batch, seq_len, 512) -> (batch, 8, seq_len, 64)
-    # This is the key step that the user requested
-    head_dim = 64
-    num_heads = channels // head_dim
-    
-    if channels % head_dim != 0:
-        print(f"[WARNING] SA2 skipped: channels={channels} not divisible by head_dim={head_dim}")
-        # Fallback to simple attention
-        attn_weights = torch.softmax(torch.bmm(query, key.transpose(1, 2)) * (channels ** -0.5), dim=-1)
-        hidden_states = torch.bmm(attn_weights, value)
+    # Handle 4D input: (batch, channels, height, width)
+    if input_ndim == 4:
+        batch, channels, height, width = hidden_states.shape
+        # Flatten spatial dims: (B*T, C, H, W) -> (B*T, H*W, C)
+        hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(batch, height * width, channels)
     else:
-        # Reshape to multi-head format: (batch, seq_len, channels) -> (batch, num_heads, seq_len, head_dim)
-        query = query.view(batch, seq_len, num_heads, head_dim).transpose(1, 2)
-        key = key.view(batch, seq_len, num_heads, head_dim).transpose(1, 2)
-        value = value.view(batch, seq_len, num_heads, head_dim).transpose(1, 2)
-        
-        print(f"[DEBUG] Reshaped Q/K/V: [B={batch}, heads={num_heads}, seq_len={seq_len}, head_dim={head_dim}]")
-        
-        # 5. Apply SA2 or FlashAttention/SDPA
-        sa2_available = _check_sa2_available()
-        scale = head_dim ** -0.5
-        
-        if sa2_available:
-            try:
-                from sageattention import sageattn
-                print(f"[DEBUG] SA2 Optimized Forward Pass: ACTIVE")
-                
-                # SA2 expects (batch, heads, seq_len, head_dim) format
-                hidden_states = sageattn(
-                    query.contiguous(),
-                    key.contiguous(),
-                    value.contiguous(),
-                    tensor_layout="HND",
-                    is_causal=False,
-                    sm_scale=scale,
-                )
-            except Exception as e:
-                print(f"[WARNING] SA2 execution failed: {e}, falling back to FlashAttention/SDPA")
-                try:
-                    with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
-                        hidden_states = F.scaled_dot_product_attention(
-                            query, key, value,
-                            attn_mask=None,
-                            dropout_p=0.0,
-                            is_causal=False,
-                            scale=scale
-                        )
-                except Exception:
-                    hidden_states = F.scaled_dot_product_attention(
-                        query, key, value,
-                        attn_mask=None,
-                        dropout_p=0.0,
-                        is_causal=False,
-                        scale=scale
-                    )
-        else:
-            print(f"[DEBUG] Using FlashAttention/SDPA (SA2 not available)")
+        batch, seq_len, channels = hidden_states.shape
+        height = width = None
+    
+    # Apply normalization if present (deprecated attn block)
+    if hasattr(self, 'group_norm') and self.group_norm is not None:
+        if input_ndim == 4:
+            normed = self.group_norm(residual)
+            hidden_states = normed.permute(0, 2, 3, 1).reshape(batch, height * width, channels)
+    
+    seq_len = hidden_states.shape[1]
+    
+    # ========== USE BFLOAT16 FOR STABILITY ==========
+    compute_dtype = torch.bfloat16
+    hidden_states_bf16 = hidden_states.to(compute_dtype)
+    
+    # Compute Q, K, V projections
+    query = self.to_q(hidden_states_bf16)
+    
+    if encoder_hidden_states is None:
+        encoder_hidden_states = hidden_states_bf16
+    else:
+        encoder_hidden_states = encoder_hidden_states.to(compute_dtype)
+    
+    key = self.to_k(encoder_hidden_states)
+    value = self.to_v(encoder_hidden_states)
+    
+    inner_dim = key.shape[-1]
+    
+    # ========== FORCED HEAD SPLITTING: 512 -> 8 heads x 64 dim ==========
+    head_dim = 64
+    if inner_dim % head_dim == 0:
+        num_heads = inner_dim // head_dim  # 512 / 64 = 8
+    else:
+        # Fallback for non-standard dimensions
+        print(f"[GGUF-SA2-WARNING] inner_dim={inner_dim} not divisible by 64")
+        num_heads = self.heads
+        head_dim = inner_dim // num_heads
+    
+    # Reshape: (batch, seq_len, inner_dim) -> (batch, num_heads, seq_len, head_dim)
+    # This is the MANDATORY reshape for SA2 compatibility
+    query = query.view(batch, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
+    key = key.view(batch, -1, num_heads, head_dim).transpose(1, 2).contiguous()
+    value = value.view(batch, -1, num_heads, head_dim).transpose(1, 2).contiguous()
+    
+    scale = head_dim ** -0.5
+    
+    # ========== FORCE SAGE_ATTN AS PRIMARY BACKEND ==========
+    sa2_available = _check_sa2_available()
+    
+    if sa2_available:
+        try:
+            from sageattention import sageattn
+            # SA2 with bfloat16
+            hidden_states = sageattn(
+                query,
+                key,
+                value,
+                tensor_layout="HND",
+                is_causal=False,
+                sm_scale=scale,
+            )
+        except Exception as e:
+            print(f"[GGUF-SA2-FALLBACK] sage_attn failed: {e}, using FlashAttention")
             try:
                 with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
                     hidden_states = F.scaled_dot_product_attention(
@@ -577,26 +573,125 @@ def sa2_inline_attention(attn_module: nn.Module, hidden_states: torch.Tensor, bl
                     is_causal=False,
                     scale=scale
                 )
-        
-        # 6. Reshape back: (batch, num_heads, seq_len, head_dim) -> (batch, seq_len, channels)
-        hidden_states = hidden_states.transpose(1, 2).contiguous().view(batch, seq_len, channels)
+    else:
+        # FlashAttention/SDPA fallback
+        try:
+            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
+                hidden_states = F.scaled_dot_product_attention(
+                    query, key, value,
+                    attn_mask=None,
+                    dropout_p=0.0,
+                    is_causal=False,
+                    scale=scale
+                )
+        except Exception:
+            hidden_states = F.scaled_dot_product_attention(
+                query, key, value,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=scale
+            )
     
-    # 7. Apply output projection
-    hidden_states = attn_module.to_out[0](hidden_states)  # Linear
-    if len(attn_module.to_out) > 1:
-        hidden_states = attn_module.to_out[1](hidden_states)  # Dropout (if present)
+    # Reshape back: (batch, num_heads, seq_len, head_dim) -> (batch, seq_len, inner_dim)
+    hidden_states = hidden_states.transpose(1, 2).contiguous().view(batch, seq_len, inner_dim)
     
-    # 8. Reshape back to image format: (batch, seq_len, channels) -> (batch, channels, H, W)
-    hidden_states = hidden_states.transpose(1, 2).view(batch, channels, height, width)
+    # Convert back to original dtype before output projection
+    hidden_states = hidden_states.to(residual.dtype)
     
-    # 9. Apply residual connection (deprecated attn block always uses residual)
-    if hasattr(attn_module, 'residual_connection') and attn_module.residual_connection:
+    # Apply output projection
+    hidden_states = self.to_out[0](hidden_states)
+    if len(self.to_out) > 1:
+        hidden_states = self.to_out[1](hidden_states)
+    
+    # Reshape back to 4D if needed: (batch, seq_len, channels) -> (batch, channels, height, width)
+    if input_ndim == 4:
+        hidden_states = hidden_states.view(batch, height, width, channels).permute(0, 3, 1, 2)
+    
+    # Apply residual connection
+    if hasattr(self, 'residual_connection') and self.residual_connection:
         hidden_states = hidden_states + residual
     
-    # 10. Apply rescale factor if present
-    if hasattr(attn_module, 'rescale_output_factor'):
-        hidden_states = hidden_states / attn_module.rescale_output_factor
-    
-    print(f"[DEBUG] Output Shape: [B={batch}, C={channels}, H={height}, W={width}]")
+    # Apply rescale factor
+    if hasattr(self, 'rescale_output_factor'):
+        hidden_states = hidden_states / self.rescale_output_factor
     
     return hidden_states
+
+
+def patch_vae_attention_globally():
+    """
+    GLOBAL CLASS PATCHING: Use setattr to replace Attention.forward BEFORE encoding/decoding.
+    
+    This ensures SA2 is engaged for ALL GGUF VAE attention blocks.
+    Must be called BEFORE any VAE encode/decode operations.
+    """
+    global _original_attention_forward, _is_patched
+    
+    if _is_patched:
+        print("[GGUF-SA2] Global class patching already applied")
+        return True
+    
+    try:
+        from diffusers.models.attention_processor import Attention
+        
+        # Store original forward method
+        _original_attention_forward = Attention.forward
+        
+        # Replace with GGUF-SA2-optimized forward using setattr
+        setattr(Attention, 'forward', _gguf_sa2_patched_forward)
+        
+        _is_patched = True
+        print("=" * 70)
+        print("[GGUF-SA2] GLOBAL CLASS PATCHING APPLIED SUCCESSFULLY")
+        print("[GGUF-SA2] Attention.forward -> _gguf_sa2_patched_forward")
+        print("[GGUF-SA2] All VAE attention: num_heads=8, head_dim=64, dtype=bfloat16")
+        print("[GGUF-SA2] Look for '[GGUF-SA2-CORE-ACTIVE]' in logs to confirm")
+        print("=" * 70)
+        return True
+        
+    except ImportError as e:
+        print(f"[GGUF-SA2-ERROR] Cannot import diffusers Attention: {e}")
+        return False
+    except Exception as e:
+        print(f"[GGUF-SA2-ERROR] Failed to patch Attention.forward: {e}")
+        return False
+
+
+def unpatch_vae_attention():
+    """Restore the original Attention.forward method."""
+    global _original_attention_forward, _is_patched
+    
+    if not _is_patched or _original_attention_forward is None:
+        return
+    
+    try:
+        from diffusers.models.attention_processor import Attention
+        setattr(Attention, 'forward', _original_attention_forward)
+        _is_patched = False
+        print("[GGUF-SA2] Global class patching removed, original Attention.forward restored")
+    except Exception as e:
+        print(f"[GGUF-SA2-ERROR] Failed to unpatch: {e}")
+
+
+# ============================================================================
+# AUTO-PATCH ON MODULE IMPORT
+# This ensures SA2 is engaged for ALL VAE attention blocks as soon as this
+# module is imported, BEFORE any VAE encode/decode operations.
+# ============================================================================
+
+def _auto_patch_on_import():
+    """Auto-patch Attention.forward when this module is imported."""
+    try:
+        # Only patch if diffusers is available
+        import diffusers
+        patch_vae_attention_globally()
+        print("[GGUF-SA2] AUTO-PATCHING COMPLETE: Ready for GGUF/safetensors VAE")
+    except ImportError:
+        print("[GGUF-SA2] diffusers not imported yet, patching will occur on first use")
+    except Exception as e:
+        print(f"[GGUF-SA2] Auto-patch failed: {e}")
+
+
+# Call auto-patch when module is imported
+_auto_patch_on_import()

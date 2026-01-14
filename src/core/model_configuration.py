@@ -1384,23 +1384,21 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
             model.set_memory_limit(**config.vae.memory_limit)
             debug.end_timer("vae_set_memory_limit", "VAE memory limits configured")
         
-        # Inject Sparge attention for Blackwell GPUs if enabled
-        if hasattr(runner, '_vae_sparge_enabled') and runner._vae_sparge_enabled:
-            try:
-                from ..optimization.vae_attention import inject_sparge_into_vae, set_vae_sparsity_threshold, reset_vae_attention_logging
-                
-                # Reset logging state for new generation
-                reset_vae_attention_logging()
-                
-                # Get sparsity threshold from runner config
-                vae_sparsity = getattr(runner, '_vae_sparsity_threshold', 0.5)
-                set_vae_sparsity_threshold(vae_sparsity)
-                
-                debug.start_timer("vae_sparge_inject")
-                patched_count = inject_sparge_into_vae(model, topk=vae_sparsity, debug=debug)
-                debug.end_timer("vae_sparge_inject", f"VAE Sparge attention injection ({patched_count} blocks)")
-            except ImportError as e:
-                debug.log(f"VAE Sparge attention not available: {e}", level="WARNING", category="vae", force=True)
+        # ALWAYS apply GGUF-SA2 class-level patching for Blackwell GPUs
+        # This is MANDATORY for both GGUF and safetensors VAE models
+        try:
+            from ..optimization.vae_attention import inject_sparge_into_vae, set_vae_sparsity_threshold, reset_vae_attention_logging
+            
+            # Reset logging state for new generation
+            reset_vae_attention_logging()
+            
+            debug.start_timer("vae_sa2_patch")
+            patched_count = inject_sparge_into_vae(model, topk=0.5, debug=debug)
+            debug.end_timer("vae_sa2_patch", f"GGUF-SA2 class-level patching ({patched_count} blocks)")
+        except ImportError as e:
+            debug.log(f"GGUF-SA2 patching not available: {e}", level="WARNING", category="vae", force=True)
+        except Exception as e:
+            debug.log(f"GGUF-SA2 patching failed: {e}", level="WARNING", category="vae", force=True)
 
         # Apply torch.compile if configured (only if not already compiled)
         if hasattr(runner, '_vae_compile_args') and runner._vae_compile_args:
