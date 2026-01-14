@@ -60,9 +60,14 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                     tooltip="GPU device for VAE model inference (encoding/decoding phases)"
                 ),
                 io.Boolean.Input("encode_tiled",
-                    default=False,
+                    default=True,
                     optional=True,
-                    tooltip="Enable tiled encoding to reduce VRAM usage during the encoding phase"
+                    tooltip=(
+                        "Enable tiled encoding to reduce VRAM usage during the encoding phase.\n"
+                        "IMPORTANT: Enable this for 16GB GPUs (Blackwell RTX 50xx) to prevent OOM.\n"
+                        "Required for large videos (e.g., 81 frames at 960x720).\n"
+                        "Default: True for memory safety."
+                    )
                 ),
                 io.Int.Input("encode_tile_size",
                     default=512,
@@ -90,9 +95,14 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                     )
                 ),
                 io.Boolean.Input("decode_tiled",
-                    default=False,
+                    default=True,
                     optional=True,
-                    tooltip="Enable tiled decoding to reduce VRAM usage during the decoding phase"
+                    tooltip=(
+                        "Enable tiled decoding to reduce VRAM usage during the decoding phase.\n"
+                        "IMPORTANT: Enable this for 16GB GPUs (Blackwell RTX 50xx) to prevent OOM.\n"
+                        "Required for large videos (e.g., 81 frames at 960x720).\n"
+                        "Default: True for memory safety."
+                    )
                 ),
                 io.Int.Input("decode_tile_size",
                     default=512,
@@ -222,9 +232,9 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
     
     @classmethod
     def execute(cls, model: str, device: str, offload_device: str = "none",
-                     cache_model: bool = False, encode_tiled: bool = False,
+                     cache_model: bool = False, encode_tiled: bool = True,
                      encode_tile_size: int = 512, encode_tile_overlap: int = 64,
-                     decode_tiled: bool = False, decode_tile_size: int = 512, 
+                     decode_tiled: bool = True, decode_tile_size: int = 512, 
                      decode_tile_overlap: int = 64, tile_debug: str = "false",
                      enable_sparge_attention: bool = True, performance_mode: str = "Balanced",
                      vae_precision: str = "auto", torch_compile_args: Dict[str, Any] = None

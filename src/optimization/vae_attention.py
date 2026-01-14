@@ -26,8 +26,10 @@ logger = logging.getLogger("SeedVR2.VAE.Blackwell")
 
 # Track if we've logged kernel info once (avoid per-call logging overhead on Windows)
 _vae_kernel_logged_once = False
-# Track if we've logged the kernel fallback warning (avoid spam)
-_vae_fallback_logged = False
+# Track if we've logged the head_dim fallback warning (avoid spam)
+_vae_head_dim_logged = False
+# Track if we've logged the kernel error fallback warning (avoid spam)
+_vae_kernel_fallback_logged = False
 
 # VAE-specific kernel parameters to fit within Blackwell shared memory limit (101376 bytes)
 # DiT (Diffusion Transformer) uses block_m=128, num_stages=3 (from Blackwell config) with NVFP4/FP8
@@ -72,6 +74,62 @@ def is_vae_sparge_available() -> bool:
     return SPARGE_LOCAL_AVAILABLE
 
 
+def _sliced_sdpa(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    scale: Optional[float] = None,
+    slice_size: int = 4096,
+) -> torch.Tensor:
+    """
+    Memory-efficient sliced SDPA for large sequence lengths.
+    
+    Processes attention in slices to avoid OOM on large inputs.
+    
+    Args:
+        query: Query tensor (batch, heads, seq_len, head_dim)
+        key: Key tensor (batch, heads, seq_len, head_dim)
+        value: Value tensor (batch, heads, seq_len, head_dim)
+        attention_mask: Optional attention mask
+        scale: Softmax scale (default: 1/sqrt(head_dim))
+        slice_size: Number of query positions to process at once (default: 4096)
+        
+    Returns:
+        Attention output tensor (batch, heads, seq_len, head_dim)
+    """
+    if scale is None:
+        scale = query.size(-1) ** -0.5
+    
+    batch, heads, seq_len, head_dim = query.shape
+    
+    # For small sequences, just use regular SDPA
+    if seq_len <= slice_size:
+        return F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, scale=scale)
+    
+    # Allocate output tensor
+    output = torch.zeros_like(query)
+    
+    # Process in slices
+    for i in range(0, seq_len, slice_size):
+        end_i = min(i + slice_size, seq_len)
+        
+        # Get query slice
+        q_slice = query[:, :, i:end_i, :]
+        
+        # For self-attention, we need the full key/value (not sliced)
+        # This computes attention for positions i:end_i against all positions
+        out_slice = F.scaled_dot_product_attention(
+            q_slice, key, value, 
+            attn_mask=attention_mask[:, :, i:end_i, :] if attention_mask is not None else None,
+            scale=scale
+        )
+        
+        output[:, :, i:end_i, :] = out_slice
+    
+    return output
+
+
 def sparge_vae_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -103,9 +161,27 @@ def sparge_vae_attention(
         Attention output tensor (batch, heads, seq_len, head_dim)
     """
     global _vae_kernel_logged_once
+    global _vae_head_dim_logged
+    global _vae_kernel_fallback_logged
     
     if topk is None:
         topk = VAE_SPARSITY_THRESHOLD
+    
+    # Get tensor dimensions
+    head_dim = query.size(-1)
+    seq_len = query.size(-2)
+    
+    # Check head_dim compatibility with Sparge kernel
+    # Sparge requires head_dim in [64, 128]
+    if head_dim not in [64, 128]:
+        if not _vae_head_dim_logged:
+            _vae_head_dim_logged = True
+            logger.info(
+                f"VAE head_dim={head_dim} not in [64, 128]. Using memory-efficient sliced SDPA. "
+                f"This is expected for VAE models with attention_head_dim=block_out_channels."
+            )
+        # Use sliced SDPA for memory efficiency with unsupported head_dim
+        return _sliced_sdpa(query, key, value, attention_mask=attention_mask, scale=scale)
     
     # Log kernel parameters only on first call
     if not _vae_kernel_logged_once:
@@ -115,7 +191,7 @@ def sparge_vae_attention(
             logger.info(
                 f"VAE Sparge Kernel: topk={topk}, Blackwell=True, "
                 f"Warps={config.get('num_warps', 8)}, Stages={VAE_NUM_STAGES} (VAE-specific), "
-                f"BlockM={VAE_BLOCK_M} (VAE-specific), BlockN={config.get('BLOCK_N', 64)}"
+                f"BlockM={VAE_BLOCK_M} (VAE-specific), BlockN={config.get('BLOCK_N', 64)}, head_dim={head_dim}"
             )
     
     # Ensure tensors are contiguous for Triton kernels
@@ -124,17 +200,16 @@ def sparge_vae_attention(
     value = value.contiguous()
     
     # Check minimum sequence length for Sparge (requires >= 128)
-    seq_len = query.size(-2)
     if seq_len < 128:
         # Fall back to standard attention for small sequences
         if scale is None:
-            scale = query.size(-1) ** -0.5
+            scale = head_dim ** -0.5
         return F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, scale=scale)
     
     # Call Sparge Sage2 attention with VAE-specific parameters:
     # - block_m=64 and num_stages=2 to fit in Blackwell shared memory (101376 bytes limit)
     # - DiT uses block_m=128, num_stages=3 (from Blackwell config)
-    # Wrap in try/except to fall back to SDPA on any Triton/CUDA error
+    # Wrap in try/except to fall back to sliced SDPA on any Triton/CUDA error
     try:
         output = spas_sage2_attn_meansim_topk_cuda(
             query, key, value,
@@ -148,19 +223,17 @@ def sparge_vae_attention(
             num_stages_override=VAE_NUM_STAGES,  # Use num_stages=2 for VAE (vs 3 for DiT)
         )
     except Exception as e:
-        # Fall back to standard SDPA on any error (e.g., shared memory limits, CUDA errors)
+        # Fall back to sliced SDPA on any error (e.g., shared memory limits, CUDA errors)
         # Log the warning only once per session to avoid spam
-        global _vae_fallback_logged
-        if not _vae_fallback_logged:
-            _vae_fallback_logged = True
+        if not _vae_kernel_fallback_logged:
+            _vae_kernel_fallback_logged = True
             logger.warning(
-                f"Sparge VAE kernel failed, falling back to SDPA: {e}. "
+                f"Sparge VAE kernel failed, falling back to sliced SDPA: {e}. "
                 f"This warning will not repeat. Consider enabling tiling to reduce memory usage."
             )
         
-        if scale is None:
-            scale = query.size(-1) ** -0.5
-        output = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, scale=scale)
+        # Use sliced SDPA for memory efficiency
+        output = _sliced_sdpa(query, key, value, attention_mask=attention_mask, scale=scale)
     
     return output
 
