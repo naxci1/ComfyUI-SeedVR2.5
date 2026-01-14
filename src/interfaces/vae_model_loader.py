@@ -60,12 +60,13 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                     tooltip="GPU device for VAE model inference (encoding/decoding phases)"
                 ),
                 io.Boolean.Input("encode_tiled",
-                    default=False,
+                    default=True,
                     optional=True,
                     tooltip=(
                         "Enable tiled encoding to reduce VRAM usage during the encoding phase.\n"
                         "IMPORTANT: Enable this for 16GB GPUs (Blackwell RTX 50xx) to prevent OOM.\n"
                         "Required for large videos (e.g., 81 frames at 960x720).\n"
+                        "SA2 runs inside each tile for optimal Blackwell performance.\n"
                         "Default: True for memory safety."
                     )
                 ),
@@ -95,12 +96,13 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                     )
                 ),
                 io.Boolean.Input("decode_tiled",
-                    default=False,
+                    default=True,
                     optional=True,
                     tooltip=(
                         "Enable tiled decoding to reduce VRAM usage during the decoding phase.\n"
                         "IMPORTANT: Enable this for 16GB GPUs (Blackwell RTX 50xx) to prevent OOM.\n"
                         "Required for large videos (e.g., 81 frames at 960x720).\n"
+                        "SA2 runs inside each tile for optimal Blackwell performance.\n"
                         "Default: True for memory safety."
                     )
                 ),

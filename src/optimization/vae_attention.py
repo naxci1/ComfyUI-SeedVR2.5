@@ -2,13 +2,15 @@
 VAE SageAttention 2 (SA2) Optimized Module for Blackwell GPUs
 
 This module provides SA2-optimized attention for VAE attention blocks on Blackwell GPUs (RTX 50 series).
+Applies to BOTH Encoder3D and Decoder3D attention layers.
 
 Key Features:
 - Dynamic head splitting: 512-dim → 8 heads × 64 dim (Blackwell Tensor Core sweet spot)
 - SageAttention 2 integration with INT8/FP8 quantization for maximum speed
 - Automatic fallback to standard SDPA if SA2 is unavailable
-- Verbose logging to show which backend is being used
+- Detailed verbose logging for both Encoder (Phase 1) and Decoder (Phase 3)
 - Memory-efficient operation on 16GB GPUs (Blackwell RTX 50xx)
+- No silent failures: Always logs warnings when SA2 is skipped
 
 NOTE: This implementation reshapes 1 head × 512 dim to 8 heads × 64 dim in the forward pass,
 preserving the original weights while enabling faster SA2/FlashAttention kernels.
@@ -19,13 +21,17 @@ import gc
 import torch
 import torch.nn.functional as F
 import logging
-from typing import Optional
+from typing import Optional, Literal
 
 # Configure logging
 logger = logging.getLogger("SeedVR2.VAE.Attention")
 
-# Track if we've logged kernel info once (avoid per-call logging overhead on Windows)
-_vae_kernel_logged_once = False
+# Track logging state separately for encoder and decoder
+_encoder_logged_once = False
+_decoder_logged_once = False
+
+# Attention call counter for detailed logging
+_attention_call_count = 0
 
 # Enable verbose logging for SA2 backend selection
 _verbose_sa2_logging = True
@@ -33,11 +39,20 @@ _verbose_sa2_logging = True
 # SA2 availability check (cached)
 _sa2_available = None
 
+# Current phase context (encoder/decoder)
+_current_phase: Literal["encoder", "decoder", "unknown"] = "unknown"
+
 # Blackwell memory guard: Set expandable_segments for better fragmentation handling
 try:
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 except Exception:
     pass
+
+
+def set_vae_phase(phase: Literal["encoder", "decoder", "unknown"]):
+    """Set the current VAE phase for logging context."""
+    global _current_phase
+    _current_phase = phase
 
 
 def _check_sa2_available() -> bool:
@@ -47,8 +62,10 @@ def _check_sa2_available() -> bool:
         try:
             from sageattention import sageattn
             _sa2_available = True
+            print("[DEBUG] SageAttention 2 (SA2) module: AVAILABLE")
         except ImportError:
             _sa2_available = False
+            print("[WARNING] SageAttention 2 (SA2) module: NOT INSTALLED - Using FlashAttention/SDPA fallback")
     return _sa2_available
 
 
@@ -93,8 +110,14 @@ def _split_heads_for_blackwell(tensor: torch.Tensor, target_heads: int = 8) -> t
         Reshaped tensor (batch, 8, seq_len, 64)
     """
     batch, heads, seq_len, dim = tensor.shape
-    assert heads == 1, f"Expected 1 head, got {heads}"
-    assert dim % target_heads == 0, f"Dimension {dim} not divisible by {target_heads}"
+    
+    if heads != 1:
+        print(f"[WARNING] SA2 head splitting skipped: Expected 1 head, got {heads}")
+        return tensor
+    
+    if dim % target_heads != 0:
+        print(f"[WARNING] SA2 head splitting skipped: Dimension {dim} not divisible by {target_heads}")
+        return tensor
     
     new_head_dim = dim // target_heads
     # Reshape: (batch, 1, seq_len, 512) -> (batch, seq_len, 8, 64) -> (batch, 8, seq_len, 64)
@@ -221,6 +244,8 @@ def standard_vae_attention(
     """
     Compute VAE attention using SA2-optimized path with dynamic head splitting.
     
+    Applies to BOTH Encoder3D and Decoder3D attention blocks.
+    
     For Blackwell GPUs, this:
     1. Splits 1 head × 512 dim into 8 heads × 64 dim
     2. Applies SageAttention 2 (or FlashAttention if SA2 unavailable)
@@ -236,9 +261,10 @@ def standard_vae_attention(
     Returns:
         Attention output tensor (batch, heads, seq_len, head_dim)
     """
-    global _vae_kernel_logged_once, _verbose_sa2_logging
+    global _encoder_logged_once, _decoder_logged_once, _attention_call_count, _current_phase
     
     batch, heads, seq_len, head_dim = query.shape
+    _attention_call_count += 1
     
     if scale is None:
         scale = head_dim ** -0.5
@@ -247,28 +273,55 @@ def standard_vae_attention(
     use_head_splitting = (heads == 1 and head_dim == 512)
     sa2_available = _check_sa2_available()
     
-    # Verbose logging - show backend selection on first call
-    if not _vae_kernel_logged_once:
-        _vae_kernel_logged_once = True
+    # Determine phase for logging
+    is_encoder = _current_phase == "encoder"
+    is_decoder = _current_phase == "decoder"
+    phase_name = "ENCODER" if is_encoder else ("DECODER" if is_decoder else "VAE")
+    
+    # Phase-specific logging
+    should_log = False
+    if is_encoder and not _encoder_logged_once:
+        _encoder_logged_once = True
+        should_log = True
+    elif is_decoder and not _decoder_logged_once:
+        _decoder_logged_once = True
+        should_log = True
+    elif not is_encoder and not is_decoder and not _encoder_logged_once:
+        _encoder_logged_once = True
+        should_log = True
+    
+    # Verbose logging - show backend selection
+    if should_log:
+        print(f"\n{'='*60}")
+        print(f"[DEBUG] VAE {phase_name}: Initiating SageAttention 2 forward pass")
+        print(f"{'='*60}")
         
-        if use_head_splitting and sa2_available:
-            print(f"[DEBUG] SA2 Optimized Forward Pass: Active")
-            print(f"[DEBUG] VAE Attention: Reshaping 1 head x 512 dim → 8 heads x 64 dim")
-            print(f"[DEBUG] VAE Attention Backend: SageAttention 2 (INT8 Quantized)")
-            print(f"[DEBUG] VAE Attention Shape: Q/K/V = ({batch}, 8, {seq_len}, 64)")
-            logger.info("VAE SA2 Optimized: heads=8, head_dim=64 (dynamic split from 512)")
-        elif use_head_splitting:
-            print(f"[DEBUG] VAE Attention: Reshaping 1 head x 512 dim → 8 heads x 64 dim")
-            print(f"[DEBUG] VAE Attention Backend: FlashAttention/SDPA (SA2 not available)")
-            print(f"[DEBUG] VAE Attention Shape: Q/K/V = ({batch}, 8, {seq_len}, 64)")
-            logger.info("VAE FlashAttention: heads=8, head_dim=64 (dynamic split from 512)")
+        if use_head_splitting:
+            print(f"[DEBUG] Reshaping: {head_dim}-dim -> 8 heads x 64-dim for SA2 compatibility")
+            print(f"[DEBUG] Original Shape: Q/K/V = (batch={batch}, heads={heads}, seq_len={seq_len}, head_dim={head_dim})")
+            print(f"[DEBUG] Reshaped Shape: Q/K/V = (batch={batch}, heads=8, seq_len={seq_len}, head_dim=64)")
+            
+            if sa2_available:
+                print(f"[DEBUG] SA2 Optimized Forward Pass: ACTIVE")
+                print(f"[DEBUG] Backend: SageAttention 2 (INT8 Quantized)")
+                print(f"[DEBUG] num_heads=8, head_dim=64 (Blackwell Tensor Core optimized)")
+            else:
+                print(f"[WARNING] SA2 not available, using FlashAttention/SDPA fallback")
+                print(f"[DEBUG] Backend: PyTorch FlashAttention/SDPA")
+                print(f"[DEBUG] num_heads=8, head_dim=64")
         else:
-            print(f"[DEBUG] VAE Attention: Executing via Native SDPA ({heads} head x {head_dim} dim)")
-            print(f"[DEBUG] VAE Attention Shape: Q/K/V = ({batch}, {heads}, {seq_len}, {head_dim})")
-            logger.info(f"VAE Standard SDPA: heads={heads}, head_dim={head_dim}")
+            print(f"[WARNING] SA2 skipped: head_dim={head_dim} not compatible (requires 512-dim for splitting)")
+            print(f"[DEBUG] Using Native SDPA: {heads} head x {head_dim} dim")
+            print(f"[DEBUG] Shape: Q/K/V = (batch={batch}, heads={heads}, seq_len={seq_len}, head_dim={head_dim})")
+        
+        print(f"[DEBUG] Precision: {query.dtype}")
+        print(f"{'='*60}\n")
+        
+        logger.info(f"VAE {phase_name} SA2: heads={8 if use_head_splitting else heads}, head_dim={64 if use_head_splitting else head_dim}")
     
     # Use sliced SDPA for very large sequence lengths to prevent OOM
     if seq_len > 4096:
+        print(f"[DEBUG] VAE {phase_name}: Large seq_len={seq_len} > 4096, using sliced attention")
         return _sliced_sdpa(query, key, value, attention_mask=attention_mask, scale=scale)
     
     # SA2-optimized path with dynamic head splitting for 1 head × 512 dim VAE
@@ -278,6 +331,11 @@ def standard_vae_attention(
         k_split = _split_heads_for_blackwell(key)
         v_split = _split_heads_for_blackwell(value)
         
+        # Check if splitting succeeded
+        if q_split.shape[1] != 8:
+            print(f"[WARNING] Head splitting failed, falling back to standard SDPA")
+            return F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, scale=scale)
+        
         # Adjust scale for new head dimension
         new_scale = 64 ** -0.5
         
@@ -286,8 +344,20 @@ def standard_vae_attention(
             try:
                 out_split = _sa2_attention(q_split, k_split, v_split, scale=new_scale)
             except Exception as e:
+                print(f"[WARNING] SA2 execution failed: {e}")
+                print(f"[DEBUG] Falling back to FlashAttention/SDPA")
                 logger.warning(f"SA2 failed, falling back to SDPA: {e}")
-                with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
+                try:
+                    with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
+                        out_split = F.scaled_dot_product_attention(
+                            q_split, k_split, v_split,
+                            attn_mask=None,
+                            dropout_p=0.0,
+                            is_causal=False,
+                            scale=new_scale
+                        )
+                except Exception as e2:
+                    print(f"[WARNING] FlashAttention also failed: {e2}, using math fallback")
                     out_split = F.scaled_dot_product_attention(
                         q_split, k_split, v_split,
                         attn_mask=None,
@@ -306,7 +376,8 @@ def standard_vae_attention(
                         is_causal=False,
                         scale=new_scale
                     )
-            except Exception:
+            except Exception as e:
+                print(f"[WARNING] FlashAttention failed: {e}, using standard SDPA")
                 out_split = F.scaled_dot_product_attention(
                     q_split, k_split, v_split,
                     attn_mask=None,
@@ -319,6 +390,7 @@ def standard_vae_attention(
         return _merge_heads_from_blackwell(out_split)
     
     # Standard path for non-512 dim VAE models
+    print(f"[WARNING] VAE {phase_name}: Non-standard head_dim={head_dim}, SA2 disabled")
     try:
         with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
             return F.scaled_dot_product_attention(
@@ -344,25 +416,35 @@ def inject_sparge_into_vae(vae, topk: Optional[float] = None, debug=None) -> int
     Inject attention processors into a VAE model.
     
     NOTE: This function is kept for API compatibility but no longer injects
-    Sparge attention. VAE uses standard SDPA which is natively optimized.
+    Sparge attention. VAE uses SA2-optimized attention which is natively optimized.
     
     Args:
         vae: VAE model (diffusers AutoencoderKL or custom VAE)
-        topk: Sparsity ratio (ignored - Sparge disabled)
+        topk: Sparsity ratio (ignored - using SA2)
         debug: Optional debug instance for logging
         
     Returns:
-        0 (no modules patched - VAE uses standard attention)
+        0 (no modules patched - VAE uses SA2/SDPA via standard_vae_attention)
     """
+    sa2_available = _check_sa2_available()
     if debug:
-        debug.log(
-            "VAE using standard PyTorch SDPA attention (natively optimized for Blackwell)",
-            level="INFO", category="vae", force=True
-        )
+        if sa2_available:
+            debug.log(
+                "VAE using SageAttention 2 (SA2) with dynamic head splitting (512-dim → 8 heads × 64 dim)",
+                level="INFO", category="vae", force=True
+            )
+        else:
+            debug.log(
+                "VAE using FlashAttention/SDPA with dynamic head splitting (512-dim → 8 heads × 64 dim)",
+                level="INFO", category="vae", force=True
+            )
     return 0
 
 
 def reset_vae_attention_logging():
     """Reset VAE attention logging state (call before each new generation)."""
-    global _vae_kernel_logged_once
-    _vae_kernel_logged_once = False
+    global _encoder_logged_once, _decoder_logged_once, _attention_call_count, _current_phase
+    _encoder_logged_once = False
+    _decoder_logged_once = False
+    _attention_call_count = 0
+    _current_phase = "unknown"

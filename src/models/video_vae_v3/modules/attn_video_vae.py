@@ -52,6 +52,7 @@ from .types import (
     _receptive_field_t,
 )
 from ....optimization.memory_manager import retry_on_oom
+from ....optimization.vae_attention import set_vae_phase
 
 logger = get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -1190,6 +1191,9 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
     def encode(self, x: torch.FloatTensor, return_dict: bool = True, 
                tiled: bool = False, tile_size: Tuple[int, int] = (512, 512), 
                tile_overlap: Tuple[int, int] = (64, 64)) -> AutoencoderKLOutput:
+        # Set phase context for SA2 logging
+        set_vae_phase("encoder")
+        
         if tiled:
             h = self.tiled_encode(x, tile_size=tile_size, tile_overlap=tile_overlap)
         else:
@@ -1206,6 +1210,8 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
     def decode(self, z: torch.Tensor, return_dict: bool = True, 
                tiled: bool = False, tile_size: Tuple[int, int] = (512, 512), 
                tile_overlap: Tuple[int, int] = (64, 64)) -> Union[DecoderOutput, torch.Tensor]:
+        # Set phase context for SA2 logging
+        set_vae_phase("decoder")
 
         if tiled:
             decoded = self.tiled_decode(z, tile_size=tile_size, tile_overlap=tile_overlap)
