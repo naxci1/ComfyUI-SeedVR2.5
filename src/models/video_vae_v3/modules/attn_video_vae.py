@@ -52,9 +52,12 @@ from .types import (
     _receptive_field_t,
 )
 from ....optimization.memory_manager import retry_on_oom
-from ....optimization.vae_attention import set_vae_phase
+from ....optimization.vae_attention import set_vae_phase, sa2_inline_attention
 
 logger = get_logger(__name__)  # pylint: disable=invalid-name
+
+# Global attention block counter for detailed logging
+_global_attn_block_id = 0
 
 class Upsample3D(Upsample2D):
     """A 3D upsampling layer with an optional convolution."""
@@ -655,12 +658,20 @@ class UNetMidBlock3D(nn.Module):
         self.resnets = nn.ModuleList(resnets)
 
     def forward(self, hidden_states, temb=None, memory_state: MemoryState = MemoryState.DISABLED):
+        global _global_attn_block_id
         video_length, frame_height, frame_width = hidden_states.size()[-3:]
         hidden_states = self.resnets[0](hidden_states, temb, memory_state=memory_state)
         for attn, resnet in zip(self.attentions, self.resnets[1:]):
             if attn is not None:
+                # Rearrange for 2D attention: (B, C, F, H, W) -> (B*F, C, H, W)
                 hidden_states = rearrange(hidden_states, "b c f h w -> (b f) c h w")
-                hidden_states = attn(hidden_states, temb=temb)
+                
+                # ====== SA2 INLINE ATTENTION ======
+                # Use SA2-optimized attention directly instead of diffusers Attention.forward()
+                _global_attn_block_id += 1
+                hidden_states = sa2_inline_attention(attn, hidden_states, _global_attn_block_id)
+                
+                # Rearrange back to 5D: (B*F, C, H, W) -> (B, C, F, H, W)
                 hidden_states = rearrange(
                     hidden_states, "(b f) c h w -> b c f h w", f=video_length
                 )

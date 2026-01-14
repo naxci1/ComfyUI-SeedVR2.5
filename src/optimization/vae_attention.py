@@ -14,11 +14,15 @@ Key Features:
 
 NOTE: This implementation reshapes 1 head × 512 dim to 8 heads × 64 dim in the forward pass,
 preserving the original weights while enabling faster SA2/FlashAttention kernels.
+
+INLINE SA2: The sa2_inline_attention() function directly replaces the diffusers Attention.forward()
+to ensure SA2 is actually executed inside every attention block.
 """
 
 import os
 import gc
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import logging
 from typing import Optional, Literal
@@ -33,7 +37,7 @@ _decoder_logged_once = False
 # Attention call counter for detailed logging
 _attention_call_count = 0
 
-# Enable verbose logging for SA2 backend selection
+# Enable verbose logging for SA2 backend selection (logs EVERY attention call)
 _verbose_sa2_logging = True
 
 # SA2 availability check (cached)
@@ -448,3 +452,151 @@ def reset_vae_attention_logging():
     _decoder_logged_once = False
     _attention_call_count = 0
     _current_phase = "unknown"
+
+
+def sa2_inline_attention(attn_module: nn.Module, hidden_states: torch.Tensor, block_id: int) -> torch.Tensor:
+    """
+    INLINE SA2 ATTENTION: Replaces the diffusers Attention.forward() with SA2-optimized attention.
+    
+    This function is called DIRECTLY from UNetMidBlock3D.forward() to ensure SA2 is actually
+    executed inside every attention block.
+    
+    Args:
+        attn_module: The diffusers Attention module containing the projections (to_q, to_k, to_v, to_out)
+        hidden_states: Input tensor (batch, channels, height, width) - already rearranged from 5D
+        block_id: Attention block ID for logging
+        
+    Returns:
+        Output tensor with same shape as input
+    """
+    global _current_phase, _attention_call_count
+    _attention_call_count += 1
+    
+    # Get phase name for logging
+    phase_name = _current_phase.upper() if _current_phase != "unknown" else "VAE"
+    
+    # Input shape info
+    batch, channels, height, width = hidden_states.shape
+    seq_len = height * width
+    
+    # Log EVERY attention call with detailed info (user requirement)
+    print(f"[SA2_EXEC] Block ID: {block_id}, Phase: {phase_name}, Shape: [{batch}, {channels}, {height}, {width}], Heads: 8")
+    
+    # ====== MANDATORY RESHAPE ======
+    # Before calling sage_attn, we MUST reshape the input:
+    # (batch, channels, H, W) -> (batch, H*W, 8, 64)
+    
+    # 1. Apply normalization if present (from deprecated attn block)
+    residual = hidden_states
+    if hasattr(attn_module, 'group_norm') and attn_module.group_norm is not None:
+        hidden_states = attn_module.group_norm(hidden_states)
+    
+    # 2. Reshape to sequence format: (batch, channels, H, W) -> (batch, seq_len, channels)
+    hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(batch, seq_len, channels)
+    
+    # Log the reshape operation
+    print(f"[DEBUG] Reshaping: {channels}-dim -> 8 heads x 64-dim for SA2 compatibility")
+    print(f"[DEBUG] Input Shape: [B={batch}, C={channels}, H={height}, W={width}] -> [B={batch}, seq_len={seq_len}, C={channels}]")
+    
+    # 3. Compute Q, K, V projections
+    query = attn_module.to_q(hidden_states)  # (batch, seq_len, channels)
+    key = attn_module.to_k(hidden_states)    # (batch, seq_len, channels)
+    value = attn_module.to_v(hidden_states)  # (batch, seq_len, channels)
+    
+    # 4. MANDATORY RESHAPE for SA2: (batch, seq_len, 512) -> (batch, 8, seq_len, 64)
+    # This is the key step that the user requested
+    head_dim = 64
+    num_heads = channels // head_dim
+    
+    if channels % head_dim != 0:
+        print(f"[WARNING] SA2 skipped: channels={channels} not divisible by head_dim={head_dim}")
+        # Fallback to simple attention
+        attn_weights = torch.softmax(torch.bmm(query, key.transpose(1, 2)) * (channels ** -0.5), dim=-1)
+        hidden_states = torch.bmm(attn_weights, value)
+    else:
+        # Reshape to multi-head format: (batch, seq_len, channels) -> (batch, num_heads, seq_len, head_dim)
+        query = query.view(batch, seq_len, num_heads, head_dim).transpose(1, 2)
+        key = key.view(batch, seq_len, num_heads, head_dim).transpose(1, 2)
+        value = value.view(batch, seq_len, num_heads, head_dim).transpose(1, 2)
+        
+        print(f"[DEBUG] Reshaped Q/K/V: [B={batch}, heads={num_heads}, seq_len={seq_len}, head_dim={head_dim}]")
+        
+        # 5. Apply SA2 or FlashAttention/SDPA
+        sa2_available = _check_sa2_available()
+        scale = head_dim ** -0.5
+        
+        if sa2_available:
+            try:
+                from sageattention import sageattn
+                print(f"[DEBUG] SA2 Optimized Forward Pass: ACTIVE")
+                
+                # SA2 expects (batch, heads, seq_len, head_dim) format
+                hidden_states = sageattn(
+                    query.contiguous(),
+                    key.contiguous(),
+                    value.contiguous(),
+                    tensor_layout="HND",
+                    is_causal=False,
+                    sm_scale=scale,
+                )
+            except Exception as e:
+                print(f"[WARNING] SA2 execution failed: {e}, falling back to FlashAttention/SDPA")
+                try:
+                    with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
+                        hidden_states = F.scaled_dot_product_attention(
+                            query, key, value,
+                            attn_mask=None,
+                            dropout_p=0.0,
+                            is_causal=False,
+                            scale=scale
+                        )
+                except Exception:
+                    hidden_states = F.scaled_dot_product_attention(
+                        query, key, value,
+                        attn_mask=None,
+                        dropout_p=0.0,
+                        is_causal=False,
+                        scale=scale
+                    )
+        else:
+            print(f"[DEBUG] Using FlashAttention/SDPA (SA2 not available)")
+            try:
+                with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
+                    hidden_states = F.scaled_dot_product_attention(
+                        query, key, value,
+                        attn_mask=None,
+                        dropout_p=0.0,
+                        is_causal=False,
+                        scale=scale
+                    )
+            except Exception:
+                hidden_states = F.scaled_dot_product_attention(
+                    query, key, value,
+                    attn_mask=None,
+                    dropout_p=0.0,
+                    is_causal=False,
+                    scale=scale
+                )
+        
+        # 6. Reshape back: (batch, num_heads, seq_len, head_dim) -> (batch, seq_len, channels)
+        hidden_states = hidden_states.transpose(1, 2).contiguous().view(batch, seq_len, channels)
+    
+    # 7. Apply output projection
+    hidden_states = attn_module.to_out[0](hidden_states)  # Linear
+    if len(attn_module.to_out) > 1:
+        hidden_states = attn_module.to_out[1](hidden_states)  # Dropout (if present)
+    
+    # 8. Reshape back to image format: (batch, seq_len, channels) -> (batch, channels, H, W)
+    hidden_states = hidden_states.transpose(1, 2).view(batch, channels, height, width)
+    
+    # 9. Apply residual connection (deprecated attn block always uses residual)
+    if hasattr(attn_module, 'residual_connection') and attn_module.residual_connection:
+        hidden_states = hidden_states + residual
+    
+    # 10. Apply rescale factor if present
+    if hasattr(attn_module, 'rescale_output_factor'):
+        hidden_states = hidden_states / attn_module.rescale_output_factor
+    
+    print(f"[DEBUG] Output Shape: [B={batch}, C={channels}, H={height}, W={width}]")
+    
+    return hidden_states
