@@ -20,6 +20,9 @@ import logging
 # Configure logging for Blackwell kernel verification
 logger = logging.getLogger("SeedVR2.Blackwell")
 
+# Track if we've logged once (to avoid spam during execution)
+_kernel_logged_once = False
+
 # Try to import Triton - required for JIT compilation
 # Supports both regular triton and triton-windows packages
 TRITON_AVAILABLE = False
@@ -386,18 +389,21 @@ def spas_sage2_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=
     Example:
         >>> output = spas_sage2_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False)
     """
+    global _kernel_logged_once
+    
     # Get Blackwell configuration for kernel parameters
     config = get_blackwell_config()
     is_blackwell = config.get('is_blackwell', False)
     
-    # Verification logging for Blackwell optimization
-    if is_blackwell:
+    # Log only once on first call to avoid Python overhead during execution
+    if is_blackwell and not _kernel_logged_once:
+        _kernel_logged_once = True
         num_warps = config.get('num_warps', 8)
         num_stages = config.get('num_stages', 4)
         block_m = config.get('BLOCK_M', 128)
         block_n = config.get('BLOCK_N', 64)
         kernel_msg = f"!!! Sparge_Sage2 Kernel: topk={topk}, Blackwell=True, Warps={num_warps}, Stages={num_stages}, BlockM={block_m}, BlockN={block_n}"
-        print(kernel_msg, flush=True)  # Force flush for immediate visibility
+        print(kernel_msg, flush=True)
         logger.info(kernel_msg)
     
     # Sage2 uses same implementation as Sage1 for Triton-only version
