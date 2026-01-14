@@ -102,7 +102,7 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
                     )
                 ),
                 io.Combo.Input("attention_mode",
-                    options=["sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3"],
+                    options=["sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3", "sparge_sage2"],
                     default="sdpa",
                     optional=True,
                     tooltip=(
@@ -112,9 +112,11 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
                         "• flash_attn_3: Flash Attention 3 (Hopper+, requires flash-attn with FA3 support)\n"
                         "• sageattn_2: SageAttention 2 (requires sageattention package)\n"
                         "• sageattn_3: SageAttention 3 (Blackwell/RTX 50xx only, requires sageattn3 package)\n"
+                        "• sparge_sage2: SpargeAttn/Sage2 block-sparse attention (Blackwell optimized, Triton JIT)\n"
                         "\n"
                         "SDPA is recommended - stable and works everywhere.\n"
-                        "Flash Attention and SageAttention provide speedup through optimized CUDA kernels on compatible GPUs."
+                        "Flash Attention and SageAttention provide speedup through optimized CUDA kernels on compatible GPUs.\n"
+                        "SpargeAttn provides block-sparse attention with configurable sparsity for Blackwell GPUs."
                     )
                 ),
                 io.Custom("TORCH_COMPILE_ARGS").Input("torch_compile_args",
