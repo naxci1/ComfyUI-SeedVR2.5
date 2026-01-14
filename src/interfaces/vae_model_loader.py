@@ -154,12 +154,15 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                     default=True,
                     optional=True,
                     tooltip=(
-                        "Enable Sparge block-sparse attention for VAE decoding (Blackwell GPUs).\n"
+                        "Enable Sparge block-sparse attention for VAE encoding/decoding (Blackwell GPUs).\n"
                         "• Requires RTX 50-series (Blackwell) GPU with Triton\n"
-                        "• Provides 2-3x speedup for VAE decoding phase\n"
-                        "• Uses hardcoded Blackwell parameters: num_warps=8, num_stages=3\n"
+                        "• Provides 2-3x speedup for VAE attention operations\n"
+                        "• Uses VAE-optimized parameters: num_warps=8, num_stages=2, block_m=64\n"
+                        "  (Lower values than DiT to fit in Blackwell shared memory)\n"
+                        "• Falls back to standard SDPA on any kernel error\n"
                         "\n"
-                        "Automatically enabled when supported. Disable to use standard SDPA."
+                        "Automatically enabled when supported. Disable to use standard SDPA.\n"
+                        "If you encounter OOM errors, enable tiling (encode_tiled/decode_tiled)."
                     )
                 ),
                 io.Combo.Input("performance_mode",

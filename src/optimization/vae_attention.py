@@ -26,6 +26,8 @@ logger = logging.getLogger("SeedVR2.VAE.Blackwell")
 
 # Track if we've logged kernel info once (avoid per-call logging overhead on Windows)
 _vae_kernel_logged_once = False
+# Track if we've logged the kernel fallback warning (avoid spam)
+_vae_fallback_logged = False
 
 # VAE-specific kernel parameters to fit within Blackwell shared memory limit (101376 bytes)
 # DiT (Diffusion Transformer) uses block_m=128, num_stages=3 (from Blackwell config) with NVFP4/FP8
@@ -132,17 +134,33 @@ def sparge_vae_attention(
     # Call Sparge Sage2 attention with VAE-specific parameters:
     # - block_m=64 and num_stages=2 to fit in Blackwell shared memory (101376 bytes limit)
     # - DiT uses block_m=128, num_stages=3 (from Blackwell config)
-    output = spas_sage2_attn_meansim_topk_cuda(
-        query, key, value,
-        topk=topk,
-        is_causal=False,
-        scale=scale,
-        smooth_k=True,
-        tensor_layout="HND",
-        output_dtype=query.dtype,
-        block_m_override=VAE_BLOCK_M,       # Use block_m=64 for VAE (vs 128 for DiT)
-        num_stages_override=VAE_NUM_STAGES,  # Use num_stages=2 for VAE (vs 3 for DiT)
-    )
+    # Wrap in try/except to fall back to SDPA on any Triton/CUDA error
+    try:
+        output = spas_sage2_attn_meansim_topk_cuda(
+            query, key, value,
+            topk=topk,
+            is_causal=False,
+            scale=scale,
+            smooth_k=True,
+            tensor_layout="HND",
+            output_dtype=query.dtype,
+            block_m_override=VAE_BLOCK_M,       # Use block_m=64 for VAE (vs 128 for DiT)
+            num_stages_override=VAE_NUM_STAGES,  # Use num_stages=2 for VAE (vs 3 for DiT)
+        )
+    except Exception as e:
+        # Fall back to standard SDPA on any error (e.g., shared memory limits, CUDA errors)
+        # Log the warning only once per session to avoid spam
+        global _vae_fallback_logged
+        if not _vae_fallback_logged:
+            _vae_fallback_logged = True
+            logger.warning(
+                f"Sparge VAE kernel failed, falling back to SDPA: {e}. "
+                f"This warning will not repeat. Consider enabling tiling to reduce memory usage."
+            )
+        
+        if scale is None:
+            scale = query.size(-1) ** -0.5
+        output = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, scale=scale)
     
     return output
 
@@ -337,5 +355,6 @@ def inject_sparge_into_vae(vae, topk: Optional[float] = None, debug=None) -> int
 
 def reset_vae_attention_logging():
     """Reset VAE attention logging state (call before each new generation)."""
-    global _vae_kernel_logged_once
+    global _vae_kernel_logged_once, _vae_fallback_logged
     _vae_kernel_logged_once = False
+    _vae_fallback_logged = False
