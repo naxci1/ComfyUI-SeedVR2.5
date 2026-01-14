@@ -17,14 +17,23 @@ from einops import rearrange
 import math
 
 # Try to import Triton - required for JIT compilation
+# Supports both regular triton and triton-windows packages
+TRITON_AVAILABLE = False
+TRITON_IMPORT_ERROR = None
+triton = None
+tl = None
+
 try:
     import triton
     import triton.language as tl
     TRITON_AVAILABLE = True
-except ImportError:
-    TRITON_AVAILABLE = False
-    triton = None
-    tl = None
+except ImportError as e:
+    TRITON_IMPORT_ERROR = f"Triton import failed: {e}"
+    # Print diagnostic for debugging
+    print(f"[SpargeAttn Debug] {TRITON_IMPORT_ERROR}")
+except Exception as e:
+    TRITON_IMPORT_ERROR = f"Triton import error: {type(e).__name__}: {e}"
+    print(f"[SpargeAttn Debug] {TRITON_IMPORT_ERROR}")
 
 # Local module imports
 from .utils import hyperparameter_check, get_block_map_meansim
@@ -46,42 +55,63 @@ def get_cuda_arch_versions():
 
 def get_blackwell_config():
     """
-    Get optimized configuration for Blackwell GPUs (RTX 50xx, sm100+).
+    Get optimized configuration for Blackwell GPUs (RTX 50xx, sm100+ / sm120).
     
     Returns dict with Triton kernel parameters tuned for Blackwell architecture:
     - Enhanced L1 cache (128KB vs 64KB on Ada)
     - 5th gen Tensor Cores
     - FP8/BF16 optimization
+    
+    SM 12.0 (Blackwell) uses SM 9.0 (Hopper) kernels as fallback since they're
+    natively supported on Blackwell architecture.
     """
     if not torch.cuda.is_available():
         return {}
     
     capability = torch.cuda.get_device_capability(0)
-    is_blackwell = capability[0] >= 10  # Blackwell is sm100+
+    major, minor = capability
+    
+    # SM 12.0 is Blackwell (RTX 5070 Ti, etc.)
+    # SM 10.0+ is also Blackwell (different revision)
+    is_blackwell = major >= 10 or (major == 12)
+    
+    # SM 9.0 is Hopper (H100, etc.)
+    is_hopper = major == 9
     
     if is_blackwell:
+        # Blackwell configuration
+        # Use Hopper-compatible kernels as Blackwell supports them natively
         return {
             'num_warps': 8,
             'num_stages': 4,
             'BLOCK_M': 128,
             'BLOCK_N': 64,
             'prefer_fp8': True,
+            'arch': f'sm{major}{minor}',
+            'fallback_arch': 'sm90',  # Use Hopper kernels as fallback
+            'is_blackwell': True,
         }
-    elif capability[0] >= 9:  # Hopper (H100)
+    elif is_hopper:
+        # Hopper (H100) configuration
         return {
             'num_warps': 8,
             'num_stages': 4,
             'BLOCK_M': 64,
             'BLOCK_N': 128,
             'prefer_fp8': True,
+            'arch': f'sm{major}{minor}',
+            'is_blackwell': False,
         }
-    else:  # Ampere/Ada
+    else:
+        # Ampere/Ada (RTX 30xx, 40xx) configuration
         return {
             'num_warps': 4,
             'num_stages': 4,
             'BLOCK_M': 128,
             'BLOCK_N': 64,
             'prefer_fp8': False,
+            'arch': f'sm{major}{minor}',
+            'is_blackwell': False,
         }
 
 

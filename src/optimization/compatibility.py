@@ -180,6 +180,7 @@ spas_sage2_attn_meansim_topk = None
 block_sparse_sage2_attn = None
 SPARGE_SAGE2_AVAILABLE = False
 SPARGE_SAGE2_VERSION = None
+_SPARGE_IMPORT_ERROR = None  # Store error for diagnostics
 
 # Try local vendored implementation first (Triton JIT, no compilation needed)
 try:
@@ -191,7 +192,12 @@ try:
         block_sparse_sage2_attn = _block_sparse_sage2
         SPARGE_SAGE2_AVAILABLE = True
         SPARGE_SAGE2_VERSION = SPARGE_LOCAL_VERSION
+    else:
+        _SPARGE_IMPORT_ERROR = "Local SpargeAttn module loaded but SPARGE_LOCAL_AVAILABLE is False (Triton may not be available)"
 except (ImportError, AttributeError, OSError) as e:
+    _SPARGE_IMPORT_ERROR = f"Local import failed: {type(e).__name__}: {e}"
+    # Print diagnostic for debugging
+    print(f"[SpargeAttn Debug] {_SPARGE_IMPORT_ERROR}")
     # Fall back to globally installed package if local fails
     try:
         from spas_sage_attn import spas_sage2_attn_meansim_topk_cuda as _spas_sage2
@@ -199,13 +205,15 @@ except (ImportError, AttributeError, OSError) as e:
         spas_sage2_attn_meansim_topk = _spas_sage2
         block_sparse_sage2_attn = _block_sparse_sage2
         SPARGE_SAGE2_AVAILABLE = True
+        _SPARGE_IMPORT_ERROR = None  # Clear error on success
         try:
             import spas_sage_attn
             SPARGE_SAGE2_VERSION = getattr(spas_sage_attn, '__version__', 'unknown')
         except (ImportError, AttributeError):
             SPARGE_SAGE2_VERSION = 'unknown'
-    except (ImportError, AttributeError, OSError):
-        pass
+    except (ImportError, AttributeError, OSError) as e2:
+        _SPARGE_IMPORT_ERROR = f"Both local and global imports failed. Global error: {type(e2).__name__}: {e2}"
+        print(f"[SpargeAttn Debug] {_SPARGE_IMPORT_ERROR}")
 
 
 # Blackwell-specific Sage2 configuration for RTX 50xx GPUs
