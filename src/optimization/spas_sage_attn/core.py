@@ -382,6 +382,18 @@ def spas_sage2_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=
     Example:
         >>> output = spas_sage2_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False)
     """
+    # Get Blackwell configuration for kernel parameters
+    config = get_blackwell_config()
+    is_blackwell = config.get('is_blackwell', False)
+    
+    # Verification logging for Blackwell optimization
+    if is_blackwell:
+        num_warps = config.get('num_warps', 8)
+        num_stages = config.get('num_stages', 4)
+        block_m = config.get('BLOCK_M', 128)
+        block_n = config.get('BLOCK_N', 64)
+        print(f"!!! Sparge_Sage2 Kernel: topk={topk}, Blackwell=True, Warps={num_warps}, Stages={num_stages}, BlockM={block_m}, BlockN={block_n}")
+    
     # Sage2 uses same implementation as Sage1 for Triton-only version
     # The difference is in CUDA kernel optimizations (Sage2++) which require compilation
     # For local JIT, we use the Triton implementation with Sage2-tuned parameters

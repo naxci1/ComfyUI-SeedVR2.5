@@ -902,9 +902,25 @@ def call_sparge_sage2_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
     heads = q.shape[1]
     dim = q.shape[2]
     
-    # Get sparsity parameters
+    # Get sparsity parameters with explicit mapping
+    # Performance Mode Mapping: Fast=0.3, Balanced=0.5, High Quality=0.7
     topk = kwargs.get('topk', Sage2BlackwellConfig.DEFAULT_TOPK)
     is_causal = kwargs.get('causal', False)
+    
+    # Map topk value to performance mode name for logging
+    if abs(topk - 0.3) < 0.01:
+        perf_mode = "Fast"
+    elif abs(topk - 0.5) < 0.01:
+        perf_mode = "Balanced"
+    elif abs(topk - 0.7) < 0.01:
+        perf_mode = "High Quality"
+    else:
+        perf_mode = f"Custom({topk})"
+    
+    # Verification logging for Blackwell optimization using config constants
+    print(f"!!! Blackwell Optimization Active: Mode={perf_mode}, Threshold={topk}, "
+          f"Warps={Sage2BlackwellConfig.TRITON_NUM_WARPS}, Stages={Sage2BlackwellConfig.TRITON_NUM_STAGES}, "
+          f"BlockM={Sage2BlackwellConfig.TRITON_BLOCK_M}, BlockN={Sage2BlackwellConfig.TRITON_BLOCK_N}")
     
     # SpargeAttn requires half precision (fp16/bf16)
     out_dtype = q.dtype
