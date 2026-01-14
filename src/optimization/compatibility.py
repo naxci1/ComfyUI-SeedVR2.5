@@ -117,6 +117,7 @@ ensure_bitsandbytes_safe()
 
 import torch
 import os
+import math
 
 
 # Flash/Sage Attention & Triton Compatibility Layer
@@ -246,7 +247,6 @@ class Sage2BlackwellConfig:
         Returns:
             Tuple of (batch_size, num_heads, ceil(seq_len/128), ceil(seq_len/64))
         """
-        import math
         rows = math.ceil(seq_len / cls.BLOCK_ROWS)
         cols = math.ceil(seq_len / cls.BLOCK_COLS)
         return (batch_size, num_heads, rows, cols)
@@ -285,7 +285,7 @@ def validate_attention_mode(requested_mode: str, debug=None) -> str:
     Validate attention mode availability with automatic fallback.
     
     Args:
-        requested_mode: 'sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3'
+        requested_mode: 'sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', 'sageattn_3', or 'sparge_sage2'
         debug: Optional debug instance for logging
         
     Returns:
@@ -870,7 +870,7 @@ def call_sparge_sage2_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
         raise RuntimeError(
             "SpargeAttn/Sage2 requires uniform sequence lengths, "
             "and SageAttention 2 is not available as fallback. "
-            "Please install sageattention package or use flash_attn/sdpa instead."
+            "Install with: pip install sageattention, or use flash_attn/sdpa instead."
         )
     
     # Extract batch dimensions
