@@ -779,13 +779,16 @@ class Encoder3D(nn.Module):
             )
 
         # mid
+        # Note: attention_head_dim=block_out_channels[-1] creates 1 head x 512 dim
+        # The VAE attention processor handles dynamic head splitting (512 → 8×64) in forward pass
+        # This preserves the original weight structure while enabling Sparge/SageAttn compatibility
         self.mid_block = UNetMidBlock3D(
             in_channels=block_out_channels[-1],
             resnet_eps=1e-6,
             resnet_act_fn=act_fn,
             output_scale_factor=1,
             resnet_time_scale_shift="default",
-            attention_head_dim=block_out_channels[-1],
+            attention_head_dim=block_out_channels[-1],  # Keep original structure, dynamic splitting in forward
             resnet_groups=norm_num_groups,
             temb_channels=None,
             add_attention=mid_block_add_attention,
@@ -920,13 +923,17 @@ class Decoder3D(nn.Module):
         temb_channels = in_channels if norm_type == "spatial" else None
 
         # mid
+        # mid
+        # Note: attention_head_dim=block_out_channels[-1] creates 1 head x 512 dim
+        # The VAE attention processor handles dynamic head splitting (512 → 8×64) in forward pass
+        # This preserves the original weight structure while enabling Sparge/SageAttn compatibility
         self.mid_block = UNetMidBlock3D(
             in_channels=block_out_channels[-1],
             resnet_eps=1e-6,
             resnet_act_fn=act_fn,
             output_scale_factor=1,
             resnet_time_scale_shift="default" if norm_type == "group" else norm_type,
-            attention_head_dim=block_out_channels[-1],
+            attention_head_dim=block_out_channels[-1],  # Keep original structure, dynamic splitting in forward
             resnet_groups=norm_num_groups,
             temb_channels=temb_channels,
             add_attention=mid_block_add_attention,
@@ -1672,6 +1679,11 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                 
                 result[:, :, : decoded_tile.shape[2], y_out:y_out_end, x_out:x_out_end] += decoded_tile
                 count[:, :, :, y_out:y_out_end, x_out:x_out_end].addcmul_(weight_h_5d, weight_w_5d)
+                
+                # Blackwell sync: Force GPU to release locked memory after each tile
+                # This prevents the scheduler hang at end of Batch 1 on RTX 5070 Ti
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
 
         # Move result back to inference device if needed and normalize
         if result.device != z.device:

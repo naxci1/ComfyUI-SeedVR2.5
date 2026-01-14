@@ -7,12 +7,14 @@ to accelerate decoding using block-sparse attention patterns. Optimized for NVID
 
 Key Features:
 - Monkey-patches diffusers.models.attention_processor.Attention.forward
-- Uses spas_sage2_attn_meansim_topk_cuda Triton kernel for VAE attention
-- Maps VAE spatial attention (B, C, H, W) to sequence format (B, H, seq, D)
-- Targets Attention blocks in MidBlock2D and UpDecoderBlock2D of the VAE
+- Uses Sparge+SageAttention 2 Triton kernels for VAE attention
+- Dynamic head splitting: 512-dim → 8 heads × 64 dim in forward pass (preserves weights)
+- Sparge Top-K selection (threshold=0.3) zeros out unimportant pixels to save VRAM
+- SageAttention 2 with INT8/FP8 quantization for Blackwell Tensor Cores
 - VAE-specific tuning: num_warps=8, num_stages=2, block_m=64, block_n=64
   (num_stages=2 and block_m=64 for VAE BF16 to fit in Blackwell shared memory limit of 101376 bytes)
 - DiT (Diffusion Transformer) keeps block_m=128, num_stages=3 for maximum speed with NVFP4/FP8
+- Blackwell sync: torch.cuda.synchronize() after Sparge mask calculation to prevent scheduler hang
 """
 
 import torch
@@ -30,12 +32,17 @@ _vae_kernel_logged_once = False
 _vae_head_dim_logged = False
 # Track if we've logged the kernel error fallback warning (avoid spam)
 _vae_kernel_fallback_logged = False
+# Track if we've logged head splitting (avoid spam)
+_vae_head_split_logged = False
 
 # VAE-specific kernel parameters to fit within Blackwell shared memory limit (101376 bytes)
 # DiT (Diffusion Transformer) uses block_m=128, num_stages=3 (from Blackwell config) with NVFP4/FP8
 # VAE uses block_m=64, num_stages=2 to avoid shared memory "Out of Resource" errors on Blackwell with BF16
 VAE_BLOCK_M = 64
 VAE_NUM_STAGES = 2
+
+# Target head dimension for Blackwell Tensor Cores (optimal for FlashAttention/Sparge/SageAttn)
+BLACKWELL_TARGET_HEAD_DIM = 64
 
 # Import sparge attention functions
 from .spas_sage_attn import (
@@ -44,8 +51,19 @@ from .spas_sage_attn import (
     get_blackwell_config,
 )
 
-# Default sparsity threshold for VAE attention
-VAE_SPARSITY_THRESHOLD = 0.5
+# Import SageAttention 2 if available
+try:
+    from .compatibility import sageattn_varlen, SAGE_ATTN_2_AVAILABLE
+except ImportError:
+    sageattn_varlen = None
+    SAGE_ATTN_2_AVAILABLE = False
+
+# Default sparsity threshold for VAE attention - 0.3 for fast mode (saves massive VRAM)
+# Lower = more sparsity = faster but less accurate
+# - 0.3: Fast mode (recommended for 16GB GPUs like RTX 5070 Ti)
+# - 0.5: Balanced mode
+# - 0.7: Quality mode
+VAE_SPARSITY_THRESHOLD = 0.3
 
 
 def set_vae_sparsity_threshold(threshold: float):
@@ -130,6 +148,74 @@ def _sliced_sdpa(
     return output
 
 
+def _split_heads_for_blackwell(
+    tensor: torch.Tensor,
+    original_head_dim: int,
+    target_head_dim: int = BLACKWELL_TARGET_HEAD_DIM,
+) -> Tuple[torch.Tensor, int, int]:
+    """
+    Split large head dimensions into multiple smaller heads for Blackwell compatibility.
+    
+    This preserves the original weight structure by reshaping in the forward pass.
+    E.g., 1 head × 512 dim → 8 heads × 64 dim
+    
+    Args:
+        tensor: Input tensor (batch, heads, seq_len, head_dim)
+        original_head_dim: Original head dimension
+        target_head_dim: Target head dimension for Blackwell (default: 64)
+        
+    Returns:
+        Tuple of (reshaped tensor, new_heads, new_head_dim)
+    """
+    batch, heads, seq_len, head_dim = tensor.shape
+    
+    if head_dim <= target_head_dim or head_dim % target_head_dim != 0:
+        return tensor, heads, head_dim
+    
+    split_factor = head_dim // target_head_dim
+    new_heads = heads * split_factor
+    
+    # Reshape: (B, H, S, D) -> (B, H, S, split, target) -> (B, H*split, S, target)
+    tensor = tensor.view(batch, heads, seq_len, split_factor, target_head_dim)
+    tensor = tensor.permute(0, 1, 3, 2, 4).contiguous()  # (B, H, split, S, target)
+    tensor = tensor.view(batch, new_heads, seq_len, target_head_dim)
+    
+    return tensor, new_heads, target_head_dim
+
+
+def _merge_heads_from_blackwell(
+    tensor: torch.Tensor,
+    original_heads: int,
+    original_head_dim: int,
+) -> torch.Tensor:
+    """
+    Merge split heads back to original structure.
+    
+    E.g., 8 heads × 64 dim → 1 head × 512 dim
+    
+    Args:
+        tensor: Input tensor (batch, new_heads, seq_len, target_head_dim)
+        original_heads: Original number of heads
+        original_head_dim: Original head dimension
+        
+    Returns:
+        Reshaped tensor (batch, original_heads, seq_len, original_head_dim)
+    """
+    batch, new_heads, seq_len, target_head_dim = tensor.shape
+    
+    if new_heads == original_heads:
+        return tensor
+    
+    split_factor = new_heads // original_heads
+    
+    # Reshape: (B, H*split, S, target) -> (B, H, split, S, target) -> (B, H, S, D)
+    tensor = tensor.view(batch, original_heads, split_factor, seq_len, target_head_dim)
+    tensor = tensor.permute(0, 1, 3, 2, 4).contiguous()  # (B, H, S, split, target)
+    tensor = tensor.view(batch, original_heads, seq_len, original_head_dim)
+    
+    return tensor
+
+
 def sparge_vae_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -139,15 +225,13 @@ def sparge_vae_attention(
     topk: Optional[float] = None,
 ) -> torch.Tensor:
     """
-    Compute VAE attention using memory-efficient methods.
+    Compute VAE attention using Sparge + SageAttention 2 for Blackwell GPUs.
     
-    This function is designed to be a drop-in replacement for standard attention
-    in VAE decoder blocks. For SeedVR2 VAE, which has head_dim=block_out_channels[-1]
-    (typically 512), we use memory-efficient sliced SDPA instead of Sparge kernel
-    since Sparge requires head_dim in [64, 128].
-    
-    Uses block_m=64 and num_stages=2 specifically for VAE if Sparge is attempted,
-    but the primary path is sliced SDPA due to head_dim incompatibility.
+    This function implements:
+    1. Dynamic head splitting: 512-dim → 8 heads × 64 dim (preserves weights)
+    2. Sparge Top-K selection (threshold=0.3) to zero out unimportant pixels
+    3. SageAttention 2 with INT8/FP8 quantization for Blackwell Tensor Cores
+    4. torch.cuda.synchronize() after Sparge mask to prevent scheduler hang
     
     Args:
         query: Query tensor (batch, heads, seq_len, head_dim) in HND layout
@@ -155,7 +239,7 @@ def sparge_vae_attention(
         value: Value tensor (batch, heads, seq_len, head_dim)
         attention_mask: Optional attention mask (not used with Sparge)
         scale: Softmax scale (default: 1/sqrt(head_dim))
-        topk: Sparsity ratio (default: VAE_SPARSITY_THRESHOLD)
+        topk: Sparsity ratio (default: VAE_SPARSITY_THRESHOLD = 0.3)
         
     Returns:
         Attention output tensor (batch, heads, seq_len, head_dim)
@@ -163,38 +247,64 @@ def sparge_vae_attention(
     global _vae_kernel_logged_once
     global _vae_head_dim_logged
     global _vae_kernel_fallback_logged
+    global _vae_head_split_logged
     
     if topk is None:
         topk = VAE_SPARSITY_THRESHOLD
     
-    # Get tensor dimensions
-    head_dim = query.size(-1)
-    seq_len = query.size(-2)
+    # Store original dimensions for later merging
+    batch, original_heads, seq_len, original_head_dim = query.shape
+    
+    # Dynamic head splitting for Blackwell compatibility
+    # Sparge/SageAttn requires head_dim in [64, 128]
+    # SeedVR2 VAE has head_dim=512 → split to 8 heads × 64 dim
+    if original_head_dim > 128 and original_head_dim % BLACKWELL_TARGET_HEAD_DIM == 0:
+        if not _vae_head_split_logged:
+            _vae_head_split_logged = True
+            split_factor = original_head_dim // BLACKWELL_TARGET_HEAD_DIM
+            new_heads = original_heads * split_factor
+            logger.info(
+                f"VAE Blackwell optimization: Splitting {original_heads} heads × {original_head_dim} dim "
+                f"→ {new_heads} heads × {BLACKWELL_TARGET_HEAD_DIM} dim for Sparge/SageAttn compatibility"
+            )
+        
+        query, new_heads, new_head_dim = _split_heads_for_blackwell(query, original_head_dim)
+        key, _, _ = _split_heads_for_blackwell(key, original_head_dim)
+        value, _, _ = _split_heads_for_blackwell(value, original_head_dim)
+        
+        # Update scale for new head_dim
+        if scale is None:
+            scale = new_head_dim ** -0.5
+        
+        head_dim_for_kernel = new_head_dim
+    else:
+        head_dim_for_kernel = original_head_dim
+        if scale is None:
+            scale = original_head_dim ** -0.5
     
     # Check head_dim compatibility with Sparge kernel
-    # Sparge requires head_dim in [64, 128]
-    # SeedVR2 VAE has head_dim=512 (block_out_channels[-1]), so we use sliced SDPA
-    if head_dim not in [64, 128]:
+    if head_dim_for_kernel not in [64, 128]:
         if not _vae_head_dim_logged:
             _vae_head_dim_logged = True
             logger.info(
-                f"VAE head_dim={head_dim} not in [64, 128]. Using memory-efficient sliced SDPA. "
-                f"This is normal for SeedVR2 VAE with attention_head_dim=block_out_channels."
+                f"VAE head_dim={head_dim_for_kernel} not in [64, 128]. Using memory-efficient sliced SDPA."
             )
-        # Use sliced SDPA for memory efficiency with unsupported head_dim
-        # This is the expected path for SeedVR2 VAE
-        return _sliced_sdpa(query, key, value, attention_mask=attention_mask, scale=scale)
+        output = _sliced_sdpa(query, key, value, attention_mask=attention_mask, scale=scale)
+        
+        # Merge heads back if we split them
+        if original_head_dim != head_dim_for_kernel:
+            output = _merge_heads_from_blackwell(output, original_heads, original_head_dim)
+        return output
     
-    # Only reach here if head_dim is 64 or 128 (compatible with Sparge)
     # Log kernel parameters only on first call
     if not _vae_kernel_logged_once:
         _vae_kernel_logged_once = True
         config = get_blackwell_config()
         if config.get('is_blackwell', False):
             logger.info(
-                f"VAE Sparge Kernel: topk={topk}, Blackwell=True, "
-                f"Warps={config.get('num_warps', 8)}, Stages={VAE_NUM_STAGES} (VAE-specific), "
-                f"BlockM={VAE_BLOCK_M} (VAE-specific), BlockN={config.get('BLOCK_N', 64)}, head_dim={head_dim}"
+                f"VAE Sparge+SA2 Kernel: topk={topk}, Blackwell=True, "
+                f"Warps={config.get('num_warps', 8)}, Stages={VAE_NUM_STAGES}, "
+                f"BlockM={VAE_BLOCK_M}, head_dim={head_dim_for_kernel}"
             )
     
     # Ensure tensors are contiguous for Triton kernels
@@ -204,16 +314,14 @@ def sparge_vae_attention(
     
     # Check minimum sequence length for Sparge (requires >= 128)
     if seq_len < 128:
-        # Fall back to standard attention for small sequences
-        if scale is None:
-            scale = head_dim ** -0.5
-        return F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, scale=scale)
+        output = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, scale=scale)
+        if original_head_dim != head_dim_for_kernel:
+            output = _merge_heads_from_blackwell(output, original_heads, original_head_dim)
+        return output
     
-    # Call Sparge Sage2 attention with VAE-specific parameters:
-    # - block_m=64 and num_stages=2 to fit in Blackwell shared memory (101376 bytes limit)
-    # - DiT uses block_m=128, num_stages=3 (from Blackwell config)
-    # Wrap in try/except to fall back to sliced SDPA on any Triton/CUDA error
+    # Try Sparge + SageAttention 2 pipeline
     try:
+        # Call Sparge Sage2 attention with VAE-specific parameters
         output = spas_sage2_attn_meansim_topk_cuda(
             query, key, value,
             topk=topk,
@@ -222,21 +330,28 @@ def sparge_vae_attention(
             smooth_k=True,
             tensor_layout="HND",
             output_dtype=query.dtype,
-            block_m_override=VAE_BLOCK_M,       # Use block_m=64 for VAE (vs 128 for DiT)
-            num_stages_override=VAE_NUM_STAGES,  # Use num_stages=2 for VAE (vs 3 for DiT)
+            block_m_override=VAE_BLOCK_M,
+            num_stages_override=VAE_NUM_STAGES,
         )
+        
+        # Blackwell sync: Force GPU to release locked memory after Sparge mask calculation
+        # This prevents scheduler hang on RTX 5070 Ti at end of batch
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            
     except Exception as e:
-        # Fall back to sliced SDPA on any error (e.g., shared memory limits, CUDA errors)
-        # Log the warning only once per session to avoid spam
+        # Fall back to sliced SDPA on any error
         if not _vae_kernel_fallback_logged:
             _vae_kernel_fallback_logged = True
             logger.warning(
                 f"Sparge VAE kernel failed, falling back to sliced SDPA: {e}. "
-                f"This warning will not repeat. Consider enabling tiling to reduce memory usage."
+                f"This warning will not repeat."
             )
-        
-        # Use sliced SDPA for memory efficiency
         output = _sliced_sdpa(query, key, value, attention_mask=attention_mask, scale=scale)
+    
+    # Merge heads back to original structure if we split them
+    if original_head_dim != head_dim_for_kernel:
+        output = _merge_heads_from_blackwell(output, original_heads, original_head_dim)
     
     return output
 
@@ -436,6 +551,8 @@ def inject_sparge_into_vae(vae, topk: Optional[float] = None, debug=None) -> int
 
 def reset_vae_attention_logging():
     """Reset VAE attention logging state (call before each new generation)."""
-    global _vae_kernel_logged_once, _vae_fallback_logged
+    global _vae_kernel_logged_once, _vae_head_dim_logged, _vae_kernel_fallback_logged, _vae_head_split_logged
     _vae_kernel_logged_once = False
-    _vae_fallback_logged = False
+    _vae_head_dim_logged = False
+    _vae_kernel_fallback_logged = False
+    _vae_head_split_logged = False

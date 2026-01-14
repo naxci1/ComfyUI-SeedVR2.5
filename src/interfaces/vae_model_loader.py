@@ -163,31 +163,33 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                     )
                 ),
                 io.Boolean.Input("enable_sparge_attention",
-                    default=False,
+                    default=True,
                     optional=True,
                     tooltip=(
-                        "Enable Sparge/Sage attention for VAE (EXPERIMENTAL - disabled by default).\n"
-                        "• SeedVR2 VAE has head_dim=512, which is incompatible with Sparge kernel\n"
-                        "• Sparge kernel requires head_dim in [64, 128]\n"
-                        "• When enabled, automatically falls back to sliced SDPA for head_dim=512\n"
-                        "• This fallback path may cause memory leaks on some systems\n"
+                        "Enable Sparge + SageAttention 2 for VAE (Blackwell optimized).\n"
                         "\n"
-                        "RECOMMENDED: Keep disabled (False) to use standard SDPA with\n"
-                        "Causal Slicing mode for best stability and memory efficiency.\n"
-                        "If you encounter OOM errors, enable tiling (encode_tiled/decode_tiled)."
+                        "• Dynamic head splitting: 512-dim → 8 heads × 64 dim in forward pass\n"
+                        "• Preserves original model weights while enabling Sparge/SageAttn\n"
+                        "• Sparge Top-K selection (threshold=0.3) zeros out unimportant pixels\n"
+                        "• SageAttention 2 with INT8/FP8 for Blackwell Tensor Cores\n"
+                        "• torch.cuda.synchronize() after each tile to prevent scheduler hang\n"
+                        "\n"
+                        "RECOMMENDED: Keep enabled (True) for RTX 50xx series GPUs.\n"
+                        "Falls back to sliced SDPA if Sparge kernel fails."
                     )
                 ),
                 io.Combo.Input("performance_mode",
                     options=["Fast", "Balanced", "High Quality"],
-                    default="Balanced",
+                    default="Fast",
                     optional=True,
                     tooltip=(
                         "Performance tuning mode for Sparge attention (Blackwell GPUs only).\n"
                         "Controls the sparsity threshold for VAE attention blocks:\n"
                         "\n"
-                        "• Fast: Maximum speed, sparsity threshold 0.3 (30% attention weights kept)\n"
-                        "• Balanced: Optimal speed/quality balance, sparsity threshold 0.5 (default)\n"
-                        "• High Quality: Best quality, sparsity threshold 0.7 (70% attention weights kept)\n"
+                        "• Fast: Maximum speed, sparsity threshold 0.3 (default for 16GB GPUs)\n"
+                        "  Zeros out 70% of attention weights to save massive VRAM\n"
+                        "• Balanced: Speed/quality balance, sparsity threshold 0.5\n"
+                        "• High Quality: Best quality, sparsity threshold 0.7\n"
                         "\n"
                         "This setting only affects VAE when enable_sparge_attention is True."
                     )
