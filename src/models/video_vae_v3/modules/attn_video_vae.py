@@ -844,10 +844,15 @@ class Encoder3D(nn.Module):
         else:
             # down
             # [Override] add extra block and extra cond
-            for down_block, extra_block in zip(self.down_blocks, self.conv_extra_cond):
+            for i, (down_block, extra_block) in enumerate(zip(self.down_blocks, self.conv_extra_cond)):
                 sample = down_block(sample, memory_state=memory_state)
                 if extra_block is not None:
                     sample = sample + safe_interpolate_operation(extra_block(extra_cond), size=sample.shape[2:])
+                # Aggressive cache clearing between ResnetBlock3D and next block to prevent OOM
+                # This is critical for 16GB GPUs (Blackwell) at high resolutions (720p+, 81+ frames)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    gc.collect()
 
             # middle
             sample = self.mid_block(sample, memory_state=memory_state)

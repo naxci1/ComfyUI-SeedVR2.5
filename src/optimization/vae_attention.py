@@ -11,8 +11,8 @@ Key Features:
 - Dynamic head splitting: 512-dim → 8 heads × 64 dim in forward pass (preserves weights)
 - Sparge Top-K selection (threshold=0.3) zeros out unimportant pixels to save VRAM
 - SageAttention 2 with INT8/FP8 quantization for Blackwell Tensor Cores
-- VAE-specific tuning: num_warps=8, num_stages=2, block_m=64, block_n=64
-  (num_stages=2 and block_m=64 for VAE BF16 to fit in Blackwell shared memory limit of 101376 bytes)
+- VAE-specific tuning: num_warps=8, num_stages=2, block_m=32, block_n=64
+  (num_stages=2 and block_m=32 for VAE BF16 to minimize peak VRAM on Blackwell)
 - DiT (Diffusion Transformer) keeps block_m=128, num_stages=3 for maximum speed with NVFP4/FP8
 - Blackwell sync: torch.cuda.synchronize() after Sparge mask calculation to prevent scheduler hang
 """
@@ -37,8 +37,9 @@ _vae_head_split_logged = False
 
 # VAE-specific kernel parameters to fit within Blackwell shared memory limit (101376 bytes)
 # DiT (Diffusion Transformer) uses block_m=128, num_stages=3 (from Blackwell config) with NVFP4/FP8
-# VAE uses block_m=64, num_stages=2 to avoid shared memory "Out of Resource" errors on Blackwell with BF16
-VAE_BLOCK_M = 64
+# VAE uses block_m=32, num_stages=2 to minimize VRAM peak allocation for OOM prevention on Blackwell with BF16
+# Reduced from 64 to 32 for even lower peak VRAM at the cost of slight speed loss
+VAE_BLOCK_M = 32
 VAE_NUM_STAGES = 2
 
 # Target head dimension for Blackwell Tensor Cores (optimal for FlashAttention/Sparge/SageAttn)

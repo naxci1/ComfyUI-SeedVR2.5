@@ -196,23 +196,24 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                 ),
                 io.Combo.Input("vae_precision",
                     options=["auto", "fp16", "bf16", "fp8_e4m3fn"],
-                    default="auto",
+                    default="bf16",
                     optional=True,
                     tooltip=(
                         "VAE model precision override:\n"
                         "\n"
-                        "• auto: Detect precision from filename (default)\n"
+                        "• auto: Detect precision from filename\n"
                         "  - Files with 'fp8' or 'e4m3fn' → FP8 loading\n"
                         "  - Other files → Use compute dtype (fp16/bf16)\n"
                         "• fp16: Force FP16 (16-bit floating point)\n"
-                        "• bf16: Force BF16 (Brain Float 16)\n"
+                        "• bf16: Force BF16 (Brain Float 16) - DEFAULT for Blackwell\n"
+                        "  - More memory-efficient on Blackwell GPUs\n"
+                        "  - Avoids 'forced to FP16' overhead\n"
                         "• fp8_e4m3fn: Force FP8 E4M3 format (8-bit float)\n"
                         "  - E4M3FN = 4 exponent bits, 3 mantissa bits, no infinity\n"
                         "  - Optimized for RTX 50xx (Blackwell) Tensor Cores\n"
                         "  - Also works on RTX 40xx (Ada) with reduced precision\n"
                         "\n"
-                        "Use 'fp8_e4m3fn' to force the FP8 Tensor Core path\n"
-                        "even if the filename doesn't contain 'fp8'."
+                        "RECOMMENDED: Use 'bf16' for best stability on RTX 50xx."
                     )
                 ),
                 io.Custom("TORCH_COMPILE_ARGS").Input("torch_compile_args",
