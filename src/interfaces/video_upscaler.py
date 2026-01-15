@@ -385,15 +385,8 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
         vae_encoder_sa2 = vae.get("vae_encoder_sa2", True)
         vae_decoder_sa2 = vae.get("vae_decoder_sa2", False)
         
-        # FORCE TILING for 720p+ to prevent OOM on 16GB Blackwell GPUs
-        # Resolution 720 = 1280x720, which causes OOM without tiling
-        if resolution >= 720:
-            if not decode_tiled:
-                decode_tiled = True
-                print(f"[VAE-CTRL] Auto-enabled decode_tiled for 720p+ resolution ({resolution}p)")
-            if not encode_tiled:
-                encode_tiled = True
-                print(f"[VAE-CTRL] Auto-enabled encode_tiled for 720p+ resolution ({resolution}p)")
+        # RESPECT UI TOGGLES - DO NOT auto-force tiling
+        # User controls encode_tiled and decode_tiled directly
 
         # TorchCompile args (optional connection, can be None)
         dit_torch_compile_args = dit.get("torch_compile_args")
@@ -495,10 +488,14 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             # Configure VAE SA2 settings from UI toggles BEFORE any VAE operations
             # This sets the global state that the patched Attention.forward() reads dynamically
             from ..optimization.vae_attention import configure_vae_sa2, set_vae_phase
-            configure_vae_sa2(encoder_sa2=vae_encoder_sa2, decoder_sa2=vae_decoder_sa2)
+            
+            # Only configure SA2 if at least one phase uses it
+            # When both are False, VAE uses native PyTorch SDPA (fastest path)
+            if vae_encoder_sa2 or vae_decoder_sa2:
+                configure_vae_sa2(encoder_sa2=vae_encoder_sa2, decoder_sa2=vae_decoder_sa2)
             
             # Phase 1: Encode
-            set_vae_phase("encoder")  # Set phase for logging context
+            set_vae_phase("encoder")
             ctx = encode_all_batches(
                 runner,
                 ctx=ctx,
@@ -530,7 +527,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             )
 
             # Phase 3: Decode
-            set_vae_phase("decoder")  # Set phase for logging context
+            set_vae_phase("decoder")
             ctx = decode_all_batches(
                 runner,
                 ctx=ctx,

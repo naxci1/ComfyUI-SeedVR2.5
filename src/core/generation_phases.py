@@ -859,15 +859,11 @@ def decode_all_batches(
     debug.log("━━━━━━━━ Phase 3: VAE decoding ━━━━━━━━", category="none", force=True)
     debug.start_timer("phase3_decoding")
     
-    # Aggressive GPU memory cleanup before Phase 3 to prevent OOM from DiT residue
-    # This is critical on 16GB GPUs (Blackwell) where Phase 2 uses significant VRAM
-    # Order matters: gc.collect() first to break Python reference cycles, then empty_cache()
-    gc.collect()  # Force Python GC to release PyTorch tensor references
+    # Memory cleanup before Phase 3 (only run once, not aggressively)
+    gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()  # Collect inter-process shared CUDA tensors
-        torch.cuda.synchronize()  # Ensure all GPU operations are complete before proceeding
-        debug.log("GPU memory aggressively cleared before Phase 3 (gc + empty_cache + ipc_collect + sync)", category="memory")
+        torch.cuda.synchronize()
 
     # Count valid latents
     num_valid_latents = len([l for l in ctx['all_upscaled_latents'] if l is not None])
