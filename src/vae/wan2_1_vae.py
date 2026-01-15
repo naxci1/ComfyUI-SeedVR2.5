@@ -98,11 +98,10 @@ class AttentionBlock(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, num_heads, HW, head_dim)
         q, k, v = qkv[0], qkv[1], qkv[2]
         
-        # Attention
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = F.softmax(attn, dim=-1)
+        # Attention using PyTorch SDPA (faster than manual implementation, memory efficient)
+        # SDPA automatically selects the best backend: Flash Attention, Memory Efficient, or Math
+        out = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
         
-        out = attn @ v
         out = out.transpose(1, 2).reshape(batch_size, height * width, channels)
         out = self.proj(out)
         

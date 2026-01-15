@@ -128,62 +128,85 @@ def detect_edges_batch(
     debug: Optional['Debug'] = None
     ) -> torch.Tensor:
     """
-    Detect edges in a batch of images using Sobel or Canny.
+    Detect edges in a batch of images using Sobel operator.
+    
+    Uses GPU-native PyTorch Sobel operator for efficient batch processing
+    without CPU round-trips. Falls back to CPU OpenCV for Canny method only.
     
     Args:
         images: Tensor of shape (T, C, H, W) in range [-1, 1] or [0, 1]
-        method: 'sobel' or 'canny'
+        method: 'sobel' (GPU-accelerated) or 'canny' (CPU fallback)
         debug: Optional debug instance for logging
         
     Returns:
         Edge map tensor of shape (T, 1, H, W) in range [0, 1]
     """
-    # Convert to float32 for OpenCV processing (will be converted to numpy anyway)
+    # Convert to float32 for numerical stability
     images, images_dtype = ensure_float32_precision(images, force_float32=True)
     
-    images_np = images.cpu().numpy()
-    T, C, H, W = images_np.shape
+    T, C, H, W = images.shape
+    device = images.device
     
-    # Denormalize if needed
-    if images_np.min() < 0:
-        images_np = (images_np + 1) / 2
+    # Denormalize if needed (in-place for efficiency)
+    if images.min() < 0:
+        images = (images + 1) * 0.5
     
-    # Convert to 0-255 uint8
-    images_np = (images_np * 255).clip(0, 255).astype(np.uint8)
-    
-    edges = []
-    for t in range(T):
-        frame = images_np[t].transpose(1, 2, 0)
-        
+    # GPU-native Sobel implementation for 'sobel' method
+    if method == 'sobel':
+        # Convert to grayscale using weighted average (ITU-R 601-2 luma transform)
         if C == 3:
-            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+            # weights: R=0.299, G=0.587, B=0.114
+            gray = images[:, 0:1] * 0.299 + images[:, 1:2] * 0.587 + images[:, 2:3] * 0.114
         else:
-            gray = frame[..., 0]
+            gray = images[:, 0:1]
         
-        if method == 'sobel':
-            sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-            sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-            edge = np.sqrt(sobelx**2 + sobely**2)
-            edge = (edge / edge.max() * 255).astype(np.uint8)
-        else:
+        # Sobel kernels (3x3)
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
+                               dtype=torch.float32, device=device).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
+                               dtype=torch.float32, device=device).view(1, 1, 3, 3)
+        
+        # Apply Sobel filters with replicate padding (same as OpenCV default)
+        gray_padded = F.pad(gray, (1, 1, 1, 1), mode='replicate')
+        gx = F.conv2d(gray_padded, sobel_x)
+        gy = F.conv2d(gray_padded, sobel_y)
+        
+        # Compute gradient magnitude
+        edges = torch.sqrt(gx.pow(2) + gy.pow(2))
+        
+        # Normalize to [0, 1] range (per-batch normalization for consistency)
+        # Use dtype-aware epsilon for numerical stability
+        edge_max = edges.amax(dim=(2, 3), keepdim=True).clamp(min=1e-5)
+        edges = edges / edge_max
+        
+        del gray, gray_padded, gx, gy, sobel_x, sobel_y
+        
+    else:
+        # Canny method - requires CPU/OpenCV fallback
+        images_np = images.cpu().numpy()
+        images_np = (images_np * 255).clip(0, 255).astype(np.uint8)
+        
+        edges_list = []
+        for t in range(T):
+            frame = images_np[t].transpose(1, 2, 0)
+            
+            if C == 3:
+                gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+            else:
+                gray = frame[..., 0]
+            
             edge = cv2.Canny(gray, 50, 150)
+            edges_list.append(edge)
         
-        edges.append(edge)
+        edges = np.stack(edges_list)
+        edges = torch.from_numpy(edges).float() / 255.0
+        edges = edges.unsqueeze(1).to(device)
+        
+        del images_np, edges_list
     
-    edges = np.stack(edges)
-    edges = torch.from_numpy(edges).float() / 255.0
-    edges = edges.unsqueeze(1)
-    
-    # Move back to images device after CPU numpy processing
-    edges = manage_tensor(
-        tensor=edges,
-        target_device=images.device,
-        tensor_name="edge_map",
-        dtype=images_dtype,
-        debug=debug,
-        reason="edge detection result",
-        indent_level=1
-    )
+    # Convert to original dtype
+    if edges.dtype != images_dtype:
+        edges = edges.to(images_dtype)
     
     return edges
 
@@ -217,16 +240,9 @@ def guided_filter_pytorch(guide: torch.Tensor, src: torch.Tensor,
     # Apply guided filter
     output = _apply_guided_filter(guide_gray, src, radius, eps)
     
-    # Restore original dtype after float32 processing
+    # Restore original dtype after float32 processing (same device, just dtype conversion)
     if output.dtype != guide_dtype:
-        output = manage_tensor(
-            tensor=output,
-            target_device=output.device,
-            tensor_name="filtered_output",
-            dtype=guide_dtype,
-            debug=debug,
-            reason="dtype restoration"
-        )
+        output = output.to(guide_dtype)
     
     return output
 
@@ -328,10 +344,11 @@ def edge_guided_alpha_upscale(
         debug.log(f"Binary ratio: {binary_ratio:.2%}", category="alpha", indent_level=1)
         debug.log("Creating tight edge-aligned transitions", category="alpha", indent_level=1)
     
-    # Normalize RGB from [-1, 1] to [0, 1] for edge detection
-    rgb_normalized = upscaled_rgb.clone()
-    if rgb_normalized.min() < 0:
-        rgb_normalized = (rgb_normalized + 1) / 2
+    # Normalize RGB from [-1, 1] to [0, 1] for edge detection (avoid clone if already normalized)
+    if upscaled_rgb.min() < 0:
+        rgb_normalized = (upscaled_rgb + 1) * 0.5
+    else:
+        rgb_normalized = upscaled_rgb
     
     # Detect edges in upscaled RGB
     rgb_edges = detect_edges_batch(images=rgb_normalized, method='sobel', debug=debug)

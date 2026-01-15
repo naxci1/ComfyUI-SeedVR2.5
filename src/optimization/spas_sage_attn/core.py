@@ -7,6 +7,11 @@ optimized for NVIDIA Blackwell (RTX 50xx) GPUs.
 The implementation uses pure Triton kernels that compile JIT on first use,
 avoiding the need for pre-compiled CUDA extensions.
 
+Windows Compatibility:
+- Automatic SDPA fallback when Triton kernel compilation fails
+- Runtime error handling for WDDM driver memory alignment issues
+- Graceful degradation to PyTorch's scaled_dot_product_attention
+
 Original Copyright (c) 2025 by SpargeAttn team.
 Licensed under the Apache License, Version 2.0
 """
@@ -16,12 +21,18 @@ import torch.nn.functional as F
 from einops import rearrange
 import math
 import logging
+import os
+import platform
 
 # Configure logging for Blackwell kernel verification
 logger = logging.getLogger("SeedVR2.Blackwell")
 
 # Track if we've logged once (to avoid spam during execution)
 _kernel_logged_once = False
+_sdpa_fallback_warned = False  # Track if we've warned about SDPA fallback
+
+# Windows-specific detection
+IS_WINDOWS = platform.system() == 'Windows'
 
 # Try to import Triton - required for JIT compilation
 # Supports both regular triton and triton-windows packages
@@ -121,6 +132,76 @@ def get_blackwell_config():
             'is_blackwell': False,
         }
 
+
+def _sdpa_fallback_attention(q, k, v, is_causal=False, scale=None, tensor_layout="HND", output_dtype=None):
+    """
+    Fallback to PyTorch's scaled_dot_product_attention when Triton fails.
+    
+    This provides a robust fallback for:
+    - Windows WDDM driver memory alignment issues
+    - Triton JIT compilation failures
+    - CUDA kernel launch errors
+    
+    Args:
+        q: Query tensor
+        k: Key tensor  
+        v: Value tensor
+        is_causal: Whether to use causal masking
+        scale: Softmax scale (default: 1/sqrt(head_dim))
+        tensor_layout: 'HND' or 'NHD'
+        output_dtype: Output dtype (default: same as input)
+        
+    Returns:
+        Attention output tensor
+    """
+    global _sdpa_fallback_warned
+    
+    if not _sdpa_fallback_warned:
+        _sdpa_fallback_warned = True
+        warning_msg = (
+            "⚠️ SpargeAttn/Sage2 kernel failed - using PyTorch SDPA fallback.\n"
+            "   This may indicate Triton compilation issues on Windows.\n"
+            "   SDPA provides good performance but without sparse attention optimization."
+        )
+        print(warning_msg, flush=True)
+        logger.warning(warning_msg)
+    
+    # Convert layout if needed
+    if tensor_layout == 'NHD':
+        q = rearrange(q, '... L H D -> ... H L D')
+        k = rearrange(k, '... L H D -> ... H L D')
+        v = rearrange(v, '... L H D -> ... H L D')
+    
+    dtype = q.dtype
+    if output_dtype is None:
+        output_dtype = dtype
+    
+    # SDPA works best with half precision
+    half_dtypes = (torch.float16, torch.bfloat16)
+    if q.dtype not in half_dtypes:
+        q = q.to(torch.bfloat16)
+        k = k.to(torch.bfloat16)
+        v = v.to(torch.bfloat16)
+    
+    # Compute scale if not provided
+    if scale is None:
+        scale = 1.0 / math.sqrt(q.size(-1))
+    
+    # Use PyTorch SDPA with automatic backend selection
+    # On CUDA, this will try Flash Attention -> Memory Efficient -> Math fallback
+    out = F.scaled_dot_product_attention(
+        q, k, v,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=is_causal,
+        scale=scale
+    )
+    
+    # Convert layout back if needed
+    if tensor_layout == 'NHD':
+        out = rearrange(out, '... H L D -> ... L H D')
+    
+    return out.to(output_dtype)
 
 if TRITON_AVAILABLE:
     @triton.jit
@@ -288,6 +369,7 @@ def spas_sage_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=N
     SpargeAttn with mean-similarity based top-k block selection.
     
     This is the base Sage1 implementation optimized for sparse attention.
+    Includes automatic SDPA fallback for Windows/Triton compatibility issues.
     
     Args:
         q: Query tensor (batch, heads, seq_len, head_dim) for HND layout
@@ -304,13 +386,29 @@ def spas_sage_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=N
     Returns:
         Attention output tensor
     """
+    # Fallback to SDPA if Triton is not available
     if not TRITON_AVAILABLE:
-        raise RuntimeError("Triton is required for local SpargeAttn. Install with: pip install triton")
+        result = _sdpa_fallback_attention(q, k, v, is_causal=is_causal, scale=scale,
+                                          tensor_layout=tensor_layout, output_dtype=output_dtype)
+        if return_sparsity:
+            return result, 0.0  # No sparsity with SDPA
+        return result
+    
+    # Save original tensors for fallback
+    q_orig, k_orig, v_orig = q, k, v
+    original_layout = tensor_layout
     
     if tensor_layout == 'NHD':
         q, k, v = map(lambda t: rearrange(t, '... L H D -> ... H L D'), (q, k, v))
     
-    assert q.size(-2) >= 128, "seq_len should be not less than 128."
+    # Check seq_len requirement - fallback to SDPA for small sequences
+    if q.size(-2) < 128:
+        result = _sdpa_fallback_attention(q_orig, k_orig, v_orig, is_causal=is_causal, scale=scale,
+                                          tensor_layout=original_layout, output_dtype=output_dtype)
+        if return_sparsity:
+            return result, 0.0
+        return result
+    
     torch.cuda.set_device(v.device)
 
     dtype = q.dtype
@@ -330,30 +428,55 @@ def spas_sage_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=N
     cdfthreshd = 0.9 + topk * 0.08        # Range 0.9-0.98
     pvthreshd = int(10 + topk * 40)       # Range 10-50
     
-    k_block_indices = get_block_map_meansim(q, k, is_causal=is_causal, 
-                                            simthreshd1=simthreshd1, 
-                                            cdfthreshd=cdfthreshd)
-    headdim = q.size(-1)
+    try:
+        k_block_indices = get_block_map_meansim(q, k, is_causal=is_causal, 
+                                                simthreshd1=simthreshd1, 
+                                                cdfthreshd=cdfthreshd)
+        headdim = q.size(-1)
 
-    assert headdim in [64, 128], "headdim should be in [64, 128]."
+        # Check head dimension requirement - fallback gracefully instead of raising
+        if headdim not in [64, 128]:
+            logger.info(f"Unsupported head dimension {headdim} (requires 64 or 128), using SDPA fallback")
+            result = _sdpa_fallback_attention(q_orig, k_orig, v_orig, is_causal=is_causal, scale=scale,
+                                              tensor_layout=original_layout, output_dtype=output_dtype)
+            if return_sparsity:
+                return result, 0.0
+            return result
 
-    q_int8, q_scale, k_int8, k_scale = per_block_int8(q, k)
-    pvthreshd_tensor = hyperparameter_check(pvthreshd, q.size(-3), q.device)
-    
-    o = _triton_forward(q_int8, k_int8, k_block_indices, v, q_scale, k_scale, 
-                        pvthreshd_tensor, is_causal=is_causal, 
-                        tensor_layout="HND", output_dtype=output_dtype)
+        q_int8, q_scale, k_int8, k_scale = per_block_int8(q, k)
+        pvthreshd_tensor = hyperparameter_check(pvthreshd, q.size(-3), q.device)
+        
+        o = _triton_forward(q_int8, k_int8, k_block_indices, v, q_scale, k_scale, 
+                            pvthreshd_tensor, is_causal=is_causal, 
+                            tensor_layout="HND", output_dtype=output_dtype)
 
-    if tensor_layout == 'NHD':
-        o = rearrange(o, '... H L D -> ... L H D')
-    
-    if return_sparsity:
-        total_blocks = k_block_indices.numel()
-        sparse_blocks = (k_block_indices == 0).sum().item()
-        sparsity = sparse_blocks / total_blocks
-        return o.to(output_dtype), sparsity
-    
-    return o.to(output_dtype)
+        if original_layout == 'NHD':
+            o = rearrange(o, '... H L D -> ... L H D')
+        
+        if return_sparsity:
+            total_blocks = k_block_indices.numel()
+            sparse_blocks = (k_block_indices == 0).sum().item()
+            sparsity = sparse_blocks / total_blocks
+            return o.to(output_dtype), sparsity
+        
+        return o.to(output_dtype)
+        
+    except (RuntimeError, OSError) as e:
+        # Catch specific CUDA/Triton errors that indicate kernel failure
+        # RuntimeError: Common for CUDA errors, Triton compilation failures
+        # OSError: Common for DLL loading issues on Windows
+        error_msg = str(e)
+        if IS_WINDOWS or "triton" in error_msg.lower() or "kernel" in error_msg.lower():
+            logger.warning(f"SpargeAttn kernel error (falling back to SDPA): {error_msg}")
+        else:
+            logger.warning(f"SpargeAttn error: {error_msg}")
+        
+        # Fallback to SDPA
+        result = _sdpa_fallback_attention(q_orig, k_orig, v_orig, is_causal=is_causal, scale=scale,
+                                          tensor_layout=original_layout, output_dtype=output_dtype)
+        if return_sparsity:
+            return result, 0.0
+        return result
 
 
 @torch.compiler.disable  
