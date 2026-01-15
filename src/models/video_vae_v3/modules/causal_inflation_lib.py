@@ -201,6 +201,8 @@ class InflatedCausalConv3d(Conv3d):
             # Update cache.
             cache = next_cache
 
+        # Concatenate splits with explicit memory cleanup between tiles
+        # to prevent VRAM accumulation on 16GB GPUs (Blackwell)
         output = retry_on_oom(
             torch.cat,
             x,
@@ -208,6 +210,14 @@ class InflatedCausalConv3d(Conv3d):
             debug=getattr(self, 'debug', None),
             operation_name="InflatedCausalConv3d.concat_splits"
         )
+        
+        # Free intermediate split tensors to release VRAM before returning
+        # This is critical for Phase 3 (decoding) on memory-constrained GPUs
+        # Set to None instead of del to avoid IndexError from shrinking list
+        for i in range(len(x)):
+            x[i] = None
+        x.clear()
+        
         return output
 
     def forward(

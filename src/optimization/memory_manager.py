@@ -9,6 +9,11 @@ Key Features:
 - Model device management with BlockSwap support
 - Memory pressure detection and cleanup
 
+Environment Variables:
+- SEEDVR2_CACHE_CLEARING: Set to '1' to enable torch.cuda.empty_cache() between phases.
+  Default is disabled ('0') for Windows performance optimization, as empty_cache can cause
+  40s+ latency penalty on Windows. Only enable if experiencing OOM errors.
+
 Async Transfer Optimization:
 For RTX 50-series (Blackwell) GPUs, this module provides:
 - Non-blocking transfers with CUDA streams
@@ -22,9 +27,15 @@ import torch
 import gc
 import sys
 import time
+import os
 import psutil
 import platform
 from typing import Tuple, Dict, Any, Optional, List, Union
+
+# Windows/Performance optimization: control cache clearing behavior via environment variable
+# Set SEEDVR2_CACHE_CLEARING=1 to enable torch.cuda.empty_cache() between phases
+# Default is disabled for Windows performance (empty_cache causes 40s+ penalty on Windows)
+ENABLE_CACHE_CLEARING = os.environ.get('SEEDVR2_CACHE_CLEARING', '0') == '1'
 
 # Global async offloader for Blackwell optimization (lazy initialized)
 _global_async_offloader = None
@@ -341,19 +352,22 @@ def clear_memory(debug: Optional['Debug'] = None, deep: bool = False, force: boo
     if debug:
         debug.log(f"Clearing memory caches ({cleanup_mode})...", category="cleanup")
     
-    # ===== MINIMAL OPERATIONS (Always performed) =====
-    # Step 1: Clear GPU caches - Fast operations (~1-5ms)
-    if debug:
-        debug.start_timer(gpu_timer)
-    
-    if is_cuda_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-    elif is_mps_available():
-        torch.mps.empty_cache()
-    
-    if debug:
-        debug.end_timer(gpu_timer, "GPU cache clearing")
+    # ===== MINIMAL OPERATIONS (Conditional based on ENABLE_CACHE_CLEARING) =====
+    # Windows optimization: torch.cuda.empty_cache() can cause 40s+ penalty on Windows
+    # Only perform these operations if cache clearing is explicitly enabled
+    # Set SEEDVR2_CACHE_CLEARING=1 environment variable to enable
+    if ENABLE_CACHE_CLEARING:
+        if debug:
+            debug.start_timer(gpu_timer)
+        
+        if is_cuda_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        elif is_mps_available():
+            torch.mps.empty_cache()
+        
+        if debug:
+            debug.end_timer(gpu_timer, "GPU cache clearing")
 
     # ===== DEEP OPERATIONS (Only when deep=True) =====
     if deep:

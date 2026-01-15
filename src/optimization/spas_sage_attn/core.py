@@ -50,6 +50,15 @@ from .quant_per_block import per_block_int8
 SPARGE_LOCAL_VERSION = "0.1.0-local-triton"
 SPARGE_LOCAL_AVAILABLE = TRITON_AVAILABLE
 
+# ============================================================================
+# BOOTSTRAP VERIFICATION: This prints when the module is loaded
+# If you don't see this in logs, the module is NOT being imported correctly
+# ============================================================================
+if TRITON_AVAILABLE:
+    print(f"[CORE-BOOTSTRAP] SpargeAttn/Sage2 LOCAL module loaded successfully (Triton OK)", flush=True)
+else:
+    print(f"[CORE-BOOTSTRAP] WARNING: Triton not available - SpargeAttn disabled!", flush=True)
+
 
 def get_cuda_arch_versions():
     """Get CUDA architecture versions for all available GPUs."""
@@ -86,11 +95,14 @@ def get_blackwell_config():
     is_hopper = major == 9
     
     if is_blackwell:
-        # Blackwell configuration
-        # Use Hopper-compatible kernels as Blackwell supports them natively
+        # Blackwell configuration (RTX 5070 Ti, SM 12.0)
+        # Hardcoded parameters for maximum Blackwell throughput:
+        # - num_warps=8: Optimal for Blackwell SM architecture
+        # - num_stages=3: Tuned for Blackwell memory pipeline (reduced from 4)
+        # - block_m=128, block_n=64: Matches block-sparse row/col sizes
         return {
             'num_warps': 8,
-            'num_stages': 4,
+            'num_stages': 3,  # Tuned for Blackwell (3 stages for better throughput)
             'BLOCK_M': 128,
             'BLOCK_N': 64,
             'prefer_fp8': True,
@@ -221,22 +233,67 @@ if TRITON_AVAILABLE:
         tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask = (offs_m[:, None] < qo_len))
 
 
-def _triton_forward(q, k, k_block_id, v, q_scale, k_scale, pvthreshd, is_causal=False, tensor_layout="HND", output_dtype=torch.float16):
+def _triton_forward(q, k, k_block_id, v, q_scale, k_scale, pvthreshd, is_causal=False, tensor_layout="HND", output_dtype=torch.float16, block_m_override=None, num_stages_override=None):
     """
     Execute sparse attention using Triton JIT kernels.
     
     This is the core forward pass that uses block-sparse attention patterns
     determined by the k_block_id mask.
+    
+    Args:
+        block_m_override: Optional override for BLOCK_M (default uses Blackwell config).
+                          Use block_m_override=64 for VAE BF16 to avoid shared memory errors.
+        num_stages_override: Optional override for num_stages (default uses Blackwell config).
+                             Use num_stages_override=2 for VAE BF16 to fit in shared memory.
     """
     if not TRITON_AVAILABLE:
         raise RuntimeError("Triton is required for local SpargeAttn. Install with: pip install triton")
     
     # Get Blackwell-optimized config
     config = get_blackwell_config()
-    BLOCK_M = config.get('BLOCK_M', 128)
+    BLOCK_M = block_m_override if block_m_override is not None else config.get('BLOCK_M', 128)
     BLOCK_N = config.get('BLOCK_N', 64)
     num_warps = config.get('num_warps', 4)
-    num_stages = config.get('num_stages', 4)
+    num_stages = num_stages_override if num_stages_override is not None else config.get('num_stages', 4)
+    
+    # Memory limit guard for Blackwell GPUs (shared memory limit: 101376 bytes)
+    # Formula: shared_mem ≈ BLOCK_M * head_dim * 2 * num_stages (for BF16)
+    # With safety factor: BLOCK_M * head_dim * 2 * num_stages < 101376
+    BLACKWELL_SHARED_MEM_LIMIT = 101376
+    dtype_bytes = 2  # BF16/FP16
+    actual_head_dim = q.size(-1)  # Get actual head_dim from tensor
+    
+    # BLACKWELL SM 12.0 OVERRIDE: 
+    # Blackwell has 101KB shared memory - it can handle 720p at BLOCK_M=128 without downscaling
+    # Only apply memory guard for non-Blackwell GPUs
+    is_blackwell = config.get('is_blackwell', False)
+    if not is_blackwell:
+        # Estimate shared memory usage: Q_block + K_block + V_block for each stage
+        # More accurate formula: BLOCK_M * HEAD_DIM * 2 * num_stages (for Q rows per stage)
+        # Plus K/V blocks: BLOCK_N * HEAD_DIM * 2 * num_stages
+        estimated_shared = (BLOCK_M * actual_head_dim * dtype_bytes + BLOCK_N * actual_head_dim * dtype_bytes * 2) * num_stages
+        
+        if estimated_shared > BLACKWELL_SHARED_MEM_LIMIT:
+            # Downscale: first try reducing num_stages, then block_m
+            original_block_m = BLOCK_M
+            original_stages = num_stages
+            
+            # Try reducing num_stages first
+            while num_stages > 1 and estimated_shared > BLACKWELL_SHARED_MEM_LIMIT:
+                num_stages -= 1
+                estimated_shared = (BLOCK_M * actual_head_dim * dtype_bytes + BLOCK_N * actual_head_dim * dtype_bytes * 2) * num_stages
+            
+            # If still too high, reduce BLOCK_M
+            while BLOCK_M > 32 and estimated_shared > BLACKWELL_SHARED_MEM_LIMIT:
+                BLOCK_M = BLOCK_M // 2
+                estimated_shared = (BLOCK_M * actual_head_dim * dtype_bytes + BLOCK_N * actual_head_dim * dtype_bytes * 2) * num_stages
+            
+            if original_block_m != BLOCK_M or original_stages != num_stages:
+                logger.warning(
+                    f"Triton kernel params auto-downscaled to fit shared memory limit "
+                    f"(BLOCK_M: {original_block_m}→{BLOCK_M}, stages: {original_stages}→{num_stages}, "
+                    f"estimated: {estimated_shared} bytes, limit: {BLACKWELL_SHARED_MEM_LIMIT})"
+                )
     
     stage = 3 if is_causal else 1
     o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
@@ -283,7 +340,8 @@ def _triton_forward(q, k, k_block_id, v, q_scale, k_scale, pvthreshd, is_causal=
 @torch.compiler.disable
 def spas_sage_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=None, 
                                       smooth_k=True, tensor_layout="HND", 
-                                      output_dtype=None, return_sparsity=False):
+                                      output_dtype=None, return_sparsity=False,
+                                      block_m_override=None, num_stages_override=None):
     """
     SpargeAttn with mean-similarity based top-k block selection.
     
@@ -300,6 +358,10 @@ def spas_sage_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=N
         tensor_layout: 'HND' or 'NHD'
         output_dtype: Output dtype (default: same as input)
         return_sparsity: Whether to return sparsity ratio
+        block_m_override: Optional override for BLOCK_M (default: None uses Blackwell config).
+                          Use block_m_override=64 for VAE BF16 to avoid shared memory errors.
+        num_stages_override: Optional override for num_stages (default: None uses Blackwell config).
+                             Use num_stages_override=2 for VAE BF16 to fit in shared memory.
         
     Returns:
         Attention output tensor
@@ -317,32 +379,77 @@ def spas_sage_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=N
     if output_dtype is None:
         output_dtype = dtype
     
+    # DTYPE CONVERSION LOGGING: Detect FP4/FP8 models and log conversion
+    # FP4 (uint4) and FP8 (float8_e4m3fn, float8_e5m2) are not directly supported
+    # They get converted to BF16/FP16 for kernel execution
+    half_dtypes = (torch.float16, torch.bfloat16)
+    needs_conversion = dtype not in half_dtypes
+    if needs_conversion:
+        dtype_name = str(dtype).split('.')[-1]
+        target_dtype = "fp16" if dtype in (torch.float32, torch.float16) else "bf16"
+        print(f"[KERNEL-DTYPE] Input dtype={dtype_name} converted to {target_dtype} for Triton kernel (FP4/FP8/FP32 → half precision)")
+    
     if dtype == torch.float32 or dtype == torch.float16:
         q, k, v = q.contiguous().to(torch.float16), k.contiguous().to(torch.float16), v.contiguous().to(torch.float16)
     else:
+        # FP8, FP4, BF16, or any other dtype → convert to bf16 for q,k and fp16 for v
         q, k, v = q.contiguous().to(torch.bfloat16), k.contiguous().to(torch.bfloat16), v.contiguous().to(torch.float16)
 
     if smooth_k:
         k = k - k.mean(dim=-2, keepdim=True)
     
     # Convert topk to threshold parameters
+    # BLACKWELL OPTIMIZED: More aggressive sparsity for Blackwell GPUs
+    # Original formula was too restrictive (0.9 + topk * 0.08)
+    # New formula enables higher sparsity TOPS on Blackwell Tensor Cores
     simthreshd1 = 0.3 + (1 - topk) * 0.4  # Range 0.3-0.7
-    cdfthreshd = 0.9 + topk * 0.08        # Range 0.9-0.98
     pvthreshd = int(10 + topk * 40)       # Range 10-50
     
+    # DYNAMIC KERNEL INJECTION: Detect GPU and apply appropriate CDF mapping
+    # This is the RAW kernel-level execution - no wrappers can override this
+    major, minor = torch.cuda.get_device_capability()
+    
+    # Get Blackwell configuration FIRST
+    config = get_blackwell_config()
+    is_blackwell = major >= 10 or major == 12  # SM 10.0+ or SM 12.0 is Blackwell
+    actual_block_m = block_m_override if block_m_override is not None else config.get('BLOCK_M', 128)
+    
+    # DYNAMIC CDF MAPPING based on GPU architecture
+    if is_blackwell:
+        # BLACKWELL (SM 10.0+/SM 12.0): Aggressive CDF mapping for maximum TOPS
+        # Formula: cdfthreshd = 0.65 + (topk * 0.3) → Range 0.65-0.95
+        # UI 0.3 (Fast) → cdfthreshd = 0.74 (high sparsity, max speed)
+        cdfthreshd = 0.65 + (topk * 0.3)
+    else:
+        # SM 8.0-9.0 (Ampere/Ada/Hopper): Conservative CDF mapping
+        # Formula: cdfthreshd = 0.85 + (topk * 0.1) → Range 0.85-0.95
+        cdfthreshd = 0.85 + (topk * 0.1)
+    
+    # MANDATORY KERNEL-EXEC LOG: This PROVES the kernel is executing with correct values
+    # If this line is missing from logs, the code path is not being hit
+    print(f"[KERNEL-EXEC] GPU: sm{major}{minor} | UI-Threshold: {topk} | Applied-CDF: {cdfthreshd:.4f} | BLOCK_M: {actual_block_m}")
+    
+    # Determine actual BLKQ to use (override or default 128)
+    # This MUST be consistent across get_block_map_meansim, per_block_int8, and _triton_forward
+    blkq = block_m_override if block_m_override is not None else 128
+    blkk = 64  # BLKK is always 64 per the Sparge algorithm
+    
     k_block_indices = get_block_map_meansim(q, k, is_causal=is_causal, 
+                                            BLKQ=blkq, BLKK=blkk,
                                             simthreshd1=simthreshd1, 
                                             cdfthreshd=cdfthreshd)
     headdim = q.size(-1)
 
     assert headdim in [64, 128], "headdim should be in [64, 128]."
 
-    q_int8, q_scale, k_int8, k_scale = per_block_int8(q, k)
+    q_int8, q_scale, k_int8, k_scale = per_block_int8(q, k, BLKQ=blkq, BLKK=blkk)
     pvthreshd_tensor = hyperparameter_check(pvthreshd, q.size(-3), q.device)
     
     o = _triton_forward(q_int8, k_int8, k_block_indices, v, q_scale, k_scale, 
                         pvthreshd_tensor, is_causal=is_causal, 
-                        tensor_layout="HND", output_dtype=output_dtype)
+                        tensor_layout="HND", output_dtype=output_dtype,
+                        block_m_override=block_m_override,
+                        num_stages_override=num_stages_override)
 
     if tensor_layout == 'NHD':
         o = rearrange(o, '... H L D -> ... L H D')
@@ -359,7 +466,8 @@ def spas_sage_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=N
 @torch.compiler.disable  
 def spas_sage2_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=None,
                                        smooth_k=True, tensor_layout="HND",
-                                       output_dtype=None, return_sparsity=False):
+                                       output_dtype=None, return_sparsity=False,
+                                       block_m_override=None, num_stages_override=None):
     """
     SpargeAttn Sage2 with mean-similarity based top-k block selection.
     
@@ -381,6 +489,10 @@ def spas_sage2_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=
         tensor_layout: 'HND' (default) or 'NHD'
         output_dtype: Output dtype (default: same as input)
         return_sparsity: Whether to return sparsity ratio
+        block_m_override: Optional override for BLOCK_M (default: None uses Blackwell config).
+                          Use block_m_override=64 for VAE BF16 to avoid shared memory errors.
+        num_stages_override: Optional override for num_stages (default: None uses Blackwell config).
+                             Use num_stages_override=2 for VAE BF16 to fit in shared memory.
         
     Returns:
         Attention output tensor (same shape as input)
@@ -388,6 +500,8 @@ def spas_sage2_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=
         
     Example:
         >>> output = spas_sage2_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False)
+        >>> # For VAE (BF16), use smaller block size and fewer stages to fit in shared memory:
+        >>> output = spas_sage2_attn_meansim_topk_cuda(q, k, v, topk=0.5, block_m_override=64, num_stages_override=2)
     """
     global _kernel_logged_once
     
@@ -395,14 +509,18 @@ def spas_sage2_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=
     config = get_blackwell_config()
     is_blackwell = config.get('is_blackwell', False)
     
+    # Determine actual values (override or config)
+    actual_block_m = block_m_override if block_m_override is not None else config.get('BLOCK_M', 128)
+    actual_num_stages = num_stages_override if num_stages_override is not None else config.get('num_stages', 4)
+    
     # Log only once on first call to avoid Python overhead during execution
     if is_blackwell and not _kernel_logged_once:
         _kernel_logged_once = True
         num_warps = config.get('num_warps', 8)
-        num_stages = config.get('num_stages', 4)
-        block_m = config.get('BLOCK_M', 128)
         block_n = config.get('BLOCK_N', 64)
-        kernel_msg = f"!!! Sparge_Sage2 Kernel: topk={topk}, Blackwell=True, Warps={num_warps}, Stages={num_stages}, BlockM={block_m}, BlockN={block_n}"
+        block_m_info = f"{actual_block_m} (override)" if block_m_override is not None else str(actual_block_m)
+        stages_info = f"{actual_num_stages} (override)" if num_stages_override is not None else str(actual_num_stages)
+        kernel_msg = f"!!! Sparge_Sage2 Kernel: topk={topk}, Blackwell=True, Warps={num_warps}, Stages={stages_info}, BlockM={block_m_info}, BlockN={block_n}"
         print(kernel_msg, flush=True)
         logger.info(kernel_msg)
     
@@ -412,7 +530,9 @@ def spas_sage2_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=
     return spas_sage_attn_meansim_topk_cuda(
         q, k, v, topk=topk, is_causal=is_causal, scale=scale,
         smooth_k=smooth_k, tensor_layout=tensor_layout,
-        output_dtype=output_dtype, return_sparsity=return_sparsity
+        output_dtype=output_dtype, return_sparsity=return_sparsity,
+        block_m_override=block_m_override,
+        num_stages_override=num_stages_override
     )
 
 

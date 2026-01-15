@@ -151,6 +151,10 @@ class FlashAttentionVarlen(nn.Module):
                 max_seqlen_q, max_seqlen_k, **kwargs
             )
         elif self.attention_mode == 'sparge_sage2':
+            # VERIFICATION: Log first call to confirm sparge_sage2 path is active
+            if not hasattr(self, '_sparge_logged'):
+                print(f"[DiT-ATTN] FlashAttentionVarlen using sparge_sage2 with topk={self.sparsity_threshold}", flush=True)
+                self._sparge_logged = True
             # Pass sparsity_threshold as topk for Blackwell-optimized sparse attention
             # Uses Triton kernel params: num_warps=8, num_stages=4, block_m=128, block_n=64
             return call_sparge_sage2_varlen(
