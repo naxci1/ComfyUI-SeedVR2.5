@@ -504,24 +504,34 @@ def _gguf_sa2_patched_forward(self, hidden_states, encoder_hidden_states=None, a
     
     This patched forward:
     1. Works for GGUF VAE (ema_vae_fp16-f16.gguf) and safetensors (FP16/BF16)
-    2. Uses UI toggles (vae_encoder_sa2, vae_decoder_sa2) to select backend
+    2. DYNAMIC CHECK: Reads UI toggles INSIDE the function every time it runs
     3. SA2 path: Forces num_heads=8, head_dim=64 for query_dim=512
     4. FlashAttn path: Uses stable PyTorch FlashAttention/SDPA
     5. Verbose logging for every attention block
     
     GOAL: Phase 1 ~5-8s, Phase 3 ~15-20s on RTX 5070 Ti
     """
-    global _current_phase, _attention_block_counter, _encoder_sa2_enabled, _decoder_sa2_enabled
+    global _current_phase, _attention_block_counter
     _attention_block_counter += 1
     
-    # Determine if SA2 should be used based on UI toggles
+    # FORCE DYNAMIC CHECK: Read the global toggle values INSIDE the function every time
+    # This ensures UI changes are respected at runtime
+    encoder_sa2 = _encoder_sa2_enabled
+    decoder_sa2 = _decoder_sa2_enabled
+    
+    # Determine if SA2 should be used based on UI toggles (read dynamically)
     is_encoder = _current_phase == "encoder"
     is_decoder = _current_phase == "decoder"
-    use_sa2 = (is_encoder and _encoder_sa2_enabled) or (is_decoder and _decoder_sa2_enabled)
+    use_sa2 = (is_encoder and encoder_sa2) or (is_decoder and decoder_sa2)
     
     # ========== MANDATORY VERBOSE LOGGING ==========
     phase_name = "Encoder" if is_encoder else ("Decoder" if is_decoder else "VAE")
     backend_name = "SA2" if use_sa2 else "FlashAttn"
+    
+    # Log confirmation when SA2 is BYPASSED (disabled)
+    if is_decoder and not decoder_sa2:
+        print(f"[VAE-STABLE] SA2 BYPASSED - Using Native FlashAttn for Quality")
+    
     print(f"[VAE-ATTN] Phase: {phase_name} | Block: {_attention_block_counter} | Backend: {backend_name} | Heads: 8 | Dim: 64")
     
     # Input processing

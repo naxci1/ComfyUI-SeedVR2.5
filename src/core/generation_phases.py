@@ -865,8 +865,9 @@ def decode_all_batches(
     gc.collect()  # Force Python GC to release PyTorch tensor references
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()  # Collect inter-process shared CUDA tensors
         torch.cuda.synchronize()  # Ensure all GPU operations are complete before proceeding
-        debug.log("GPU memory aggressively cleared before Phase 3 (gc + empty_cache + sync)", category="memory")
+        debug.log("GPU memory aggressively cleared before Phase 3 (gc + empty_cache + ipc_collect + sync)", category="memory")
 
     # Count valid latents
     num_valid_latents = len([l for l in ctx['all_upscaled_latents'] if l is not None])

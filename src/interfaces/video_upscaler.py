@@ -380,6 +380,20 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
         decode_tile_size = vae.get("decode_tile_size", 512)
         decode_tile_overlap = vae.get("decode_tile_overlap", 64)
         tile_debug = vae.get("tile_debug", False)
+        
+        # VAE SA2 control per Encoder/Decoder (from UI toggles)
+        vae_encoder_sa2 = vae.get("vae_encoder_sa2", True)
+        vae_decoder_sa2 = vae.get("vae_decoder_sa2", False)
+        
+        # FORCE TILING for 720p+ to prevent OOM on 16GB Blackwell GPUs
+        # Resolution 720 = 1280x720, which causes OOM without tiling
+        if resolution >= 720:
+            if not decode_tiled:
+                decode_tiled = True
+                print(f"[VAE-CTRL] Auto-enabled decode_tiled for 720p+ resolution ({resolution}p)")
+            if not encode_tiled:
+                encode_tiled = True
+                print(f"[VAE-CTRL] Auto-enabled encode_tiled for 720p+ resolution ({resolution}p)")
 
         # TorchCompile args (optional connection, can be None)
         dit_torch_compile_args = dit.get("torch_compile_args")
@@ -478,7 +492,13 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             
             debug.start_timer("generation")
             
+            # Configure VAE SA2 settings from UI toggles BEFORE any VAE operations
+            # This sets the global state that the patched Attention.forward() reads dynamically
+            from ..optimization.vae_attention import configure_vae_sa2, set_vae_phase
+            configure_vae_sa2(encoder_sa2=vae_encoder_sa2, decoder_sa2=vae_decoder_sa2)
+            
             # Phase 1: Encode
+            set_vae_phase("encoder")  # Set phase for logging context
             ctx = encode_all_batches(
                 runner,
                 ctx=ctx,
@@ -510,6 +530,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             )
 
             # Phase 3: Decode
+            set_vae_phase("decoder")  # Set phase for logging context
             ctx = decode_all_batches(
                 runner,
                 ctx=ctx,
