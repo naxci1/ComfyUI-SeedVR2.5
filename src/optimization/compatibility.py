@@ -906,8 +906,10 @@ def call_sparge_sage2_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
     Returns:
         Attention output tensor (total_seq, heads, head_dim)
     """
-    # BOOTSTRAP: This print verifies the function is being called at runtime
+    # IMPORTANT: global declaration MUST come before ANY use of the variable
     global _sparge_sage2_frame_counter
+    
+    # BOOTSTRAP: This print verifies the function is being called at runtime
     if _sparge_sage2_frame_counter == 0:
         print("[CALL-SPARGE] call_sparge_sage2_varlen() INVOKED - entering kernel path", flush=True)
     
@@ -957,8 +959,7 @@ def call_sparge_sage2_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
     assert isinstance(topk, (int, float)), f"sparsity_threshold must be a float, got {type(topk)}"
     assert 0.0 < topk <= 1.0, f"sparsity_threshold must be in (0.0, 1.0], got {topk}"
     
-    # Update frame counter (always, for tracking)
-    global _sparge_sage2_frame_counter
+    # Update frame counter (already declared global at top of function)
     _sparge_sage2_frame_counter += 1
     
     # Logging only on first call OR if verbose logging is explicitly enabled
