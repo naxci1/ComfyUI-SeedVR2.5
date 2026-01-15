@@ -30,6 +30,9 @@ _current_phase: Literal["encoder", "decoder", "unknown"] = "unknown"
 _encoder_sa2_enabled = False
 _decoder_sa2_enabled = False
 
+# UI-controlled sparsity threshold (dynamic from UI: 0.3/0.5/0.7)
+_vae_sparsity_threshold = 0.5
+
 # Original forward methods cache (for cleanup)
 _original_forwards = {}
 
@@ -50,19 +53,21 @@ def set_vae_phase(phase: Literal["encoder", "decoder", "unknown"]):
     _block_counter = 0
 
 
-def configure_vae_sa2(encoder_sa2: bool = False, decoder_sa2: bool = False):
+def configure_vae_sa2(encoder_sa2: bool = False, decoder_sa2: bool = False, sparsity_threshold: float = 0.5):
     """
     Configure SA2 enablement for Encoder and Decoder from UI toggles.
+    Also sets the sparsity_threshold for SA2 kernel.
     """
-    global _encoder_sa2_enabled, _decoder_sa2_enabled
+    global _encoder_sa2_enabled, _decoder_sa2_enabled, _vae_sparsity_threshold
     
     _encoder_sa2_enabled = encoder_sa2
     _decoder_sa2_enabled = decoder_sa2
+    _vae_sparsity_threshold = sparsity_threshold
     
     encoder_backend = "SA2" if encoder_sa2 else "Native SDPA"
     decoder_backend = "SA2" if decoder_sa2 else "Native SDPA"
     
-    print(f"[VAE-CTRL] Encoder: {encoder_backend} | Decoder: {decoder_backend}")
+    print(f"[VAE-CTRL] Encoder: {encoder_backend} | Decoder: {decoder_backend} | Sparsity: {sparsity_threshold}")
 
 
 def _check_sa2_available() -> bool:
@@ -83,13 +88,15 @@ def is_vae_sparge_available() -> bool:
 
 
 def set_vae_sparsity_threshold(threshold: float):
-    """API compatibility."""
-    pass
+    """Set the VAE sparsity threshold (used by SA2 kernel)."""
+    global _vae_sparsity_threshold
+    _vae_sparsity_threshold = threshold
 
 
 def get_vae_sparsity_threshold() -> float:
-    """API compatibility."""
-    return 0.5
+    """Get the current VAE sparsity threshold."""
+    global _vae_sparsity_threshold
+    return _vae_sparsity_threshold
 
 
 def _create_sa2_forward_diffusers(original_forward, block_id: int):

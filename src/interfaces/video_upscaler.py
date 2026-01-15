@@ -512,9 +512,15 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             # Only configure SA2 if at least one phase uses it
             # When both are False, VAE uses native PyTorch SDPA (fastest path)
             if vae_encoder_sa2 or vae_decoder_sa2:
-                configure_vae_sa2(encoder_sa2=vae_encoder_sa2, decoder_sa2=vae_decoder_sa2)
+                configure_vae_sa2(
+                    encoder_sa2=vae_encoder_sa2, 
+                    decoder_sa2=vae_decoder_sa2,
+                    sparsity_threshold=sparsity_threshold  # Pass UI threshold to VAE SA2
+                )
                 # REAL SA2 INJECTION: Patch VAE AttentionBlock modules
-                inject_sparge_into_vae(runner.vae)
+                patched_count = inject_sparge_into_vae(runner.vae)
+                if patched_count == 0:
+                    print("[VAE-SA2] WARNING: inject_sparge_into_vae returned 0 - SA2 may not be active!")
             else:
                 print("[VAE-CTRL] VAE: NATIVE SDPA (no SA2 patching - fastest path)")
             
