@@ -528,9 +528,15 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             # Configure VAE SA2 settings from UI toggles BEFORE any VAE operations
             # This sets the global state that the patched Attention.forward() reads dynamically
             from ..optimization.vae_attention import (
-                configure_vae_sa2, set_vae_phase, inject_sparge_into_vae, 
+                configure_vae_sa2, set_vae_phase, end_vae_phase, inject_sparge_into_vae, 
                 update_dit_sparsity_blocks
             )
+            
+            # Import Truth Monitor for execution summary
+            from ..optimization.truth_monitor import print_execution_summary, reset_truth_monitor
+            
+            # Reset Truth Monitor for this generation
+            reset_truth_monitor()
             
             # Only configure SA2 if at least one phase uses it
             # When both are False, VAE uses native PyTorch SDPA (fastest path)
@@ -549,7 +555,8 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             
             # Phase 1: Encode
             print(f"\n[PHASE 1] Starting VAE Encoding (SA2={vae_encoder_sa2})")
-            set_vae_phase("encoder")
+            # TRUTH MONITOR: Set phase with tiling context for transparency logging
+            set_vae_phase("encoder", tiling_enabled=encode_tiled, force_sa2_with_tiling=force_decoder_sa2_with_tiling)
             ctx = encode_all_batches(
                 runner,
                 ctx=ctx,
@@ -565,6 +572,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 input_noise_scale=input_noise_scale,
                 color_correction=color_correction
             )
+            end_vae_phase()  # Finalize encoder telemetry
 
             # MEMORY ISOLATION: Clear CUDA cache and reset kernel counter before DiT phase
             reset_sparge_sage2_verification()
@@ -588,7 +596,8 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
 
             # Phase 3: Decode
             print(f"\n[PHASE 3] Starting VAE Decoding (SA2={vae_decoder_sa2})")
-            set_vae_phase("decoder")
+            # TRUTH MONITOR: Set phase with tiling context for transparency logging
+            set_vae_phase("decoder", tiling_enabled=decode_tiled, force_sa2_with_tiling=force_decoder_sa2_with_tiling)
             ctx = decode_all_batches(
                 runner,
                 ctx=ctx,
@@ -596,6 +605,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 progress_callback=progress_callback,
                 cache_model=vae_cache
             )
+            end_vae_phase()  # Finalize decoder telemetry
 
             # Phase 4: Post-processing
             ctx = postprocess_all_batches(
@@ -659,6 +669,9 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             if total_execution_time > 0:
                 fps = gen_info['total_frames'] / total_execution_time
                 debug.log(f"Average FPS: {fps:.2f} frames/sec", category="timing", force=True)
+
+            # TRUTH MONITOR: Print GPU telemetry summary
+            print_execution_summary()
 
             # Print footer
             debug.print_footer()

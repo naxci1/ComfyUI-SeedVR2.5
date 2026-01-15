@@ -26,6 +26,9 @@ from ...optimization.compatibility import (
     call_sparge_sage2_varlen
 )
 
+# Import Truth Monitor for automatic GPU telemetry
+from ...optimization.truth_monitor import AttentionTelemetry, initialize_truth_monitor
+
 from torch import nn
 
 
@@ -124,47 +127,70 @@ class FlashAttentionVarlen(nn.Module):
     def forward(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs):
         kwargs["deterministic"] = torch.are_deterministic_algorithms_enabled()
         
+        # TRUTH MONITOR: Track block executions for telemetry
+        if not hasattr(self, '_telemetry_block_id'):
+            self._telemetry_block_id = 0
+        self._telemetry_block_id += 1
+        
+        # Create telemetry tracker for this execution
+        telemetry = AttentionTelemetry(block_id=self._telemetry_block_id, phase="dit")
+        telemetry.start(q)
+        
         # Convert to pipeline compute_dtype if configured (handles FP8 → fp16/bf16)
         if self.compute_dtype is not None and q.dtype != self.compute_dtype:
             q = q.to(self.compute_dtype)
             k = k.to(self.compute_dtype)
             v = v.to(self.compute_dtype)
         
-        if self.attention_mode == 'flash_attn_3':
-            return call_flash_attn_3_varlen(
-                q, k, v, cu_seqlens_q, cu_seqlens_k, 
-                max_seqlen_q, max_seqlen_k, **kwargs
-            )
-        elif self.attention_mode == 'flash_attn_2':
-            return call_flash_attn_2_varlen(
-                q, k, v, cu_seqlens_q, cu_seqlens_k, 
-                max_seqlen_q, max_seqlen_k, **kwargs
-            )
-        elif self.attention_mode == 'sageattn_3':
-            return call_sage_attn_3_varlen(
-                q, k, v, cu_seqlens_q, cu_seqlens_k,
-                max_seqlen_q, max_seqlen_k, **kwargs
-            )
-        elif self.attention_mode == 'sageattn_2':
-            return call_sage_attn_2_varlen(
-                q, k, v, cu_seqlens_q, cu_seqlens_k,
-                max_seqlen_q, max_seqlen_k, **kwargs
-            )
-        elif self.attention_mode == 'sparge_sage2':
-            # VERIFICATION: Log first call to confirm sparge_sage2 path is active
-            if not hasattr(self, '_sparge_logged'):
-                print(f"[DiT-ATTN] FlashAttentionVarlen using sparge_sage2 with topk={self.sparsity_threshold}", flush=True)
-                self._sparge_logged = True
-            # Pass sparsity_threshold as topk for Blackwell-optimized sparse attention
-            # Uses Triton kernel params: num_warps=8, num_stages=4, block_m=128, block_n=64
-            return call_sparge_sage2_varlen(
-                q, k, v, cu_seqlens_q, cu_seqlens_k,
-                max_seqlen_q, max_seqlen_k, topk=self.sparsity_threshold, **kwargs
-            )
-        else:
-            # PyTorch SDPA - Log warning that Blackwell optimization is NOT active
-            logger.warning(f"!!! WARNING: Blackwell optimization skipped. Current attention_mode: {self.attention_mode}")
-            return pytorch_varlen_attention(
-                q, k, v, cu_seqlens_q, cu_seqlens_k,
-                max_seqlen_q, max_seqlen_k, **kwargs
-            )
+        kernel_executed = False  # Track if custom kernel was used
+        
+        try:
+            if self.attention_mode == 'flash_attn_3':
+                result = call_flash_attn_3_varlen(
+                    q, k, v, cu_seqlens_q, cu_seqlens_k, 
+                    max_seqlen_q, max_seqlen_k, **kwargs
+                )
+                kernel_executed = True
+            elif self.attention_mode == 'flash_attn_2':
+                result = call_flash_attn_2_varlen(
+                    q, k, v, cu_seqlens_q, cu_seqlens_k, 
+                    max_seqlen_q, max_seqlen_k, **kwargs
+                )
+                kernel_executed = True
+            elif self.attention_mode == 'sageattn_3':
+                result = call_sage_attn_3_varlen(
+                    q, k, v, cu_seqlens_q, cu_seqlens_k,
+                    max_seqlen_q, max_seqlen_k, **kwargs
+                )
+                kernel_executed = True
+            elif self.attention_mode == 'sageattn_2':
+                result = call_sage_attn_2_varlen(
+                    q, k, v, cu_seqlens_q, cu_seqlens_k,
+                    max_seqlen_q, max_seqlen_k, **kwargs
+                )
+                kernel_executed = True
+            elif self.attention_mode == 'sparge_sage2':
+                # VERIFICATION: Log first call to confirm sparge_sage2 path is active
+                if not hasattr(self, '_sparge_logged'):
+                    print(f"[DiT-ATTN] FlashAttentionVarlen using sparge_sage2 with topk={self.sparsity_threshold}", flush=True)
+                    self._sparge_logged = True
+                # Pass sparsity_threshold as topk for Blackwell-optimized sparse attention
+                # Uses Triton kernel params: num_warps=8, num_stages=4, block_m=128, block_n=64
+                result = call_sparge_sage2_varlen(
+                    q, k, v, cu_seqlens_q, cu_seqlens_k,
+                    max_seqlen_q, max_seqlen_k, topk=self.sparsity_threshold, **kwargs
+                )
+                kernel_executed = True
+            else:
+                # PyTorch SDPA - Log warning that Blackwell optimization is NOT active
+                logger.warning(f"!!! WARNING: Blackwell optimization skipped. Current attention_mode: {self.attention_mode}")
+                result = pytorch_varlen_attention(
+                    q, k, v, cu_seqlens_q, cu_seqlens_k,
+                    max_seqlen_q, max_seqlen_k, **kwargs
+                )
+                kernel_executed = False  # SDPA fallback
+        finally:
+            # TRUTH MONITOR: Record execution result
+            telemetry.end(kernel_was_executed=kernel_executed)
+        
+        return result

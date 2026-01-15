@@ -4,6 +4,8 @@ VAE Attention Utilities for SeedVR2
 Provides optional SageAttention 2 support for VAE attention blocks.
 REAL BLOCK-LEVEL INJECTION when UI toggles are True.
 NATIVE SDPA when UI toggles are False (default - fastest path).
+
+Includes Truth Monitor integration for automatic GPU telemetry.
 """
 
 import os
@@ -11,6 +13,13 @@ import torch
 import torch.nn.functional as F
 import logging
 from typing import Optional, Literal, Any
+
+# Import Truth Monitor for VAE telemetry
+try:
+    from .truth_monitor import VAETelemetry, initialize_truth_monitor
+    TRUTH_MONITOR_AVAILABLE = True
+except ImportError:
+    TRUTH_MONITOR_AVAILABLE = False
 
 # Configure logging
 logger = logging.getLogger("SeedVR2.VAE")
@@ -39,6 +48,9 @@ _original_forwards = {}
 # Block counter for logging
 _block_counter = 0
 
+# VAE Telemetry instance for Truth Monitor
+_current_vae_telemetry: Optional[Any] = None
+
 # Memory policy: expandable_segments for Blackwell
 try:
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -46,11 +58,42 @@ except Exception:
     pass
 
 
-def set_vae_phase(phase: Literal["encoder", "decoder", "unknown"]):
-    """Set the current VAE phase."""
-    global _current_phase, _block_counter
+def set_vae_phase(phase: Literal["encoder", "decoder", "unknown"], 
+                  tiling_enabled: bool = False,
+                  force_sa2_with_tiling: bool = False):
+    """
+    Set the current VAE phase with Truth Monitor telemetry.
+    
+    Args:
+        phase: Current VAE phase ("encoder", "decoder", or "unknown")
+        tiling_enabled: Whether tiled VAE is active
+        force_sa2_with_tiling: Whether force_decoder_sa2_with_tiling is set
+    """
+    global _current_phase, _block_counter, _current_vae_telemetry
     _current_phase = phase
     _block_counter = 0
+    
+    # Initialize Truth Monitor telemetry for this phase
+    if TRUTH_MONITOR_AVAILABLE and phase != "unknown":
+        # Determine SA2 status for this phase
+        sa2_enabled = _encoder_sa2_enabled if phase == "encoder" else _decoder_sa2_enabled
+        
+        # Create and start VAE telemetry
+        _current_vae_telemetry = VAETelemetry(phase=phase)
+        _current_vae_telemetry.start(
+            tiling_enabled=tiling_enabled,
+            sa2_enabled=sa2_enabled,
+            force_override=force_sa2_with_tiling
+        )
+
+
+def end_vae_phase():
+    """End the current VAE phase and finalize telemetry."""
+    global _current_vae_telemetry
+    
+    if _current_vae_telemetry is not None:
+        _current_vae_telemetry.end()
+        _current_vae_telemetry = None
 
 
 def configure_vae_sa2(encoder_sa2: bool = False, decoder_sa2: bool = False, sparsity_threshold: float = 0.5):
