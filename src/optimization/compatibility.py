@@ -229,8 +229,11 @@ try:
         block_sparse_sage2_attn = _block_sparse_sage2
         SPARGE_SAGE2_AVAILABLE = True
         SPARGE_SAGE2_VERSION = SPARGE_LOCAL_VERSION
+        # BOOTSTRAP VERIFICATION: Print when SpargeAttn is successfully loaded
+        print(f"[COMPAT-BOOTSTRAP] SpargeAttn/Sage2 loaded: LOCAL Triton JIT (v{SPARGE_LOCAL_VERSION})", flush=True)
     else:
         _SPARGE_IMPORT_ERROR = "Local SpargeAttn module loaded but SPARGE_LOCAL_AVAILABLE is False (Triton may not be available)"
+        print(f"[COMPAT-BOOTSTRAP] WARNING: {_SPARGE_IMPORT_ERROR}", flush=True)
 except (ImportError, AttributeError, OSError) as e:
     _SPARGE_IMPORT_ERROR = f"Local import failed: {type(e).__name__}: {e}"
     # Print diagnostic for debugging
@@ -248,6 +251,7 @@ except (ImportError, AttributeError, OSError) as e:
             SPARGE_SAGE2_VERSION = getattr(spas_sage_attn, '__version__', 'unknown')
         except (ImportError, AttributeError):
             SPARGE_SAGE2_VERSION = 'unknown'
+        print(f"[COMPAT-BOOTSTRAP] SpargeAttn/Sage2 loaded: GLOBAL package (v{SPARGE_SAGE2_VERSION})", flush=True)
     except (ImportError, AttributeError, OSError) as e2:
         _SPARGE_IMPORT_ERROR = f"Both local and global imports failed. Global error: {type(e2).__name__}: {e2}"
         print(f"[SpargeAttn Debug] {_SPARGE_IMPORT_ERROR}")
@@ -902,6 +906,11 @@ def call_sparge_sage2_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
     Returns:
         Attention output tensor (total_seq, heads, head_dim)
     """
+    # BOOTSTRAP: This print verifies the function is being called at runtime
+    global _sparge_sage2_frame_counter
+    if _sparge_sage2_frame_counter == 0:
+        print("[CALL-SPARGE] call_sparge_sage2_varlen() INVOKED - entering kernel path", flush=True)
+    
     if not SPARGE_SAGE2_AVAILABLE:
         raise ImportError("SpargeAttn/Sage2 is not available")
     

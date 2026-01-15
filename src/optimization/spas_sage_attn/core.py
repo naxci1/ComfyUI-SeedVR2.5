@@ -50,6 +50,15 @@ from .quant_per_block import per_block_int8
 SPARGE_LOCAL_VERSION = "0.1.0-local-triton"
 SPARGE_LOCAL_AVAILABLE = TRITON_AVAILABLE
 
+# ============================================================================
+# BOOTSTRAP VERIFICATION: This prints when the module is loaded
+# If you don't see this in logs, the module is NOT being imported correctly
+# ============================================================================
+if TRITON_AVAILABLE:
+    print(f"[CORE-BOOTSTRAP] SpargeAttn/Sage2 LOCAL module loaded successfully (Triton OK)", flush=True)
+else:
+    print(f"[CORE-BOOTSTRAP] WARNING: Triton not available - SpargeAttn disabled!", flush=True)
+
 
 def get_cuda_arch_versions():
     """Get CUDA architecture versions for all available GPUs."""
