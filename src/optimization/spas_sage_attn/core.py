@@ -379,9 +379,20 @@ def spas_sage_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=N
     if output_dtype is None:
         output_dtype = dtype
     
+    # DTYPE CONVERSION LOGGING: Detect FP4/FP8 models and log conversion
+    # FP4 (uint4) and FP8 (float8_e4m3fn, float8_e5m2) are not directly supported
+    # They get converted to BF16/FP16 for kernel execution
+    half_dtypes = (torch.float16, torch.bfloat16)
+    needs_conversion = dtype not in half_dtypes
+    if needs_conversion:
+        dtype_name = str(dtype).split('.')[-1]
+        target_dtype = "fp16" if dtype in (torch.float32, torch.float16) else "bf16"
+        print(f"[KERNEL-DTYPE] Input dtype={dtype_name} converted to {target_dtype} for Triton kernel (FP4/FP8/FP32 → half precision)")
+    
     if dtype == torch.float32 or dtype == torch.float16:
         q, k, v = q.contiguous().to(torch.float16), k.contiguous().to(torch.float16), v.contiguous().to(torch.float16)
     else:
+        # FP8, FP4, BF16, or any other dtype → convert to bf16 for q,k and fp16 for v
         q, k, v = q.contiguous().to(torch.bfloat16), k.contiguous().to(torch.bfloat16), v.contiguous().to(torch.float16)
 
     if smooth_k:

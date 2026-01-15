@@ -392,13 +392,18 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
         # Decoder SA2 follows dependency on tiling to prevent artifacts
         vae_encoder_sa2 = vae.get("vae_encoder_sa2", True)  # Default True = SA2 for Encoder
         vae_decoder_sa2_ui = vae.get("vae_decoder_sa2", False)  # User's requested setting
+        force_decoder_sa2_with_tiling = vae.get("force_decoder_sa2_with_tiling", False)  # Override safety check
         
         # VAE AUTO-LOCK LOGIC: Strict dependency between Tiling and SA2
         # IF decode_tiled is TRUE -> FORCE vae_decoder_sa2 = False and DISABLE the option
         # IF decode_tiled is FALSE -> ALLOW vae_decoder_sa2 to be user-defined (True/False)
-        if decode_tiled:
+        # OVERRIDE: If force_decoder_sa2_with_tiling is True, allow SA2 even with tiling (may cause artifacts)
+        if decode_tiled and not force_decoder_sa2_with_tiling:
             vae_decoder_sa2 = False  # FORCED to False when tiling is enabled
             print(f"[VAE-AUTO] Tiling is ON: Disabling Decoder SA2 to prevent artifacts.")
+        elif decode_tiled and force_decoder_sa2_with_tiling:
+            vae_decoder_sa2 = vae_decoder_sa2_ui  # User forcing SA2 with tiling (risky!)
+            print(f"[VAE-FORCE] WARNING: Tiling + SA2 enabled (force_decoder_sa2_with_tiling=True). May cause artifacts!")
         else:
             vae_decoder_sa2 = vae_decoder_sa2_ui  # Respect user setting when tiling is off
         
