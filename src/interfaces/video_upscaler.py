@@ -382,6 +382,11 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
         tile_debug = vae.get("tile_debug", False)
         
         # VAE SA2 control per Encoder/Decoder (from UI toggles)
+        # DEBUG: Print raw VAE config to verify UI values are received
+        print(f"[VAE-DEBUG] Raw VAE config keys: {list(vae.keys()) if isinstance(vae, dict) else 'NOT A DICT'}")
+        print(f"[VAE-DEBUG] vae_encoder_sa2 in config: {vae.get('vae_encoder_sa2', 'NOT FOUND')}")
+        print(f"[VAE-DEBUG] vae_decoder_sa2 in config: {vae.get('vae_decoder_sa2', 'NOT FOUND')}")
+        
         # NO DEFAULTS - respect user settings exactly as provided
         vae_encoder_sa2 = vae.get("vae_encoder_sa2", False)  # Default False = Native SDPA
         vae_decoder_sa2 = vae.get("vae_decoder_sa2", False)  # Default False = Native SDPA

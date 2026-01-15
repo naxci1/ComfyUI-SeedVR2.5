@@ -386,12 +386,13 @@ def spas_sage_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=N
     cdfthreshd = 0.65 + (topk * 0.3)      # Range 0.65-0.95 (Blackwell optimized)
     pvthreshd = int(10 + topk * 40)       # Range 10-50
     
-    # Log kernel math sync for verification
+    # Log kernel math sync for verification - ALWAYS print for debugging
     config = get_blackwell_config()
     is_blackwell = config.get('is_blackwell', False)
     actual_block_m = block_m_override if block_m_override is not None else config.get('BLOCK_M', 128)
-    if is_blackwell:
-        print(f"[DiT-SYNC] Threshold {topk} mapped to Kernel-CDF {cdfthreshd:.4f} | BLOCK_M={actual_block_m}")
+    
+    # FORCE PRINT: Always log kernel-CDF mapping regardless of GPU type
+    print(f"[DiT-SYNC] Threshold {topk} mapped to Kernel-CDF {cdfthreshd:.4f} | BLOCK_M={actual_block_m} | Blackwell={is_blackwell}")
     
     # Determine actual BLKQ to use (override or default 128)
     # This MUST be consistent across get_block_map_meansim, per_block_int8, and _triton_forward
