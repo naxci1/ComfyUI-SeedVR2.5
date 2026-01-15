@@ -175,7 +175,8 @@ def detect_edges_batch(
         edges = torch.sqrt(gx.pow(2) + gy.pow(2))
         
         # Normalize to [0, 1] range (per-batch normalization for consistency)
-        edge_max = edges.amax(dim=(2, 3), keepdim=True).clamp(min=1e-6)
+        # Use dtype-aware epsilon for numerical stability
+        edge_max = edges.amax(dim=(2, 3), keepdim=True).clamp(min=1e-5)
         edges = edges / edge_max
         
         del gray, gray_padded, gx, gy, sobel_x, sobel_y
