@@ -504,12 +504,17 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             
             # Configure VAE SA2 settings from UI toggles BEFORE any VAE operations
             # This sets the global state that the patched Attention.forward() reads dynamically
-            from ..optimization.vae_attention import configure_vae_sa2, set_vae_phase
+            from ..optimization.vae_attention import (
+                configure_vae_sa2, set_vae_phase, inject_sparge_into_vae, 
+                update_dit_sparsity_blocks
+            )
             
             # Only configure SA2 if at least one phase uses it
             # When both are False, VAE uses native PyTorch SDPA (fastest path)
             if vae_encoder_sa2 or vae_decoder_sa2:
                 configure_vae_sa2(encoder_sa2=vae_encoder_sa2, decoder_sa2=vae_decoder_sa2)
+                # REAL SA2 INJECTION: Patch VAE AttentionBlock modules
+                inject_sparge_into_vae(runner.vae)
             else:
                 print("[VAE-CTRL] VAE: NATIVE SDPA (no SA2 patching - fastest path)")
             
@@ -537,6 +542,11 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
 
             # Phase 2: Upscale
             print(f"\n[PHASE 2] Starting DiT Upscaling (Mode={attention_mode}, Threshold={sparsity_threshold})")
+            
+            # REAL BLOCK-LEVEL SPARSITY UPDATE: Iterate through ALL DiT blocks
+            # This ensures the UI threshold is ACTUALLY applied to the model
+            update_dit_sparsity_blocks(runner, sparsity_threshold)
+            
             ctx = upscale_all_batches(
                 runner,
                 ctx=ctx,
