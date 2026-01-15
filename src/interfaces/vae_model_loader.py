@@ -214,15 +214,15 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                     )
                 ),
                 io.Boolean.Input("vae_encoder_sa2",
-                    default=True,
+                    default=False,
                     optional=True,
                     tooltip=(
                         "Enable SageAttention 2 (SA2) for VAE Encoder (Phase 1).\n"
                         "\n"
-                        "• True (default): Use SA2 with 8 heads × 64-dim for Blackwell optimization\n"
-                        "• False: Use stable FlashAttention/SDPA fallback\n"
+                        "• True: Use SA2 with 8 heads × 64-dim for Blackwell optimization\n"
+                        "• False (default): Use Native SDPA (fastest, stable)\n"
                         "\n"
-                        "SA2 provides faster encoding on RTX 50xx GPUs."
+                        "Recommended: Keep disabled for maximum speed (17s encoding)."
                     )
                 ),
                 io.Boolean.Input("vae_decoder_sa2",
@@ -232,7 +232,7 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                         "Enable SageAttention 2 (SA2) for VAE Decoder (Phase 3).\n"
                         "\n"
                         "• True: Use SA2 with 8 heads × 64-dim for Blackwell optimization\n"
-                        "• False (default): Use stable FlashAttention/SDPA to prevent artifacts\n"
+                        "• False (default): Use Native SDPA (stable, prevents artifacts)\n"
                         "\n"
                         "Recommended: Keep disabled for best quality output."
                     )
@@ -260,8 +260,8 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                      encode_tile_size: int = 512, encode_tile_overlap: int = 64,
                      decode_tiled: bool = True, decode_tile_size: int = 512, 
                      decode_tile_overlap: int = 64, tile_debug: str = "false",
-                     enable_sparge_attention: bool = True, performance_mode: str = "Balanced",
-                     vae_precision: str = "auto", vae_encoder_sa2: bool = True,
+                     enable_sparge_attention: bool = False, performance_mode: str = "Balanced",
+                     vae_precision: str = "auto", vae_encoder_sa2: bool = False,
                      vae_decoder_sa2: bool = False,
                      torch_compile_args: Dict[str, Any] = None
                      ) -> io.NodeOutput:
@@ -332,8 +332,8 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
             is_fp8_model = "fp8" in model.lower() or "e4m3fn" in model.lower()
         
         # Print VAE control status
-        encoder_backend = "SA2" if vae_encoder_sa2 else "Stable FlashAttn"
-        decoder_backend = "SA2" if vae_decoder_sa2 else "Stable FlashAttn"
+        encoder_backend = "SA2" if vae_encoder_sa2 else "Native SDPA"
+        decoder_backend = "SA2" if vae_decoder_sa2 else "Native SDPA"
         print(f"[VAE-CTRL] Encoder: {encoder_backend} | Decoder: {decoder_backend}")
         print(f"[VAE-CTRL] Encode Tile Size: {encode_tile_size} | Decode Tile Size: {decode_tile_size} | Precision: {vae_precision}")
         

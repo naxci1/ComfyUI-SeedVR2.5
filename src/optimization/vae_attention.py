@@ -28,8 +28,9 @@ _sa2_available = None
 _current_phase: Literal["encoder", "decoder", "unknown"] = "unknown"
 
 # UI-controlled SA2 toggles (set at runtime from node inputs)
-_encoder_sa2_enabled = True  # Default: True for Encoder
-_decoder_sa2_enabled = False  # Default: False for Decoder
+# DEFAULTS: False = Native SDPA (fastest path, no patching)
+_encoder_sa2_enabled = False  # Default: False = Native SDPA
+_decoder_sa2_enabled = False  # Default: False = Native SDPA
 
 # Memory policy: expandable_segments for Blackwell (optional optimization)
 try:
@@ -44,15 +45,16 @@ def set_vae_phase(phase: Literal["encoder", "decoder", "unknown"]):
     _current_phase = phase
 
 
-def configure_vae_sa2(encoder_sa2: bool = True, decoder_sa2: bool = False):
+def configure_vae_sa2(encoder_sa2: bool = False, decoder_sa2: bool = False):
     """
     Configure SA2 enablement for Encoder and Decoder from UI toggles.
     
-    When BOTH are False, NO patching occurs and VAE uses native PyTorch SDPA.
+    When BOTH are False (default), NO patching occurs and VAE uses native PyTorch SDPA.
+    This is the fastest path for Blackwell GPUs.
     
     Args:
-        encoder_sa2: Enable SA2 for Encoder (Phase 1) - default True
-        decoder_sa2: Enable SA2 for Decoder (Phase 3) - default False
+        encoder_sa2: Enable SA2 for Encoder (Phase 1) - default False (Native SDPA)
+        decoder_sa2: Enable SA2 for Decoder (Phase 3) - default False (Native SDPA)
     """
     global _encoder_sa2_enabled, _decoder_sa2_enabled
     

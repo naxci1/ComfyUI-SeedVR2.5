@@ -382,8 +382,9 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
         tile_debug = vae.get("tile_debug", False)
         
         # VAE SA2 control per Encoder/Decoder (from UI toggles)
-        vae_encoder_sa2 = vae.get("vae_encoder_sa2", True)
-        vae_decoder_sa2 = vae.get("vae_decoder_sa2", False)
+        # NO DEFAULTS - respect user settings exactly as provided
+        vae_encoder_sa2 = vae.get("vae_encoder_sa2", False)  # Default False = Native SDPA
+        vae_decoder_sa2 = vae.get("vae_decoder_sa2", False)  # Default False = Native SDPA
         
         # RESPECT UI TOGGLES - DO NOT auto-force tiling
         # User controls encode_tiled and decode_tiled directly
@@ -485,6 +486,22 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             
             debug.start_timer("generation")
             
+            # ══════════════════════════════════════════════════════════
+            # PRE-FLIGHT SYNC: TRUTHFUL LOGGING OF ALL SETTINGS
+            # ══════════════════════════════════════════════════════════
+            print("\n" + "═" * 60)
+            print("PRE-FLIGHT SYNC: ACTUAL SETTINGS PASSED TO MODEL")
+            print("═" * 60)
+            print(f"  DiT Mode        = {attention_mode}")
+            print(f"  Threshold       = {sparsity_threshold}")
+            print(f"  VAE Encoder SA2 = {vae_encoder_sa2}")
+            print(f"  VAE Decoder SA2 = {vae_decoder_sa2}")
+            print(f"  Encode Tiled    = {encode_tiled}")
+            print(f"  Decode Tiled    = {decode_tiled}")
+            print(f"  Encode Tile Size= {encode_tile_size}")
+            print(f"  Decode Tile Size= {decode_tile_size}")
+            print("═" * 60 + "\n")
+            
             # Configure VAE SA2 settings from UI toggles BEFORE any VAE operations
             # This sets the global state that the patched Attention.forward() reads dynamically
             from ..optimization.vae_attention import configure_vae_sa2, set_vae_phase
@@ -493,8 +510,11 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             # When both are False, VAE uses native PyTorch SDPA (fastest path)
             if vae_encoder_sa2 or vae_decoder_sa2:
                 configure_vae_sa2(encoder_sa2=vae_encoder_sa2, decoder_sa2=vae_decoder_sa2)
+            else:
+                print("[VAE-CTRL] VAE: NATIVE SDPA (no SA2 patching - fastest path)")
             
             # Phase 1: Encode
+            print(f"\n[PHASE 1] Starting VAE Encoding (SA2={vae_encoder_sa2})")
             set_vae_phase("encoder")
             ctx = encode_all_batches(
                 runner,
@@ -516,6 +536,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             reset_sparge_sage2_verification()
 
             # Phase 2: Upscale
+            print(f"\n[PHASE 2] Starting DiT Upscaling (Mode={attention_mode}, Threshold={sparsity_threshold})")
             ctx = upscale_all_batches(
                 runner,
                 ctx=ctx,
@@ -527,6 +548,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             )
 
             # Phase 3: Decode
+            print(f"\n[PHASE 3] Starting VAE Decoding (SA2={vae_decoder_sa2})")
             set_vae_phase("decoder")
             ctx = decode_all_batches(
                 runner,
