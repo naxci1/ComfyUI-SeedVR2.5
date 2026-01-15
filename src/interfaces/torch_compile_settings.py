@@ -110,6 +110,59 @@ class SeedVR2TorchCompileSettings(io.ComfyNode):
         Returns:
             NodeOutput containing torch.compile configuration dictionary
         """
+        import platform
+        import torch
+        
+        # Windows-specific inductor configuration
+        # These settings improve compatibility with Triton-Windows
+        is_windows = platform.system() == 'Windows'
+        
+        # Configure inductor settings for Windows + Triton-Windows compatibility
+        if is_windows and backend == "inductor":
+            try:
+                import torch._inductor.config as inductor_config
+                
+                # Windows-optimized inductor settings:
+                # cpp_wrapper=True: Use C++ wrapper instead of Python for reduced overhead
+                inductor_config.cpp_wrapper = True
+                
+                # fallback_random=True: Use PyTorch random instead of Triton random
+                # This avoids Windows-specific issues with Triton random generation
+                inductor_config.fallback_random = True
+                
+                # disable_progress=True: Avoid Windows console issues with progress bars
+                if hasattr(inductor_config, 'disable_progress'):
+                    inductor_config.disable_progress = True
+                
+                # triton.cudagraphs=False: Disable CUDA graphs in Triton to avoid
+                # Windows WDDM driver issues with graph capture
+                if hasattr(inductor_config, 'triton'):
+                    inductor_config.triton.cudagraphs = False
+                
+                # coordinate_descent_tuning=False: Disable for faster compilation
+                # (tuning can be slow on Windows due to subprocess overhead)
+                if hasattr(inductor_config, 'coordinate_descent_tuning'):
+                    inductor_config.coordinate_descent_tuning = False
+                    
+                print("🔧 Windows torch.compile optimizations applied: cpp_wrapper=True, fallback_random=True")
+                
+            except (ImportError, AttributeError) as e:
+                print(f"⚠️ Could not apply Windows inductor optimizations: {e}")
+        
+        # Apply Dynamo configuration
+        try:
+            torch._dynamo.config.cache_size_limit = dynamo_cache_size_limit
+            torch._dynamo.config.accumulated_cache_size_limit = dynamo_recompile_limit
+            
+            # Windows-specific Dynamo settings
+            if is_windows:
+                # Suppress excessive recompilation warnings on Windows
+                torch._dynamo.config.verbose = False
+                torch._dynamo.config.suppress_errors = True
+                
+        except (ImportError, AttributeError):
+            pass
+        
         compile_args = {
             "backend": backend,
             "mode": mode,
@@ -117,5 +170,6 @@ class SeedVR2TorchCompileSettings(io.ComfyNode):
             "dynamic": dynamic,
             "dynamo_cache_size_limit": dynamo_cache_size_limit,
             "dynamo_recompile_limit": dynamo_recompile_limit,
+            "is_windows": is_windows,
         }
         return io.NodeOutput(compile_args)
