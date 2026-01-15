@@ -387,12 +387,22 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
         print(f"[VAE-DEBUG] vae_encoder_sa2 in config: {vae.get('vae_encoder_sa2', 'NOT FOUND')}")
         print(f"[VAE-DEBUG] vae_decoder_sa2 in config: {vae.get('vae_decoder_sa2', 'NOT FOUND')}")
         
-        # VAE ATTENTION SETTINGS:
+        # VAE ATTENTION SETTINGS with AUTO-LOCK LOGIC:
         # Encoder SA2 defaults to True (SA2 is faster for encoding on Blackwell)
-        # Decoder SA2 is LOCKED to False (Native SDPA prevents artifacts)
+        # Decoder SA2 follows dependency on tiling to prevent artifacts
         vae_encoder_sa2 = vae.get("vae_encoder_sa2", True)  # Default True = SA2 for Encoder
-        vae_decoder_sa2 = False  # LOCKED: Always use Native SDPA for decoder (quality)
-        print(f"[VAE-CTRL] Encoder SA2 = {vae_encoder_sa2} | Decoder SA2 = {vae_decoder_sa2} (LOCKED)")
+        vae_decoder_sa2_ui = vae.get("vae_decoder_sa2", False)  # User's requested setting
+        
+        # VAE AUTO-LOCK LOGIC: Strict dependency between Tiling and SA2
+        # IF decode_tiled is TRUE -> FORCE vae_decoder_sa2 = False and DISABLE the option
+        # IF decode_tiled is FALSE -> ALLOW vae_decoder_sa2 to be user-defined (True/False)
+        if decode_tiled:
+            vae_decoder_sa2 = False  # FORCED to False when tiling is enabled
+            print(f"[VAE-AUTO] Tiling is ON: Disabling Decoder SA2 to prevent artifacts.")
+        else:
+            vae_decoder_sa2 = vae_decoder_sa2_ui  # Respect user setting when tiling is off
+        
+        print(f"[VAE-CTRL] Encoder SA2 = {vae_encoder_sa2} | Decoder SA2 = {vae_decoder_sa2} | Decode Tiled = {decode_tiled}")
         
         # RESPECT UI TOGGLES - DO NOT auto-force tiling
         # User controls encode_tiled and decode_tiled directly
