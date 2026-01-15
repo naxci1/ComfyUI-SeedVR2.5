@@ -387,9 +387,12 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
         print(f"[VAE-DEBUG] vae_encoder_sa2 in config: {vae.get('vae_encoder_sa2', 'NOT FOUND')}")
         print(f"[VAE-DEBUG] vae_decoder_sa2 in config: {vae.get('vae_decoder_sa2', 'NOT FOUND')}")
         
-        # NO DEFAULTS - respect user settings exactly as provided
-        vae_encoder_sa2 = vae.get("vae_encoder_sa2", False)  # Default False = Native SDPA
-        vae_decoder_sa2 = vae.get("vae_decoder_sa2", False)  # Default False = Native SDPA
+        # VAE ATTENTION SETTINGS:
+        # Encoder SA2 defaults to True (SA2 is faster for encoding on Blackwell)
+        # Decoder SA2 is LOCKED to False (Native SDPA prevents artifacts)
+        vae_encoder_sa2 = vae.get("vae_encoder_sa2", True)  # Default True = SA2 for Encoder
+        vae_decoder_sa2 = False  # LOCKED: Always use Native SDPA for decoder (quality)
+        print(f"[VAE-CTRL] Encoder SA2 = {vae_encoder_sa2} | Decoder SA2 = {vae_decoder_sa2} (LOCKED)")
         
         # RESPECT UI TOGGLES - DO NOT auto-force tiling
         # User controls encode_tiled and decode_tiled directly

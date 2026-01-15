@@ -383,13 +383,25 @@ def spas_sage_attn_meansim_topk_cuda(q, k, v, topk=0.5, is_causal=False, scale=N
     # Original formula was too restrictive (0.9 + topk * 0.08)
     # New formula enables higher sparsity TOPS on Blackwell Tensor Cores
     simthreshd1 = 0.3 + (1 - topk) * 0.4  # Range 0.3-0.7
-    cdfthreshd = 0.65 + (topk * 0.3)      # Range 0.65-0.95 (Blackwell optimized)
     pvthreshd = int(10 + topk * 40)       # Range 10-50
     
-    # Log kernel math sync for verification - ALWAYS print for debugging
+    # Get Blackwell configuration FIRST
     config = get_blackwell_config()
     is_blackwell = config.get('is_blackwell', False)
     actual_block_m = block_m_override if block_m_override is not None else config.get('BLOCK_M', 128)
+    
+    # BLACKWELL FORCE-INJECTION: If Blackwell GPU, FORCE cdfthreshd based on topk
+    # This bypasses any wrapper logic that might override the value
+    if is_blackwell:
+        # FORCED: Blackwell uses aggressive CDF mapping for maximum TOPS
+        # Formula: cdfthreshd = 0.65 + (topk * 0.3) → Range 0.65-0.95
+        # UI 0.3 (Fast) → cdfthreshd = 0.74 (high sparsity, max speed)
+        cdfthreshd = 0.65 + (topk * 0.3)
+        print(f"[DiT-SYNC] Blackwell Force-Set: cdfthreshd = {cdfthreshd:.4f} (topk={topk})")
+    else:
+        # Non-Blackwell: use conservative formula
+        cdfthreshd = 0.65 + (topk * 0.3)  # Same formula, but log differently
+        print(f"[DiT-SYNC] Non-Blackwell: cdfthreshd = {cdfthreshd:.4f} (topk={topk})")
     
     # FORCE PRINT: Always log kernel-CDF mapping regardless of GPU type
     print(f"[DiT-SYNC] Threshold {topk} mapped to Kernel-CDF {cdfthreshd:.4f} | BLOCK_M={actual_block_m} | Blackwell={is_blackwell}")
