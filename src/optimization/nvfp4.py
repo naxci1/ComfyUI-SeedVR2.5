@@ -646,7 +646,10 @@ def load_nvfp4_weights(state_dict: Dict[str, torch.Tensor],
         
         if is_nvfp4:
             # Wrap as NVFP4Tensor
-            scales = state_dict.get(scales_key) or getattr(tensor, 'nvfp4_scales', None)
+            # Use explicit None check instead of 'or' to avoid tensor boolean ambiguity
+            scales = state_dict.get(scales_key)
+            if scales is None:
+                scales = getattr(tensor, 'nvfp4_scales', None)
             if scales is not None:
                 # Get original shape from metadata or derive from scales
                 original_shape = getattr(tensor, 'original_shape', None)
