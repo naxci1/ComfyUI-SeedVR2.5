@@ -318,14 +318,9 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
         if is_blackwell_gpu():
             log_blackwell_status()
         
-        # Log TeaCache and Temporal Filter status with requested format
+        # Log TeaCache status with requested format
         if enable_teacache:
             print(f"[TeaCache] Block Skipping Active: Skipping blocks 12-24 (Threshold: 0.1)")
-        if temporal_filter_threshold < 1.0:
-            print(f"[Temporal Filter] Similarity: {temporal_filter_threshold*100:.0f}% -> Bypassing DiT: NO")
-        
-        # Log memory optimization status
-        print("[Memory] Dynamic memory allocation with autocast disabled for RoPE.")
         
         # Initialize debug (stateless - stored in local variable)
         debug = Debug(enabled=enable_debug)
