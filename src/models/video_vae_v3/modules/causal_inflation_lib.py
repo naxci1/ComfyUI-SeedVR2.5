@@ -166,7 +166,8 @@ class InflatedCausalConv3d(Conv3d):
             if prev_cache is not None:
                 x[idx] = torch.cat([prev_cache[idx], x[idx]], dim=split_dim - 1)
                 # Free prev_cache slice immediately after use (memory optimization)
-                del prev_cache[idx]
+                # Use None assignment instead of del to keep list length consistent
+                prev_cache[idx] = None
 
             # Get padding pattern.
             lpad_dim = (x[idx].ndim - split_dim - 1) * 2
