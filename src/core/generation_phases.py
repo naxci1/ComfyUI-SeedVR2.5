@@ -332,7 +332,8 @@ def encode_all_batches(
         
         # Move VAE to GPU for encoding (no-op if already there)
         manage_model_device(model=runner.vae, target_device=ctx['vae_device'], 
-                          model_name="VAE", debug=debug, runner=runner)
+                          model_name="VAE", debug=debug, runner=runner,
+                          enable_nvfp4=getattr(runner, '_enable_nvfp4', False))
         
         debug.log_memory_state("After VAE loading for encoding", detailed_tensors=False)
 
@@ -531,7 +532,8 @@ def encode_all_batches(
         # Offload VAE to configured offload device if specified
         if ctx['vae_offload_device'] is not None:
             manage_model_device(model=runner.vae, target_device=ctx['vae_offload_device'], 
-                                model_name="VAE", debug=debug, reason="VAE offload", runner=runner)
+                                model_name="VAE", debug=debug, reason="VAE offload", runner=runner,
+                                enable_nvfp4=getattr(runner, '_enable_nvfp4', False))
     
     debug.end_timer("phase1_encoding", "Phase 1: VAE encoding complete", show_breakdown=True)
     debug.log_memory_state("After phase 1 (VAE encoding)", show_tensors=False)
@@ -647,7 +649,8 @@ def upscale_all_batches(
         
         # Move DiT to GPU for upscaling (no-op if already there)
         manage_model_device(model=runner.dit, target_device=ctx['dit_device'], 
-                            model_name="DiT", debug=debug, runner=runner)
+                            model_name="DiT", debug=debug, runner=runner,
+                            enable_nvfp4=getattr(runner, '_enable_nvfp4', False))
 
         debug.log_memory_state("After DiT loading for upscaling", detailed_tensors=False)
 
@@ -901,7 +904,8 @@ def decode_all_batches(
 
         # Move VAE to GPU for decoding (no-op if already there)
         manage_model_device(model=runner.vae, target_device=ctx['vae_device'], 
-                          model_name="VAE", debug=debug, runner=runner)
+                          model_name="VAE", debug=debug, runner=runner,
+                          enable_nvfp4=getattr(runner, '_enable_nvfp4', False))
         
         debug.log_memory_state("After VAE loading for decoding", detailed_tensors=False)
 
