@@ -66,6 +66,18 @@ if hasattr(torch, 'float8_e4m3fn'):
 if hasattr(torch, 'float8_e5m2'):
     _DTYPE_SIZES[torch.float8_e5m2] = 1
 
+# FP8 E4M3 maximum representable value (for scaling calculations)
+FP8_E4M3_MAX = 448.0
+
+# Check for scaled_mm and FP8 availability
+_SCALED_MM_AVAILABLE = hasattr(torch, '_scaled_mm')
+_FP8_E4M3_AVAILABLE = hasattr(torch, 'float8_e4m3fn')
+
+
+class NVFP4RequirementError(RuntimeError):
+    """Error raised when NVFP4 requirements are not met"""
+    pass
+
 
 def _get_dtype_size(dtype: torch.dtype) -> int:
     """Get element size in bytes for a dtype"""
@@ -102,6 +114,494 @@ class NVFP4Config:
     def __post_init__(self):
         if self.preserve_precision_patterns is None:
             self.preserve_precision_patterns = PRESERVED_LAYER_PATTERNS.copy()
+
+
+# =============================================================================
+# NVFP4 Extreme Packed Weight Support (uint8 packed, block-wise scaled)
+# =============================================================================
+
+def unpack_nvfp4_uint8(packed_data: torch.Tensor) -> torch.Tensor:
+    """
+    Unpack NVFP4 weights from uint8 containers.
+    
+    In Blackwell's native FP4 implementation, two 4-bit elements are packed 
+    into a single 8-bit container (uint8). This function extracts the individual
+    4-bit components using bit-shifting and masking.
+    
+    Packing format:
+    - High nibble (bits 7-4): First 4-bit value
+    - Low nibble (bits 3-0): Second 4-bit value
+    
+    Args:
+        packed_data: torch.uint8 tensor with packed 4-bit values
+        
+    Returns:
+        torch.int8 tensor with unpacked 4-bit values (2x the length)
+        Each value is in range [0, 15] as signed representation
+    """
+    # Ensure input is uint8
+    if packed_data.dtype != torch.uint8:
+        packed_data = packed_data.to(torch.uint8)
+    
+    # Flatten for processing
+    flat_packed = packed_data.flatten()
+    
+    # Extract high nibble (bits 7-4) - first element
+    high_nibbles = (flat_packed >> 4) & 0x0F
+    
+    # Extract low nibble (bits 3-0) - second element
+    low_nibbles = flat_packed & 0x0F
+    
+    # Interleave to get original order [high0, low0, high1, low1, ...]
+    num_elements = flat_packed.numel() * 2
+    unpacked = torch.empty(num_elements, dtype=torch.uint8, device=packed_data.device)
+    unpacked[0::2] = high_nibbles
+    unpacked[1::2] = low_nibbles
+    
+    # Convert to signed int8 for E2M1 interpretation
+    return unpacked.to(torch.int8)
+
+
+def dequantize_nvfp4_blockwise(
+    unpacked_data: torch.Tensor,
+    scales: torch.Tensor,
+    target_shape: torch.Size,
+    block_size: int = NVFP4_BLOCK_SIZE,
+    output_dtype: torch.dtype = torch.float16
+) -> torch.Tensor:
+    """
+    De-quantize unpacked NVFP4 values using block-wise scaling.
+    
+    E2M1 Format (4-bit floating point):
+    - Bit 3: Sign bit (0=positive, 1=negative)
+    - Bits 2-1: Exponent (2 bits, bias=1)
+    - Bit 0: Mantissa (1 bit)
+    
+    Representable values: 0, ±0.5, ±1.0, ±1.5, ±2.0, ±3.0, ±4.0, ±6.0
+    
+    Args:
+        unpacked_data: Unpacked 4-bit values as int8 tensor
+        scales: Block-wise scaling factors (float16)
+        target_shape: Original weight shape to reshape to
+        block_size: Number of elements per scaling block (default: 16)
+        output_dtype: Output data type (default: float16)
+        
+    Returns:
+        Dequantized tensor in target_shape with output_dtype
+    """
+    device = unpacked_data.device
+    
+    # Ensure we're working with the right types
+    unpacked = unpacked_data.to(torch.int32)  # Use int32 for bit operations
+    
+    # Trim to match original element count
+    total_elements = target_shape.numel()
+    unpacked = unpacked[:total_elements]
+    
+    # Extract sign and magnitude code from E2M1 format
+    # Format: [sign(1 bit) | magnitude_code(3 bits)]
+    sign_bit = (unpacked >> 3) & 1  # Bit 3 is sign
+    mag_code = unpacked & 0x7       # Bits 0-2 are magnitude code
+    
+    # E2M1 magnitude lookup table
+    # Code -> Magnitude: 0->0, 1->0.5, 2->1.0, 3->1.5, 4->2.0, 5->3.0, 6->4.0, 7->6.0
+    e2m1_lut = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        dtype=output_dtype,
+        device=device
+    )
+    
+    # Map magnitude codes to actual values
+    magnitude = e2m1_lut[mag_code.clamp(0, 7).long()]
+    
+    # Apply sign
+    sign_multiplier = torch.where(sign_bit == 1, 
+                                   torch.tensor(-1.0, dtype=output_dtype, device=device),
+                                   torch.tensor(1.0, dtype=output_dtype, device=device))
+    base_values = magnitude * sign_multiplier
+    
+    # Apply block-wise scaling
+    # Each scale corresponds to 'block_size' consecutive elements
+    scales_flat = scales.flatten().to(output_dtype)
+    
+    # Expand scales to match element count
+    # scales shape might be [N, 1] for N blocks, each covering block_size elements
+    num_blocks = scales_flat.numel()
+    scales_expanded = scales_flat.repeat_interleave(block_size)
+    
+    # Trim to actual element count
+    scales_expanded = scales_expanded[:total_elements]
+    
+    # Apply scales: dequantized = base_value * scale
+    dequantized = base_values * scales_expanded
+    
+    # Reshape to target shape
+    return dequantized.reshape(target_shape)
+
+
+def unpack_and_dequantize_nvfp4(
+    packed_weight: torch.Tensor,
+    scales: torch.Tensor,
+    target_shape: torch.Size,
+    block_size: int = NVFP4_BLOCK_SIZE,
+    output_dtype: torch.dtype = torch.float16
+) -> torch.Tensor:
+    """
+    Complete pipeline to unpack uint8-packed NVFP4 weights and dequantize.
+    
+    This is the main entry point for converting packed NVFP4 checkpoints
+    to usable weight tensors for inference.
+    
+    Args:
+        packed_weight: uint8 tensor with packed 4-bit values
+        scales: Block-wise scaling factors (float16)
+        target_shape: Original weight shape
+        block_size: Elements per scaling block (default: 16, Blackwell alignment)
+        output_dtype: Output data type (default: float16)
+        
+    Returns:
+        Dequantized weight tensor in target_shape
+    """
+    # Step 1: Unpack two 4-bit values from each uint8 byte
+    unpacked = unpack_nvfp4_uint8(packed_weight)
+    
+    # Step 2: Dequantize using block-wise scales
+    dequantized = dequantize_nvfp4_blockwise(
+        unpacked, scales, target_shape, block_size, output_dtype
+    )
+    
+    return dequantized
+
+
+class BlackwellNVFP4PackedLinear(nn.Module):
+    """
+    Linear layer optimized for Blackwell (SM_120) using uint8-packed NVFP4 weights.
+    
+    This module handles the extreme NVFP4 format where:
+    - Weights are stored as uint8 (two 4-bit values per byte)
+    - Block-wise scales are stored as float16
+    - Uses torch._scaled_mm for hardware-accelerated computation
+    
+    Technical Details:
+    - Block size alignment: 16 (Blackwell Tensor Core requirement)
+    - Weight format: E2M1 (4-bit) packed in uint8
+    - Scale format: float16 per block
+    - Computation: FP8 via torch._scaled_mm for Tensor Core acceleration
+    """
+    
+    _active_layers = 0
+    _scaled_mm_calls = 0
+    
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        packed_weight: torch.Tensor,
+        weight_scales: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        block_size: int = NVFP4_BLOCK_SIZE,
+        device: Optional[torch.device] = None,
+        debug: Optional[Any] = None
+    ):
+        """
+        Initialize Blackwell NVFP4 Packed Linear layer.
+        
+        Args:
+            in_features: Input feature dimension
+            out_features: Output feature dimension
+            packed_weight: uint8 packed NVFP4 weights
+            weight_scales: Block-wise float16 scales
+            bias: Optional bias tensor (float16)
+            block_size: Scaling block size (default: 16)
+            device: Target device
+            debug: Debug instance for logging
+        """
+        super().__init__()
+        
+        if not _SCALED_MM_AVAILABLE:
+            raise NVFP4RequirementError(
+                "torch._scaled_mm not available. Blackwell NVFP4 requires PyTorch 2.1+ "
+                "with CUDA support."
+            )
+        
+        if not _FP8_E4M3_AVAILABLE:
+            raise NVFP4RequirementError(
+                "FP8 E4M3 dtype not available. Blackwell NVFP4 requires PyTorch 2.1+ "
+                "with FP8 support."
+            )
+        
+        self.in_features = in_features
+        self.out_features = out_features
+        self.block_size = block_size
+        self._debug = debug
+        self._native_fp4_active = True
+        
+        if device is None:
+            device = packed_weight.device
+        
+        # Store packed weight and scales as buffers
+        self.register_buffer('packed_weight', packed_weight.to(device))
+        self.register_buffer('weight_scales', weight_scales.to(torch.float16).to(device))
+        
+        # Pre-dequantize and convert to FP8 for torch._scaled_mm
+        # This is done once during init to avoid per-forward overhead
+        with torch.no_grad():
+            target_shape = torch.Size([out_features, in_features])
+            dequantized = unpack_and_dequantize_nvfp4(
+                packed_weight, weight_scales, target_shape, block_size, torch.float32
+            )
+            
+            # Compute scale for FP8 conversion
+            weight_absmax = dequantized.abs().max()
+            fp8_scale = (weight_absmax / FP8_E4M3_MAX).clamp(min=1e-12)
+            
+            # Convert to FP8 E4M3
+            weight_scaled = (dequantized / fp8_scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
+            weight_fp8 = weight_scaled.to(torch.float8_e4m3fn)
+            
+            # Handle K-dimension padding for torch._scaled_mm (must be divisible by 16)
+            self._k_padding = 0
+            if in_features % 16 != 0:
+                self._k_padding = 16 - (in_features % 16)
+                weight_padded = torch.nn.functional.pad(
+                    weight_fp8.view(torch.int8).to(torch.float32),
+                    (0, self._k_padding),
+                    mode='constant',
+                    value=0
+                )
+                weight_fp8 = weight_padded.to(torch.int8).view(torch.float8_e4m3fn)
+            
+            self.register_buffer('weight_fp8', weight_fp8.to(device))
+            self.register_buffer('fp8_scale', fp8_scale.to(torch.float32).to(device))
+        
+        # Handle bias
+        if bias is not None:
+            self.bias = nn.Parameter(bias.to(torch.bfloat16).to(device))
+        else:
+            self.register_parameter('bias', None)
+        
+        BlackwellNVFP4PackedLinear._active_layers += 1
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass using Blackwell-native FP8 hardware acceleration.
+        
+        Computation flow:
+        1. Dynamically quantize input to FP8
+        2. Pad input if needed for Tensor Core alignment
+        3. Call torch._scaled_mm for hardware-accelerated matmul
+        4. Add bias and return in BF16
+        """
+        original_shape = x.shape
+        original_dtype = x.dtype
+        
+        # Flatten for 2D matmul
+        if x.dim() > 2:
+            x = x.reshape(-1, x.shape[-1])
+        
+        # Pad input if needed
+        if self._k_padding > 0:
+            x = torch.nn.functional.pad(x, (0, self._k_padding), mode='constant', value=0)
+        
+        # Dynamic input quantization to FP8
+        with torch.no_grad():
+            input_absmax = x.abs().max()
+            input_scale = (input_absmax / FP8_E4M3_MAX).clamp(min=1e-12)
+        
+        x_scaled = (x / input_scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
+        x_fp8 = x_scaled.to(torch.float8_e4m3fn)
+        
+        # Prepare scale tensors
+        scale_a = input_scale.to(torch.float32).reshape(1)
+        scale_b = self.fp8_scale.reshape(1)
+        
+        # Hardware-accelerated scaled matmul
+        try:
+            result = torch._scaled_mm(
+                x_fp8,
+                self.weight_fp8.t(),
+                scale_a,
+                scale_b,
+                bias=None,
+                out_dtype=torch.bfloat16,
+                use_fast_accum=True
+            )
+            BlackwellNVFP4PackedLinear._scaled_mm_calls += 1
+        except Exception as e:
+            raise RuntimeError(
+                f"torch._scaled_mm failed: {e}. "
+                "Blackwell NVFP4 cannot fallback to BF16."
+            )
+        
+        # Handle tuple return
+        if isinstance(result, tuple):
+            result = result[0]
+        
+        # Add bias
+        if self.bias is not None:
+            result = result + self.bias
+        
+        # Reshape back
+        if len(original_shape) > 2:
+            result = result.reshape(*original_shape[:-1], self.out_features)
+        
+        # Cast to original dtype if needed
+        if original_dtype != torch.bfloat16 and original_dtype in (torch.float16, torch.float32):
+            result = result.to(original_dtype)
+        
+        return result
+    
+    @classmethod
+    def get_active_layer_count(cls) -> int:
+        return cls._active_layers
+    
+    @classmethod
+    def get_scaled_mm_calls(cls) -> int:
+        return cls._scaled_mm_calls
+
+
+def load_blackwell_nvfp4_model(
+    state_dict: Dict[str, torch.Tensor],
+    model: nn.Module,
+    block_size: int = NVFP4_BLOCK_SIZE,
+    device: Optional[torch.device] = None,
+    debug: Optional[Any] = None
+) -> Tuple[nn.Module, Dict[str, int]]:
+    """
+    Load a Blackwell NVFP4 extreme packed model from state dict.
+    
+    This function iterates through the model's modules and replaces
+    Linear layers with BlackwellNVFP4PackedLinear when packed weights
+    with scales are found in the state dict.
+    
+    Handles Ada-style transformer blocks with .vid and .txt parallel paths.
+    
+    Args:
+        state_dict: State dict with packed uint8 weights and float16 scales
+        model: Model to load weights into
+        block_size: Scaling block size (default: 16)
+        device: Target device
+        debug: Debug instance for logging
+        
+    Returns:
+        Tuple of (modified model, statistics dict)
+    """
+    if device is None and torch.cuda.is_available():
+        device = torch.device('cuda:0')
+    elif device is None:
+        device = torch.device('cpu')
+    
+    stats = {
+        'replaced_layers': 0,
+        'preserved_layers': 0,
+        'vid_layers': 0,
+        'txt_layers': 0,
+        'total_blocks': 0
+    }
+    
+    if debug:
+        debug.log("🚀 Loading Blackwell NVFP4 extreme packed model", category="nvfp4")
+    
+    # Find all packed weight + scale pairs
+    packed_weights = {}
+    for key in state_dict.keys():
+        if key.endswith('_scales'):
+            weight_key = key.replace('_scales', '')
+            if weight_key in state_dict:
+                packed_weights[weight_key] = {
+                    'packed': state_dict[weight_key],
+                    'scales': state_dict[key]
+                }
+    
+    if debug:
+        debug.log(f"🔄 Found {len(packed_weights)} packed weight+scale pairs", category="nvfp4")
+    
+    # Build replacement map
+    replacements = []
+    
+    def find_linear_layers(module: nn.Module, prefix: str = ''):
+        """Recursively find all Linear layers"""
+        for name, child in module.named_children():
+            full_name = f"{prefix}.{name}" if prefix else name
+            
+            if isinstance(child, nn.Linear):
+                # Check for corresponding packed weight
+                weight_key = f"{full_name}.weight"
+                
+                if weight_key in packed_weights:
+                    data = packed_weights[weight_key]
+                    replacements.append({
+                        'prefix': prefix,
+                        'name': name,
+                        'full_name': full_name,
+                        'module': child,
+                        'packed_weight': data['packed'],
+                        'scales': data['scales']
+                    })
+                    
+                    # Track layer types
+                    if '.vid.' in full_name or '.vid' in full_name:
+                        stats['vid_layers'] += 1
+                    elif '.txt.' in full_name or '.txt' in full_name:
+                        stats['txt_layers'] += 1
+            else:
+                find_linear_layers(child, full_name)
+    
+    find_linear_layers(model)
+    
+    if debug:
+        debug.log(f"🔄 Found {len(replacements)} Linear layers to replace", category="nvfp4")
+    
+    # Perform replacements
+    for rep in replacements:
+        parent = model
+        parts = rep['prefix'].split('.') if rep['prefix'] else []
+        
+        # Navigate to parent module
+        for part in parts:
+            if part:
+                parent = getattr(parent, part)
+        
+        original = rep['module']
+        
+        try:
+            # Create packed linear layer
+            new_layer = BlackwellNVFP4PackedLinear(
+                in_features=original.in_features,
+                out_features=original.out_features,
+                packed_weight=rep['packed_weight'],
+                weight_scales=rep['scales'],
+                bias=original.bias.data if original.bias is not None else None,
+                block_size=block_size,
+                device=device,
+                debug=debug
+            )
+            
+            # Replace in parent
+            setattr(parent, rep['name'], new_layer)
+            stats['replaced_layers'] += 1
+            
+        except Exception as e:
+            if debug:
+                debug.log(f"⚠️ Failed to replace {rep['full_name']}: {e}", category="nvfp4")
+            stats['preserved_layers'] += 1
+    
+    # Count blocks
+    for name, _ in model.named_modules():
+        if 'blocks.' in name and name.endswith('.attn'):
+            block_num = name.split('blocks.')[1].split('.')[0]
+            if block_num.isdigit():
+                stats['total_blocks'] = max(stats['total_blocks'], int(block_num) + 1)
+    
+    if debug:
+        debug.log(f"✅ NVFP4 Loading Complete:", category="nvfp4")
+        debug.log(f"    - Replaced: {stats['replaced_layers']} Linear layers", category="nvfp4")
+        debug.log(f"    - Preserved: {stats['preserved_layers']} layers", category="nvfp4")
+        debug.log(f"    - Video path (.vid): {stats['vid_layers']} layers", category="nvfp4")
+        debug.log(f"    - Text path (.txt): {stats['txt_layers']} layers", category="nvfp4")
+        debug.log(f"    - Ada-style blocks: {stats['total_blocks']}", category="nvfp4")
+    
+    return model, stats
 
 
 # Global state for Blackwell detection
@@ -1250,11 +1750,7 @@ def create_pinned_tensor(shape: torch.Size, dtype: torch.dtype,
         return torch.empty(shape, dtype=dtype)
 
 
-# Check if torch._scaled_mm is available (requires PyTorch 2.1+)
-_SCALED_MM_AVAILABLE = hasattr(torch, '_scaled_mm')
-
-# Check if FP8 types are available
-_FP8_E4M3_AVAILABLE = hasattr(torch, 'float8_e4m3fn')
+# Additional FP8 E5M2 availability check (not duplicated at top)
 _FP8_E5M2_AVAILABLE = hasattr(torch, 'float8_e5m2')
 
 
@@ -1279,10 +1775,6 @@ def _check_scaled_mm_support() -> bool:
         pass
     
     return False
-
-
-# FP8 E4M3 maximum representable value (used for scaling)
-FP8_E4M3_MAX = 448.0
 
 
 class BlackwellNativeFP4Linear(nn.Module):
@@ -1628,13 +2120,7 @@ class NVFP4ScaledLinear(nn.Module):
         cls._total_replaced_layers = 0
 
 
-class NVFP4RequirementError(RuntimeError):
-    """
-    Explicit error raised when NVFP4 requirements are not met.
-    
-    This ensures no silent fallback to FP16 when NVFP4 is explicitly requested.
-    """
-    pass
+# Note: NVFP4RequirementError is defined at the top of this module
 
 
 def replace_linear_with_nvfp4(
@@ -2003,6 +2489,7 @@ __all__ = [
     'NvFP4LinearLayer',
     'NVFP4ScaledLinear',
     'BlackwellNativeFP4Linear',
+    'BlackwellNVFP4PackedLinear',
     'NVFP4RequirementError',
     'AsyncModelOffloader',
     'PinnedMemoryPool',
@@ -2020,4 +2507,10 @@ __all__ = [
     'verify_nvfp4_active',
     'apply_nvfp4_to_dit',
     'PRESERVED_LAYER_PATTERNS',
+    # New NVFP4 extreme packed weight functions
+    'unpack_nvfp4_uint8',
+    'dequantize_nvfp4_blockwise',
+    'unpack_and_dequantize_nvfp4',
+    'load_blackwell_nvfp4_model',
+    'FP8_E4M3_MAX',
 ]
