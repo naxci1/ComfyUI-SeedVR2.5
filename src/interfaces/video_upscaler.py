@@ -42,10 +42,19 @@ def is_blackwell_gpu() -> bool:
     return BLACKWELL_GPU_DETECTED
 
 
-def log_blackwell_status():
-    """Log Blackwell optimization status."""
+def log_blackwell_status(debug: Optional[Any] = None):
+    """Log Blackwell optimization status.
+    
+    Args:
+        debug: Optional debug object for logging. If provided, uses debug.log().
+               Otherwise falls back to print().
+    """
     if BLACKWELL_GPU_DETECTED:
-        print("🚀 BLACKWELL SM_120 DETECTED: Applying TeaCache & Async Optimization.")
+        msg = "🚀 BLACKWELL SM_120 DETECTED: Applying TeaCache & Async Optimization."
+        if debug is not None:
+            debug.log(msg, category="hardware")
+        else:
+            print(msg)
     return BLACKWELL_GPU_DETECTED
 
 
