@@ -28,163 +28,15 @@ Key Optimizations:
 - Proper device management to ensure tensors stay on correct devices
 
 BLACKWELL VRAM OPTIMIZATIONS (16GB VRAM target):
-- Singleton Buffer Manager for zero-allocation scatter-gather
-- Uses .narrow() to slice into pre-allocated CUDA workspace
-- Prevents "Allocation on device" errors on 16GB VRAM
-- Kernel-level logging for hardware verification
+- Memory-efficient scatter-gather without large pre-allocated buffers
+- Uses index_copy_ for in-place tensor operations
+- Autocast disabled for RoPE to prevent precision-related memory bloat
 """
 
 from itertools import chain
 from typing import Callable, Dict, List, Tuple, Optional, Any
 import einops
 import torch
-
-
-# =============================================================================
-# SINGLETON BUFFER MANAGER FOR ZERO-ALLOCATION SCATTER-GATHER
-# =============================================================================
-
-class CUDAWorkspaceManager:
-    """
-    Singleton CUDA Workspace Manager for zero-allocation tensor operations.
-    
-    Uses a pre-allocated CUDA buffer and .narrow() slicing to prevent
-    dynamic allocations that cause OOM on 16GB VRAM systems.
-    
-    This is the ONLY way to prevent "Allocation on device" errors on RTX 5070 Ti.
-    
-    NOTE: This class is designed for single-threaded inference. For multi-threaded
-    use, consider using thread-local storage or explicit synchronization.
-    """
-    
-    _instance = None
-    _workspace: Optional[torch.Tensor] = None
-    _workspace_size: int = 0
-    _current_offset: int = 0
-    _dtype: torch.dtype = torch.bfloat16
-    _device: Optional[torch.device] = None
-    _allocation_count: int = 0
-    _reuse_count: int = 0
-    
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-    
-    @classmethod
-    def initialize(cls, max_elements: int = 256 * 1024 * 1024,  # 256M elements (~512MB for bf16)
-                   dtype: torch.dtype = torch.bfloat16,
-                   device: Optional[torch.device] = None) -> None:
-        """
-        Initialize the CUDA workspace buffer.
-        
-        Args:
-            max_elements: Maximum number of elements in workspace
-            dtype: Data type for workspace buffer
-            device: CUDA device (auto-detected if None)
-        """
-        if device is None:
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        cls._dtype = dtype
-        cls._device = device
-        cls._workspace_size = max_elements
-        cls._current_offset = 0
-        
-        if device.type == 'cuda':
-            # Pre-allocate workspace buffer
-            cls._workspace = torch.empty(
-                max_elements, 
-                dtype=dtype, 
-                device=device
-            )
-            cls._allocation_count += 1
-    
-    @classmethod
-    def get_buffer(cls, shape: Tuple[int, ...], dtype: torch.dtype = None) -> torch.Tensor:
-        """
-        Get a buffer from the workspace using .narrow() - ZERO ALLOCATION.
-        
-        Args:
-            shape: Required shape
-            dtype: Required dtype (must match workspace dtype)
-            
-        Returns:
-            Tensor view into workspace buffer
-        """
-        numel = 1
-        for s in shape:
-            numel *= s
-        
-        dtype = dtype or cls._dtype
-        
-        # Ensure workspace is initialized
-        if cls._workspace is None:
-            cls.initialize(dtype=dtype)
-        
-        # Check dtype match
-        if dtype != cls._dtype:
-            # Reinitialize with new dtype
-            cls.initialize(max_elements=cls._workspace_size, dtype=dtype, device=cls._device)
-        
-        # Check if we have enough space
-        if cls._current_offset + numel > cls._workspace_size:
-            # Reset offset (simple ring buffer strategy)
-            cls._current_offset = 0
-        
-        # Use .narrow() for zero-allocation slicing
-        if cls._workspace is not None and numel <= cls._workspace_size:
-            buffer = cls._workspace.narrow(0, cls._current_offset, numel).view(shape)
-            cls._current_offset += numel
-            cls._reuse_count += 1
-            return buffer
-        
-        # Fallback: allocate new tensor (should be rare)
-        cls._allocation_count += 1
-        return torch.empty(shape, dtype=dtype, device=cls._device)
-    
-    @classmethod
-    def reset(cls) -> None:
-        """Reset workspace offset for new forward pass."""
-        cls._current_offset = 0
-    
-    @classmethod
-    def get_stats(cls) -> Dict[str, Any]:
-        """Get workspace statistics for kernel logging."""
-        return {
-            'workspace_size_mb': (cls._workspace_size * 2) / (1024 * 1024) if cls._workspace is not None else 0,
-            'current_offset': cls._current_offset,
-            'allocation_count': cls._allocation_count,
-            'reuse_count': cls._reuse_count,
-            'workspace_address': hex(cls._workspace.data_ptr()) if cls._workspace is not None else '0x0',
-            'device': str(cls._device),
-            'dtype': str(cls._dtype),
-            'vram_reserved_mb': torch.cuda.memory_reserved() / (1024 * 1024) if torch.cuda.is_available() else 0,
-            'vram_allocated_mb': torch.cuda.memory_allocated() / (1024 * 1024) if torch.cuda.is_available() else 0,
-        }
-    
-    @classmethod
-    def log_kernel_event(cls, event_type: str, details: Dict[str, Any]) -> str:
-        """
-        Log kernel-level event with hardware state.
-        
-        Returns formatted log string for verification.
-        """
-        stats = cls.get_stats()
-        log_msg = (
-            f"VRAM_PEAK_PREVENTION: {event_type} | "
-            f"Buffer@{stats['workspace_address']} | "
-            f"Offset={stats['current_offset']} | "
-            f"VRAM_Reserved={stats['vram_reserved_mb']:.1f}MB | "
-            f"VRAM_Allocated={stats['vram_allocated_mb']:.1f}MB"
-        )
-        for k, v in details.items():
-            log_msg += f" | {k}={v}"
-        return log_msg
-
-
-# Global workspace instance
-_cuda_workspace = CUDAWorkspaceManager()
 
 
 def _tensor_split(tensor: torch.Tensor, lengths: torch.LongTensor, dim: int = 0) -> List[torch.Tensor]:
@@ -571,14 +423,11 @@ def repeat_concat_idx(
 
     def memory_efficient_scatter_concat(vid: torch.Tensor, txt: torch.Tensor) -> torch.Tensor:
         """
-        ZERO-ALLOCATION scatter-gather concatenation using Singleton Buffer Manager.
-        
-        Uses CUDAWorkspaceManager to slice into pre-allocated CUDA workspace via .narrow().
-        This is the ONLY way to prevent "Allocation on device" errors on 16GB VRAM.
+        Memory-efficient scatter-gather concatenation using standard dynamic allocation.
         
         Instead of torch.cat([vid, txt])[tgt_idx] which creates a 2x VRAM peak,
-        this approach uses the singleton workspace buffer and directly maps slices
-        of vid and txt into their target positions.
+        this approach uses index_select and index_copy_ to directly map slices
+        of vid and txt into their target positions without intermediate buffers.
         
         Args:
             vid: Video tensor (VL, ...)
@@ -586,40 +435,14 @@ def repeat_concat_idx(
             
         Returns:
             Interleaved tensor with elements at tgt_idx positions
-            
-        KERNEL LOGGING: Outputs VRAM_PEAK_PREVENTION log with buffer address
         """
-        global _cuda_workspace
-        
-        # Calculate total elements for flat buffer
+        # Calculate output shape
         total_len = tgt_idx.shape[0]
-        feature_size = vid.shape[1:].numel() if len(vid.shape) > 1 else 1
-        total_elements = total_len * feature_size
-        
-        # Initialize workspace if needed
-        if _cuda_workspace._workspace is None or _cuda_workspace._device != vid.device:
-            CUDAWorkspaceManager.initialize(
-                max_elements=max(total_elements * 4, 256 * 1024 * 1024),  # 4x headroom
-                dtype=vid.dtype,
-                device=vid.device
-            )
-        
-        # Get output buffer from workspace using .narrow() - ZERO ALLOCATION
         output_shape = (total_len,) + vid.shape[1:]
-        output = CUDAWorkspaceManager.get_buffer(output_shape, dtype=vid.dtype)
         
-        # Log kernel event for verification
-        _log_msg = CUDAWorkspaceManager.log_kernel_event(
-            "Pre-allocated buffer reuse",
-            {
-                "output_shape": str(output_shape),
-                "vid_shape": str(vid.shape),
-                "txt_shape": str(txt.shape),
-                "vid_device": str(vid.device),
-                "vid_dtype": str(vid.dtype),
-            }
-        )
-        # Uncomment for verbose logging: print(_log_msg)
+        # Standard allocation with RoPE-compatible dtype (autocast disabled)
+        # Using vid.dtype ensures we don't get precision-related memory bloat
+        output = torch.empty(output_shape, dtype=vid.dtype, device=vid.device)
         
         # Compute source indices for vid and txt
         vid_len_total = vid.shape[0]
@@ -652,8 +475,8 @@ def repeat_concat_idx(
         
         return output
 
-    # Use ZERO-ALLOCATION scatter-gather with Singleton Buffer Manager
-    # This prevents "Allocation on device" errors on 16GB VRAM (RTX 5070 Ti)
+    # Use memory-efficient scatter-gather without Singleton Buffer Manager
+    # Uses standard dynamic allocation with autocast disabled for RoPE compatibility
     return (
         memory_efficient_scatter_concat,
         lambda all: unconcat_coalesce(all),
@@ -875,72 +698,3 @@ def window_idx(
         tgt_shape,
         tgt_windows,
     )
-
-
-# =============================================================================
-# VERIFICATION REPORT FUNCTIONS
-# =============================================================================
-
-def get_scatter_concat_verification_report() -> Dict[str, Any]:
-    """
-    Get hardware verification report for scatter-concat optimizations.
-    
-    Returns dictionary with:
-    - workspace_active: Whether singleton buffer is active
-    - buffer_address: Hex address of pre-allocated buffer
-    - vram_state: Current CUDA memory state
-    - allocation_stats: Zero-allocation statistics
-    
-    Use this to verify kernels are actually active.
-    """
-    report = {
-        'optimization': 'SCATTER_CONCAT_ZERO_ALLOCATION',
-        'status': 'ACTIVE' if CUDAWorkspaceManager._workspace is not None else 'INACTIVE',
-    }
-    
-    # Add workspace stats
-    workspace_stats = CUDAWorkspaceManager.get_stats()
-    report.update({
-        'workspace_active': CUDAWorkspaceManager._workspace is not None,
-        'buffer_address': workspace_stats['workspace_address'],
-        'workspace_size_mb': workspace_stats['workspace_size_mb'],
-        'allocation_count': workspace_stats['allocation_count'],
-        'reuse_count': workspace_stats['reuse_count'],
-        'device': workspace_stats['device'],
-        'dtype': workspace_stats['dtype'],
-    })
-    
-    # Add CUDA memory state
-    if torch.cuda.is_available():
-        report['vram_state'] = {
-            'reserved_mb': torch.cuda.memory_reserved() / (1024 * 1024),
-            'allocated_mb': torch.cuda.memory_allocated() / (1024 * 1024),
-            'max_reserved_mb': torch.cuda.max_memory_reserved() / (1024 * 1024),
-            'max_allocated_mb': torch.cuda.max_memory_allocated() / (1024 * 1024),
-        }
-    
-    return report
-
-
-def reset_workspace_for_inference() -> None:
-    """Reset workspace offset before each inference pass."""
-    CUDAWorkspaceManager.reset()
-
-
-def validate_scatter_concat_kernel() -> bool:
-    """
-    Validate that scatter-concat kernel is properly configured.
-    
-    Raises RuntimeError if optimization is not active when expected.
-    """
-    if torch.cuda.is_available() and CUDAWorkspaceManager._workspace is None:
-        # Initialize on first call
-        CUDAWorkspaceManager.initialize()
-    
-    if torch.cuda.is_available() and CUDAWorkspaceManager._workspace is None:
-        raise RuntimeError(
-            "Optimization Injection Failed: SCATTER_CONCAT workspace not initialized. "
-            "Call CUDAWorkspaceManager.initialize() before inference."
-        )
-    
-    return True
