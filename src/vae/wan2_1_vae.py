@@ -1,12 +1,19 @@
 """
 Wan2.1 VAE Implementation for ComfyUI-SeedVR2.5
 Includes encoder/decoder blocks and Wan2_1_VAE wrapper class
+
+Optimized with SageAttention 2.2.0 for improved VAE decoding performance.
+Note: SageAttention only supports head_dim <= 256. For larger dimensions,
+automatically falls back to PyTorch SDPA.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, List
+
+# Import SageAttention for optimized VAE attention
+from ..optimization.vae_sage_attention import sage_attn_vae, SAGE_ATTN_BATCHED_AVAILABLE, is_head_dim_supported
 
 
 class ResidualBlock(nn.Module):
@@ -69,14 +76,17 @@ class ResidualBlock(nn.Module):
 
 
 class AttentionBlock(nn.Module):
-    """Multi-head self-attention block"""
+    """Multi-head self-attention block with SageAttention 2.2.0 optimization"""
     
-    def __init__(self, channels: int, num_heads: int = 4):
+    def __init__(self, channels: int, num_heads: int = 4, use_tiling: bool = True, 
+                 tile_size: int = 64):
         super().__init__()
         
         self.channels = channels
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
+        self.use_tiling = use_tiling
+        self.tile_size = tile_size
         
         assert channels % num_heads == 0, "channels must be divisible by num_heads"
         
@@ -84,26 +94,32 @@ class AttentionBlock(nn.Module):
         self.qkv = nn.Linear(channels, channels * 3, bias=True)
         self.proj = nn.Linear(channels, channels, bias=True)
         self.scale = self.head_dim ** -0.5
+        
+        # Track whether SageAttention is available
+        self._use_sage = SAGE_ATTN_BATCHED_AVAILABLE
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, channels, height, width = x.shape
+        seq_len = height * width
         
         # Reshape and normalize
         x_norm = self.norm(x)
-        x_flat = x_norm.permute(0, 2, 3, 1).reshape(batch_size, height * width, channels)
+        x_flat = x_norm.permute(0, 2, 3, 1).reshape(batch_size, seq_len, channels)
         
         # Project to Q, K, V
         qkv = self.qkv(x_flat)
-        qkv = qkv.reshape(batch_size, height * width, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, num_heads, HW, head_dim)
+        qkv = qkv.reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, num_heads, seq, head_dim)
         q, k, v = qkv[0], qkv[1], qkv[2]
         
-        # Attention
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = F.softmax(attn, dim=-1)
+        # Use SageAttention with memory-efficient tiling for large sequences
+        if self.use_tiling and seq_len > self.tile_size * self.tile_size:
+            out = self._tiled_attention(q, k, v, seq_len)
+        else:
+            # Use SageAttention kernel (falls back to SDPA if unavailable)
+            out = sage_attn_vae(q, k, v, is_causal=False, scale=self.scale)
         
-        out = attn @ v
-        out = out.transpose(1, 2).reshape(batch_size, height * width, channels)
+        out = out.transpose(1, 2).reshape(batch_size, seq_len, channels)
         out = self.proj(out)
         
         # Reshape back and add residual
@@ -111,6 +127,35 @@ class AttentionBlock(nn.Module):
         out = out + x
         
         return out
+    
+    def _tiled_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                         seq_len: int) -> torch.Tensor:
+        """Memory-efficient tiled attention for large spatial dimensions (16GB VRAM)."""
+        tile_seq = self.tile_size * self.tile_size
+        
+        if seq_len <= tile_seq:
+            return sage_attn_vae(q, k, v, is_causal=False, scale=self.scale)
+        
+        num_tiles = (seq_len + tile_seq - 1) // tile_seq
+        outputs = []
+        
+        for i in range(num_tiles):
+            start_idx = i * tile_seq
+            end_idx = min((i + 1) * tile_seq, seq_len)
+            
+            q_tile = q[:, :, start_idx:end_idx, :]
+            
+            # Sliding window for K, V to balance accuracy and memory
+            k_start = max(0, start_idx - tile_seq // 2)
+            k_end = min(seq_len, end_idx + tile_seq // 2)
+            
+            k_tile = k[:, :, k_start:k_end, :]
+            v_tile = v[:, :, k_start:k_end, :]
+            
+            out_tile = sage_attn_vae(q_tile, k_tile, v_tile, is_causal=False, scale=self.scale)
+            outputs.append(out_tile)
+        
+        return torch.cat(outputs, dim=2)
 
 
 class EncoderBlock(nn.Module):

@@ -76,6 +76,7 @@ from ..optimization.compatibility import (
 )
 from ..optimization.blockswap import is_blockswap_enabled, validate_blockswap_config, apply_block_swap_to_dit, cleanup_blockswap
 from ..optimization.memory_manager import cleanup_dit, cleanup_vae
+from ..optimization.vae_sage_attention import SAGE_ATTN_BATCHED_AVAILABLE
 from ..utils.constants import find_model_file
 
 
@@ -1295,6 +1296,20 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
             debug.start_timer("model_requires_grad")
             model.requires_grad_(False).eval()
             debug.end_timer("model_requires_grad", "VAE model set to eval mode")
+        
+        # Apply SageAttention 2.2.0 processor for optimized VAE decoding (16GB VRAM target)
+        if SAGE_ATTN_BATCHED_AVAILABLE:
+            debug.log("Applying SageAttention 2.2.0 processor for VAE attention optimization", category="vae")
+            debug.start_timer("vae_sage_attention")
+            try:
+                from ..models.video_vae_v3.modules.attn_video_vae import set_vae_sage_attention_processor
+                set_vae_sage_attention_processor(model, tile_size=64, use_tiling=True)
+                debug.end_timer("vae_sage_attention", "SageAttention processor applied to VAE")
+            except Exception as e:
+                debug.end_timer("vae_sage_attention", f"SageAttention setup failed: {e}")
+                debug.log(f"VAE will use default attention (SDPA fallback)", category="vae", indent_level=1)
+        else:
+            debug.log("SageAttention not available, VAE using PyTorch SDPA for attention", category="vae")
         
         # Configure causal slicing if available - always apply as it's lightweight
         if hasattr(model, "set_causal_slicing") and hasattr(config.vae, "slicing"):
