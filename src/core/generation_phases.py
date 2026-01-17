@@ -546,7 +546,9 @@ def upscale_all_batches(
     progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
     seed: int = 42,
     latent_noise_scale: float = 0.0,
-    cache_model: bool = False
+    cache_model: bool = False,
+    enable_teacache: bool = True,
+    temporal_filter_threshold: float = 0.98
 ) -> Dict[str, Any]:
     """
     Phase 2: DiT Upscaling for all encoded batches.
@@ -565,6 +567,8 @@ def upscale_all_batches(
                            but may help with certain artifacts. 0.0 = no noise (crisp),
                            1.0 = maximum noise (softer)
         cache_model: If True, keep DiT model for reuse instead of deleting it
+        enable_teacache: If True, enable TeaCache dynamic block skipping (default: True)
+        temporal_filter_threshold: Similarity threshold for temporal filtering (default: 0.98)
         
     Returns:
         dict: Updated context containing:
@@ -649,7 +653,38 @@ def upscale_all_batches(
         manage_model_device(model=runner.dit, target_device=ctx['dit_device'], 
                             model_name="DiT", debug=debug, runner=runner)
 
+        # KERNEL INTEGRATION: Enable TeaCache on DiT model if requested
+        # Import TeaCacheConfig here to avoid circular imports
+        from ..models.dit_3b.nadit import TeaCacheConfig
+        
+        # Access the actual DiT model (handle CompatibleDiT wrapper if present)
+        dit_model = runner.dit.dit_model if hasattr(runner.dit, 'dit_model') else runner.dit
+        
+        # Kernel audit log: Report TeaCache configuration status
+        teacache_status = "ENABLED" if enable_teacache else "DISABLED"
+        print(f"[Kernel Audit] TeaCache: {teacache_status}, Threshold: {temporal_filter_threshold}")
+        
+        if enable_teacache:
+            # Configure TeaCache with user settings
+            tea_config = TeaCacheConfig(
+                enabled=True,
+                l2_threshold=0.1,  # Fixed L2 threshold for block skipping
+                skip_start=12,
+                skip_end=24,
+                cache_residual=True,
+                verbose_logging=True
+            )
+            if hasattr(dit_model, 'enable_tea_cache'):
+                dit_model.enable_tea_cache(tea_config)
+                debug.log("[TeaCache] Block Skipping Active: Enabled for blocks 12-24 (Threshold: 0.1)", category="dit", force=True)
+            else:
+                print("[CRITICAL ERROR] TeaCache optimization failed: DiT model does not support enable_tea_cache method")
+
         debug.log_memory_state("After DiT loading for upscaling", detailed_tensors=False)
+
+        # Track previous latent for temporal similarity filtering
+        previous_latent = None
+        previous_upscaled = None
 
         for batch_idx, latent in enumerate(ctx['all_latents']):
             if latent is None:
@@ -675,6 +710,51 @@ def upscale_all_batches(
                 reason="DiT upscaling",
                 indent_level=1
             )
+
+            # TEMPORAL SIMILARITY FILTER: Compare with previous latent
+            # If similarity > threshold, bypass DiT and reuse previous upscaled result
+            bypass_dit = False
+            similarity_percent = 0.0
+            
+            if previous_latent is not None and previous_upscaled is not None and temporal_filter_threshold < 1.0:
+                # Compute cosine similarity between flattened latents
+                latent_flat = latent.flatten().float()
+                prev_flat = previous_latent.flatten().float()
+                
+                # Compute norms with explicit scalar conversion to avoid "Boolean value of Tensor" error
+                norm_current = torch.norm(latent_flat)
+                norm_previous = torch.norm(prev_flat)
+                norm_current_scalar = norm_current.item()
+                norm_previous_scalar = norm_previous.item()
+                
+                if norm_current_scalar > 1e-8 and norm_previous_scalar > 1e-8:
+                    cosine_sim = torch.dot(latent_flat, prev_flat) / (norm_current * norm_previous)
+                    similarity_percent = cosine_sim.item() * 100.0
+                    
+                    if cosine_sim.item() >= temporal_filter_threshold:
+                        bypass_dit = True
+                        print(f"[Temporal Filter] FRAME MATCH DETECTED ({similarity_percent:.1f}%). Bypassing DiT to save VRAM/Time.")
+                    else:
+                        print(f"[Temporal Filter] Similarity: {similarity_percent:.1f}% -> Bypassing DiT: NO")
+                
+                del latent_flat, prev_flat
+
+            if bypass_dit:
+                # Reuse previous upscaled result
+                ctx['all_upscaled_latents'][upscale_idx] = previous_upscaled.clone()
+                
+                # Free original latent
+                release_tensor_memory(ctx['all_latents'][batch_idx])
+                ctx['all_latents'][batch_idx] = None
+                
+                debug.end_timer(f"upscale_batch_{upscale_idx+1}", f"Bypassed batch {upscale_idx+1} (reused previous)")
+                
+                if progress_callback:
+                    progress_callback(upscale_idx+1, num_valid_latents,
+                                    1, "Phase 2: Upscaling")
+                
+                upscale_idx += 1
+                continue
 
             # Generate noise (randn_like automatically uses latent's device)
             base_noise = torch.randn_like(latent, dtype=ctx['compute_dtype'])
@@ -742,6 +822,10 @@ def upscale_all_batches(
                 )
             else:
                 ctx['all_upscaled_latents'][upscale_idx] = upscaled_latents[0]
+            
+            # Store for temporal similarity filtering on next batch
+            previous_latent = latent.detach().clone()
+            previous_upscaled = ctx['all_upscaled_latents'][upscale_idx].detach().clone()
             
             # Free original latent - release tensor memory first
             release_tensor_memory(ctx['all_latents'][batch_idx])

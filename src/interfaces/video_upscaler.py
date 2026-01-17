@@ -318,10 +318,6 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
         if is_blackwell_gpu():
             log_blackwell_status()
         
-        # Log TeaCache status with requested format
-        if enable_teacache:
-            print(f"[TeaCache] Block Skipping Active: Skipping blocks 12-24 (Threshold: 0.1)")
-        
         # Initialize debug (stateless - stored in local variable)
         debug = Debug(enabled=enable_debug)
         
@@ -564,7 +560,9 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 progress_callback=progress_callback,
                 seed=seed,
                 latent_noise_scale=latent_noise_scale,
-                cache_model=dit_cache
+                cache_model=dit_cache,
+                enable_teacache=enable_teacache,
+                temporal_filter_threshold=temporal_filter_threshold
             )
 
             # Phase 3: Decode
