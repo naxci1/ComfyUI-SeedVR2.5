@@ -2291,7 +2291,14 @@ class BlackwellNativeFP4Linear(nn.Module):
         
         # Add bias if present
         if self.bias is not None:
-            result = result + self.bias
+            # Ensure bias is on the same device as result (may have been moved during model offloading)
+            bias = self.bias
+            if bias.device != result.device:
+                bias = bias.to(result.device)
+                # Update stored bias to avoid repeated transfers
+                with torch.no_grad():
+                    self.bias.data = bias
+            result = result + bias
         
         # Reshape back to original shape
         if len(original_shape) > 2:
@@ -2432,7 +2439,16 @@ class NVFP4ScaledLinear(nn.Module):
         """
         # Dequantize weight (hardware-accelerated on Blackwell)
         weight = self.dequantize_weight(dtype=x.dtype)
-        return nn.functional.linear(x, weight, self.bias)
+        
+        # Ensure bias is on the same device as input (may have been moved during model offloading)
+        bias = self.bias
+        if bias is not None and bias.device != x.device:
+            bias = bias.to(x.device)
+            # Update stored bias to avoid repeated transfers
+            with torch.no_grad():
+                self.bias.data = bias
+        
+        return nn.functional.linear(x, weight, bias)
     
     @classmethod
     def get_active_layer_count(cls) -> int:
