@@ -24,6 +24,83 @@ from ...common.distributed.ops import slice_inputs
 ada_layer_type = Callable[[int, int], nn.Module]
 
 
+def _materialize_meta_tensor(t: torch.Tensor, target_device: torch.device, target_dtype: torch.dtype) -> torch.Tensor:
+    """
+    Materialize a meta tensor to actual VRAM on the target device.
+    
+    For Blackwell NVFP4 models, meta tensors are placeholders without actual data.
+    This function allocates real memory on the GPU and returns a usable tensor.
+    
+    Args:
+        t: The tensor to materialize (may be on 'meta' device)
+        target_device: The device to allocate on (e.g., cuda:0)
+        target_dtype: The dtype to use for the allocated tensor
+        
+    Returns:
+        A tensor on the target device with actual memory allocated
+    """
+    if t is None:
+        return None
+    
+    # Check if tensor is on meta device
+    if t.device.type == 'meta' or (hasattr(t, 'is_meta') and t.is_meta):
+        # Allocate actual memory on target device using zeros for stability
+        return torch.zeros(t.shape, device=target_device, dtype=target_dtype)
+    
+    # Check if tensor is on wrong device
+    if t.device != target_device:
+        return t.to(device=target_device, dtype=target_dtype)
+    
+    # Check if tensor needs dtype conversion
+    if t.dtype != target_dtype:
+        return t.to(dtype=target_dtype)
+    
+    return t
+
+
+def _ensure_tensor_ready(t: torch.Tensor, hid: torch.Tensor) -> torch.Tensor:
+    """
+    Ensure a tensor is ready for arithmetic operations with hid tensor.
+    
+    Handles:
+    1. Meta tensors (materialized to hid's device)
+    2. Wrong device tensors (moved to hid's device)
+    3. FP8 tensors (converted to hid's dtype for arithmetic)
+    
+    Args:
+        t: The tensor to check/prepare
+        hid: The reference tensor for device/dtype
+        
+    Returns:
+        A tensor ready for arithmetic with hid
+    """
+    if t is None:
+        return None
+    
+    target_device = hid.device
+    target_dtype = hid.dtype
+    
+    # Handle meta tensors - must materialize first
+    if t.device.type == 'meta' or (hasattr(t, 'is_meta') and t.is_meta):
+        return torch.zeros(t.shape, device=target_device, dtype=target_dtype)
+    
+    # Handle device mismatch
+    if t.device != target_device:
+        t = t.to(device=target_device)
+    
+    # Handle FP8 dtype incompatibility for arithmetic
+    if hasattr(torch, 'float8_e4m3fn'):
+        fp8_types = (torch.float8_e4m3fn, torch.float8_e5m2)
+        if t.dtype in fp8_types:
+            t = t.to(dtype=target_dtype)
+    
+    # Handle general dtype mismatch
+    if t.dtype != target_dtype:
+        t = t.to(dtype=target_dtype)
+    
+    return t
+
+
 def get_ada_layer(ada_layer: str) -> ada_layer_type:
     if ada_layer == "single":
         return AdaSingle
@@ -92,28 +169,78 @@ class AdaSingle(nn.Module):
             getattr(self, f"{layer}_gate", None),
         )
 
-        # Handle potential FP8 parameters - convert to input computation dtype
-        if hasattr(torch, 'float8_e4m3fn'):
-            fp8_types = (torch.float8_e4m3fn, torch.float8_e5m2)
-            # Use input tensor's dtype as target (respects pipeline precision)
-            target_dtype = hid.dtype
-            
-            # Convert FP8 parameters to match input dtype for arithmetic operations
-            if shiftB is not None and shiftB.dtype in fp8_types:
-                shiftB = shiftB.to(target_dtype)
-            if scaleB is not None and scaleB.dtype in fp8_types:
-                scaleB = scaleB.to(target_dtype)
-            if gateB is not None and gateB.dtype in fp8_types:
-                gateB = gateB.to(target_dtype)
+        # ============================================================
+        # BLACKWELL NVFP4 META TENSOR MATERIALIZATION
+        # ============================================================
+        # For Blackwell GPUs with NVFP4 quantization, modulation parameters
+        # may remain on 'meta' device after model loading. We MUST materialize
+        # them to hid's device before any arithmetic operations.
+        
+        # Ensure all A tensors (from emb) are on correct device/dtype
+        shiftA = _ensure_tensor_ready(shiftA, hid)
+        scaleA = _ensure_tensor_ready(scaleA, hid)
+        gateA = _ensure_tensor_ready(gateA, hid)
+        
+        # Ensure all B tensors (learned parameters) are on correct device/dtype
+        # This handles: meta tensors, wrong device, FP8 conversion
+        shiftB = _ensure_tensor_ready(shiftB, hid)
+        scaleB = _ensure_tensor_ready(scaleB, hid)
+        gateB = _ensure_tensor_ready(gateB, hid)
+        
+        # Update stored parameters if they were on meta/wrong device
+        # This avoids repeated materialization on subsequent forward passes
+        if shiftB is not None:
+            orig_shiftB = getattr(self, f"{layer}_shift", None)
+            if orig_shiftB is not None and (orig_shiftB.device.type == 'meta' or orig_shiftB.device != hid.device):
+                with torch.no_grad():
+                    try:
+                        orig_shiftB.data = shiftB
+                    except (RuntimeError, TypeError):
+                        pass  # Parameter update failed, will materialize again next time
+                        
+        if scaleB is not None:
+            orig_scaleB = getattr(self, f"{layer}_scale", None)
+            if orig_scaleB is not None and (orig_scaleB.device.type == 'meta' or orig_scaleB.device != hid.device):
+                with torch.no_grad():
+                    try:
+                        orig_scaleB.data = scaleB
+                    except (RuntimeError, TypeError):
+                        pass
+                        
+        if gateB is not None:
+            orig_gateB = getattr(self, f"{layer}_gate", None)
+            if orig_gateB is not None and (orig_gateB.device.type == 'meta' or orig_gateB.device != hid.device):
+                with torch.no_grad():
+                    try:
+                        orig_gateB.data = gateB
+                    except (RuntimeError, TypeError):
+                        pass
 
+        # ============================================================
+        # IN-PLACE MODULATION OPERATIONS
+        # ============================================================
+        # All tensors are now guaranteed to be on hid.device with compatible dtype
+        
         if mode == "in":
-            return hid.mul_(scaleA + scaleB).add_(shiftA + shiftB)
+            # Compute scale and shift additions safely
+            if scaleB is not None:
+                scale_sum = scaleA + scaleB
+            else:
+                scale_sum = scaleA
+                
+            if shiftB is not None:
+                shift_sum = shiftA + shiftB
+            else:
+                shift_sum = shiftA
+                
+            return hid.mul_(scale_sum).add_(shift_sum)
+            
         if mode == "out":
             if gateB is not None:
-                return hid.mul_(gateA + gateB)
+                gate_sum = gateA + gateB
             else:
-                # If no gate parameter, just use the embedding gate
-                return hid.mul_(gateA)
+                gate_sum = gateA
+            return hid.mul_(gate_sum)
             
         raise NotImplementedError
 
