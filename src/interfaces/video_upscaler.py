@@ -247,6 +247,14 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                         "Saves 100% compute for each bypassed frame."
                     )
                 ),
+                io.Custom("TEMPORAL_FILTER_CONFIG").Input("temporal_filter_config",
+                    optional=True,
+                    tooltip=(
+                        "Optional temporal filter configuration from SeedVR2 Temporal Similarity Filter node.\n"
+                        "When connected, uses the filter node's settings instead of the UI slider.\n"
+                        "Enables advanced frame similarity analysis and latent passthrough."
+                    )
+                ),
                 io.Boolean.Input("enable_debug",
                     default=False,
                     optional=True,
@@ -271,6 +279,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 color_correction: str = "wavelet", input_noise_scale: float = 0.0,
                 latent_noise_scale: float = 0.0, offload_device: str = "none",
                 enable_teacache: bool = True, temporal_filter_threshold: float = 0.98,
+                temporal_filter_config: Optional[Dict[str, Any]] = None,
                 enable_debug: bool = False) -> io.NodeOutput:
         """
         Execute SeedVR2 video upscaling with progress reporting
@@ -296,6 +305,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             offload_device: Device to offload intermediate tensors
             enable_teacache: Enable TeaCache dynamic block skipping (default: True)
             temporal_filter_threshold: Similarity threshold for temporal filtering (default: 0.98)
+            temporal_filter_config: Optional config from Temporal Similarity Filter node
             enable_debug: Enable detailed logging and memory tracking
             
         Returns:
@@ -309,11 +319,20 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
         if is_blackwell_gpu():
             log_blackwell_status()
         
+        # Use temporal filter config if provided, otherwise use UI slider
+        effective_threshold = temporal_filter_threshold
+        if temporal_filter_config is not None and isinstance(temporal_filter_config, dict):
+            # Validate and extract similarity_threshold with fallback
+            threshold_value = temporal_filter_config.get('similarity_threshold')
+            if threshold_value is not None and isinstance(threshold_value, (int, float)):
+                effective_threshold = float(threshold_value)
+                print(f"[Temporal Filter] Using config from Filter node: {effective_threshold*100:.0f}%")
+        
         # Log TeaCache and Temporal Filter status
         if enable_teacache:
             print(f"[TeaCache] Block Skipping Active: Skipping blocks 12-24 (Threshold: 0.1)")
-        if temporal_filter_threshold < 1.0:
-            print(f"[Temporal Filter] Enabled with threshold: {temporal_filter_threshold*100:.0f}%")
+        if effective_threshold < 1.0:
+            print(f"[Temporal Filter] Enabled with threshold: {effective_threshold*100:.0f}%")
         
         # Log memory optimization status
         print("[Memory] Singleton Buffer Scatter-Concat initialized.")
