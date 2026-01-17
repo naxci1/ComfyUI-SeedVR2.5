@@ -42,15 +42,20 @@ def is_blackwell_gpu() -> bool:
     return BLACKWELL_GPU_DETECTED
 
 
-def log_blackwell_status(debug: Optional[Any] = None):
-    """Log Blackwell optimization status.
+def log_blackwell_status(debug: Optional[Any] = None, optimizations_active: bool = False):
+    """Log Blackwell optimization status only when optimizations are actually active.
     
     Args:
         debug: Optional debug object for logging. If provided, uses debug.log().
                Otherwise falls back to print().
+        optimizations_active: If True, logs that optimizations are active.
+                             If False, only logs hardware detection without claiming optimization.
     """
     if BLACKWELL_GPU_DETECTED:
-        msg = "🚀 BLACKWELL SM_120 DETECTED: Applying TeaCache & Async Optimization."
+        if optimizations_active:
+            msg = "🚀 BLACKWELL SM_120 DETECTED: TeaCache & Memory Optimizations Active."
+        else:
+            msg = "🚀 BLACKWELL SM_120 DETECTED: Applying memory-efficient VAE decoding."
         if debug is not None:
             debug.log(msg, category="hardware")
         else:
@@ -314,9 +319,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             ValueError: If model files cannot be downloaded or configuration is invalid
             RuntimeError: If generation fails
         """
-        # Log Blackwell optimization status
-        if is_blackwell_gpu():
-            log_blackwell_status()
+        # Don't log Blackwell status at start - wait until we verify actual optimizations
         
         # Initialize debug (stateless - stored in local variable)
         debug = Debug(enabled=enable_debug)
@@ -442,8 +445,9 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
 
         debug.log("━━━━━━━━━ Model Preparation ━━━━━━━━━", category="none")
         
-        # Log Blackwell-Optimized status for RTX 50-series GPUs
-        log_blackwell_status(debug)
+        # Log Blackwell hardware detection - no claims about optimization speedup
+        if is_blackwell_gpu():
+            log_blackwell_status(debug, optimizations_active=False)
 
         # Initial memory state
         debug.log_memory_state("Before model preparation", show_tensors=False, detailed_tensors=False)

@@ -1121,6 +1121,10 @@ def decode_all_batches(
             ctx['all_upscaled_latents'][batch_idx] = None
             del upscaled_latent, sample
             
+            # Force CUDA cache clear after each batch to prevent OOM during VAE decoding
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
             debug.end_timer(f"decode_batch_{decode_idx+1}", f"Decoded batch {decode_idx+1}")
             
             if progress_callback:

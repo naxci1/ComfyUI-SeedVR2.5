@@ -165,6 +165,8 @@ class InflatedCausalConv3d(Conv3d):
             # Concat prev cache from last dim
             if prev_cache is not None:
                 x[idx] = torch.cat([prev_cache[idx], x[idx]], dim=split_dim - 1)
+                # Free prev_cache slice immediately after use (memory optimization)
+                del prev_cache[idx]
 
             # Get padding pattern.
             lpad_dim = (x[idx].ndim - split_dim - 1) * 2
@@ -198,8 +200,14 @@ class InflatedCausalConv3d(Conv3d):
                 prev_cache=cache
             )
 
-            # Update cache.
+            # Update cache and free memory after each chunk to prevent OOM on 16GB VRAM
+            if cache is not None:
+                del cache
             cache = next_cache
+            
+            # Clear CUDA cache after each chunk to prevent memory fragmentation
+            if torch.cuda.is_available() and x[idx].is_cuda:
+                torch.cuda.empty_cache()
 
         output = retry_on_oom(
             torch.cat,
@@ -299,8 +307,14 @@ class InflatedCausalConv3d(Conv3d):
                 prev_cache=cache
             )
 
-            # Update cache.
+            # Update cache and free old cache to prevent memory buildup
+            if cache is not None:
+                del cache
             cache = next_cache
+            
+            # Clear CUDA cache after each slice to prevent OOM on 16GB VRAM
+            if torch.cuda.is_available() and input[i].is_cuda:
+                torch.cuda.empty_cache()
 
         return input[0] if squeeze_out else input
 
