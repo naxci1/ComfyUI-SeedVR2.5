@@ -1205,8 +1205,29 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
                         dtype=param.dtype, 
                         device=target_device
                     )
-                    # Replace the parameter (will be uninitialized)
-                    param.data = new_param
+                    # Use set_ to bypass strict dtype checks (needed for FP8/NVFP4)
+                    try:
+                        # Preferred: use set_ to point to new storage directly
+                        param.set_(new_param)
+                    except (RuntimeError, TypeError):
+                        try:
+                            # Fallback 1: force assignment via as_subclass
+                            param.as_subclass(torch.Tensor).data = new_param.as_subclass(torch.Tensor)
+                        except (RuntimeError, TypeError):
+                            # Fallback 2: find and replace parameter in parent module
+                            parts = name.rsplit('.', 1)
+                            if len(parts) == 2:
+                                parent_name, param_name = parts
+                                parent = model
+                                for part in parent_name.split('.'):
+                                    parent = getattr(parent, part)
+                                # Create new Parameter with correct dtype/device
+                                new_parameter = torch.nn.Parameter(new_param, requires_grad=param.requires_grad)
+                                setattr(parent, param_name, new_parameter)
+                            else:
+                                # Top-level parameter
+                                new_parameter = torch.nn.Parameter(new_param, requires_grad=param.requires_grad)
+                                setattr(model, name, new_parameter)
         
         for name, buffer in model.named_buffers():
             if buffer.device.type == 'meta':
@@ -1255,6 +1276,38 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
                 debug.log(f"Meta tensor detected during to(), using to_empty() fallback", 
                          level="WARNING", category="memory", force=True)
             model.to_empty(device=target_device)
+        else:
+            raise
+    except RuntimeError as e:
+        # Handle dtype incompatibility (e.g., FP8/NVFP4 vs bfloat16)
+        if "incompatible tensor type" in str(e) or "set_data" in str(e):
+            if debug:
+                debug.log(f"Dtype incompatibility during to(), using per-tensor movement", 
+                         level="WARNING", category="memory", force=True)
+            # Move each parameter individually using set_
+            with torch.no_grad():
+                for name, param in model.named_parameters():
+                    if param.device != target_device:
+                        try:
+                            new_data = param.data.to(target_device)
+                            param.set_(new_data)
+                        except (RuntimeError, TypeError):
+                            try:
+                                param.as_subclass(torch.Tensor).data = param.data.to(target_device).as_subclass(torch.Tensor)
+                            except (RuntimeError, TypeError):
+                                # Last resort: just move what we can
+                                pass
+                for name, buffer in model.named_buffers():
+                    if buffer.device != target_device:
+                        parts = name.rsplit('.', 1)
+                        if len(parts) == 2:
+                            parent_name, buffer_name = parts
+                            parent = model
+                            for part in parent_name.split('.'):
+                                parent = getattr(parent, part)
+                            parent.register_buffer(buffer_name, buffer.to(target_device), persistent=False)
+                        else:
+                            model.register_buffer(name, buffer.to(target_device), persistent=False)
         else:
             raise
     
