@@ -645,25 +645,23 @@ def load_nvfp4_weights(state_dict: Dict[str, torch.Tensor],
             continue
         
         if is_nvfp4:
-            # Wrap as NVFP4Tensor
-            # Use explicit None check instead of 'or' to avoid tensor boolean ambiguity
+            # For NVFP4 checkpoints with packed weights, we need to be careful:
+            # - If weight has associated scales, it's a packed NVFP4 weight with non-standard shape
+            # - We should skip processing these here and let them be handled by the model loading
+            # - The shape mismatch will be handled by loading with strict=False or special NVFP4 model loading
             scales = state_dict.get(scales_key)
             if scales is None:
                 scales = getattr(tensor, 'nvfp4_scales', None)
+            
             if scales is not None:
-                # Get original shape from metadata or derive from scales
-                original_shape = getattr(tensor, 'original_shape', None)
-                if original_shape is None:
-                    # Estimate original shape from packed data and scales
-                    num_blocks = scales.numel()
-                    total_elements = num_blocks * config.block_size
-                    # Assume 2D weight matrix
-                    original_shape = torch.Size([total_elements])
-                
-                processed[name] = NVFP4Tensor(
-                    tensor, scales, original_shape,
-                    block_size=config.block_size, debug=debug
-                )
+                # Skip processing packed NVFP4 weights - they have incompatible shapes
+                # Just store the packed data and scales separately
+                # The caller should use strict=False when loading state_dict
+                # and handle the conversion in replace_linear_with_nvfp4
+                processed[name] = tensor  # Keep packed format
+                # Also preserve scales in the processed dict
+                if scales_key not in processed:
+                    processed[scales_key] = scales
                 nvfp4_count += 1
                 continue
         
