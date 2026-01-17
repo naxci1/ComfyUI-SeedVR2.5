@@ -181,13 +181,11 @@ class TeaCache:
         self.total_count += 1
         if skipped:
             self.skip_count += 1
-            # KERNEL LOGGING: Real skip occurred
+            # KERNEL LOGGING: Real skip occurred - using requested format
             if self.config.verbose_logging:
+                blocks_skipped = skip_end - skip_start
                 log_msg = (
-                    f"TEACACHE_SKIP: Block [{skip_start}-{skip_end}] bypassed | "
-                    f"Delta: {self._last_l2_delta:.6f} | "
-                    f"Threshold: {self.config.l2_threshold} | "
-                    f"Skip_Rate: {self.skip_count}/{self.total_count}"
+                    f"[TeaCache] Block Skipping Active: Skipped {blocks_skipped} blocks (Threshold: {self.config.l2_threshold})"
                 )
                 self._kernel_logs.append(log_msg)
                 print(log_msg)

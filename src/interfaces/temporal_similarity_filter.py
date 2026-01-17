@@ -46,6 +46,7 @@ class TemporalSimilarityCache:
         self.previous_upscaled: Optional[torch.Tensor] = None
         self.skip_count: int = 0
         self.total_count: int = 0
+        self._last_similarity: float = 0.0
     
     def compute_similarity(self, current: torch.Tensor, previous: torch.Tensor) -> float:
         """
@@ -103,7 +104,27 @@ class TemporalSimilarityCache:
             return False
         
         similarity = self.compute_similarity(current_latent, self.previous_latent)
+        self._last_similarity = similarity  # Store for logging
         return similarity >= threshold
+    
+    def should_reuse_previous_with_similarity(self, current_latent: torch.Tensor, 
+                                               threshold: float = 0.98) -> Tuple[bool, float]:
+        """
+        Determine if previous upscaled frame should be reused, returning similarity.
+        
+        Args:
+            current_latent: Current frame latent
+            threshold: Similarity threshold (default 0.98 = 98%)
+            
+        Returns:
+            Tuple of (should_reuse, similarity_value)
+        """
+        if self.previous_latent is None or self.previous_upscaled is None:
+            return False, 0.0
+        
+        similarity = self.compute_similarity(current_latent, self.previous_latent)
+        self._last_similarity = similarity
+        return similarity >= threshold, similarity
     
     def update(self, latent: torch.Tensor, upscaled: torch.Tensor):
         """
@@ -120,11 +141,18 @@ class TemporalSimilarityCache:
         """Get cached previous upscaled output."""
         return self.previous_upscaled
     
-    def record_decision(self, reused: bool):
-        """Record whether frame was reused for statistics."""
+    def record_decision(self, reused: bool, similarity: float = 0.0):
+        """
+        Record whether frame was reused for statistics.
+        
+        Logs: "[Temporal Filter] Frame similarity: X%. Bypassing DiT: YES/NO"
+        """
         self.total_count += 1
         if reused:
             self.skip_count += 1
+        # Log with requested format
+        bypass_status = "YES" if reused else "NO"
+        print(f"[Temporal Filter] Frame similarity: {similarity*100:.1f}%. Bypassing DiT: {bypass_status}")
     
     def get_stats(self) -> Dict[str, Any]:
         """Get filtering statistics."""
@@ -292,19 +320,21 @@ def filter_frames_with_temporal_similarity(
     results = []
     
     for i, latent in enumerate(latents):
-        # Check if we should reuse previous frame
-        should_reuse = (
-            config.enabled and 
-            config.reuse_previous and
-            cache.should_reuse_previous(latent, config.similarity_threshold)
-        )
+        # Check if we should reuse previous frame - get similarity value too
+        should_reuse = False
+        similarity = 0.0
+        
+        if config.enabled and config.reuse_previous:
+            should_reuse, similarity = cache.should_reuse_previous_with_similarity(
+                latent, config.similarity_threshold
+            )
         
         if should_reuse:
             # Reuse previous upscaled output - saves 100% compute
             upscaled = cache.get_previous_upscaled()
             if upscaled is not None:
                 results.append(upscaled.clone())
-                cache.record_decision(reused=True)
+                cache.record_decision(reused=True, similarity=similarity)
                 
                 if debug:
                     debug.log(f"Frame {i}: Reused (100% compute saved)", 
@@ -317,7 +347,7 @@ def filter_frames_with_temporal_similarity(
         
         # Update cache for next frame comparison
         cache.update(latent, upscaled)
-        cache.record_decision(reused=False)
+        cache.record_decision(reused=False, similarity=similarity)
         
         if debug:
             debug.log(f"Frame {i}: Upscaled", category="temporal", indent_level=1)

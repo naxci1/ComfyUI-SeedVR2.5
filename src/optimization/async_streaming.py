@@ -27,13 +27,102 @@ import torch.nn as nn
 from typing import Dict, Any, Optional, List, Tuple, Iterator
 from dataclasses import dataclass
 
-from .nvfp4 import (
-    is_blackwell_gpu,
-    PinnedMemoryPool,
-    CUDAStreamManager,
-    AsyncModelOffloader,
-    create_pinned_tensor
-)
+from .compatibility import BLACKWELL_GPU_DETECTED
+
+
+def is_blackwell_gpu() -> bool:
+    """Check if running on a Blackwell (SM_120) GPU."""
+    return BLACKWELL_GPU_DETECTED
+
+
+class PinnedMemoryPool:
+    """Simple pinned memory pool for async transfers."""
+    
+    def __init__(self, max_pool_gb: float = 4.0):
+        self.max_pool_bytes = int(max_pool_gb * 1024 * 1024 * 1024)
+        self._pool: Dict[Tuple[torch.Size, torch.dtype], torch.Tensor] = {}
+        self._current_bytes = 0
+    
+    def allocate(self, shape: torch.Size, dtype: torch.dtype) -> torch.Tensor:
+        """Get or create pinned tensor."""
+        key = (shape, dtype)
+        if key not in self._pool:
+            tensor = torch.empty(shape, dtype=dtype, pin_memory=True)
+            tensor_bytes = tensor.numel() * tensor.element_size()
+            if self._current_bytes + tensor_bytes <= self.max_pool_bytes:
+                self._pool[key] = tensor
+                self._current_bytes += tensor_bytes
+            return tensor
+        return self._pool[key]
+    
+    def clear(self):
+        """Clear the pool."""
+        self._pool.clear()
+        self._current_bytes = 0
+
+
+class CUDAStreamManager:
+    """Manages CUDA streams for async transfers."""
+    
+    def __init__(self):
+        self._streams: Dict[str, torch.cuda.Stream] = {}
+    
+    def get_stream(self, name: str = "default") -> Optional[torch.cuda.Stream]:
+        """Get or create a named CUDA stream."""
+        if not torch.cuda.is_available():
+            return None
+        if name not in self._streams:
+            self._streams[name] = torch.cuda.Stream()
+        return self._streams[name]
+    
+    def synchronize_all(self):
+        """Synchronize all streams."""
+        for stream in self._streams.values():
+            stream.synchronize()
+
+
+class AsyncModelOffloader:
+    """Manages async model offloading with pinned memory."""
+    
+    def __init__(self, use_pinned_memory: bool = True, 
+                 debug: Optional[Any] = None,
+                 max_pinned_pool_gb: float = 4.0):
+        self.use_pinned_memory = use_pinned_memory
+        self.debug = debug
+        self._pool = PinnedMemoryPool(max_pinned_pool_gb) if use_pinned_memory else None
+        self._stream_manager = CUDAStreamManager()
+        self._offloaded: Dict[str, Dict[str, torch.Tensor]] = {}
+    
+    def offload_async(self, model: nn.Module, name: str = "model"):
+        """Offload model to CPU with pinned memory."""
+        self._offloaded[name] = {}
+        for param_name, param in model.named_parameters():
+            if param.is_cuda:
+                cpu_tensor = param.data.cpu()
+                if self.use_pinned_memory and self._pool is not None:
+                    pinned = self._pool.allocate(cpu_tensor.shape, cpu_tensor.dtype)
+                    pinned.copy_(cpu_tensor)
+                    self._offloaded[name][param_name] = pinned
+                else:
+                    self._offloaded[name][param_name] = cpu_tensor
+    
+    def prefetch_layer(self, layer: nn.Module, device: torch.device, name: str = "layer"):
+        """Prefetch layer to GPU using async stream."""
+        stream = self._stream_manager.get_stream(name)
+        if stream is not None:
+            with torch.cuda.stream(stream):
+                layer.to(device)
+        else:
+            layer.to(device)
+    
+    def synchronize(self):
+        """Synchronize all pending transfers."""
+        self._stream_manager.synchronize_all()
+
+
+def create_pinned_tensor(shape: torch.Size, dtype: torch.dtype) -> torch.Tensor:
+    """Create a pinned memory tensor for async transfers."""
+    return torch.empty(shape, dtype=dtype, pin_memory=True)
 
 
 @dataclass
@@ -91,14 +180,12 @@ class AsyncWeightStreamer:
         self._layers_offloaded: List[nn.Module] = []
         self._prefetch_queue: List[Tuple[nn.Module, torch.device]] = []
         
-        # Log Blackwell status
-        if self.config.log_blackwell_status and debug:
-            if self._is_blackwell:
-                debug.log("[Blackwell-Optimized] Async weight streaming with pinned memory enabled",
+        # Log streaming status with requested format
+        if self.config.log_blackwell_status:
+            print("[Streaming] Async weight transfer active (Pinned Memory).")
+            if self._is_blackwell and debug:
+                debug.log("[Streaming] Async weight transfer active (Pinned Memory).",
                          category="streaming", force=True)
-            else:
-                debug.log("Async weight streaming enabled (non-Blackwell mode)",
-                         category="streaming")
     
     def offload_model_to_cpu(self, model: nn.Module, name: str = "model"):
         """

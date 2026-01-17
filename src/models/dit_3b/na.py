@@ -638,10 +638,17 @@ def repeat_concat_idx(
         
         # Scatter vid and txt into output using index_copy for efficiency
         # This avoids the memory peak from torch.cat
+        # FIX: Ensure same dtype to prevent index_copy_ dtype mismatch error
         if vid_src_indices.numel() > 0:
-            output.index_copy_(0, vid_out_positions, vid.index_select(0, vid_src_indices))
+            vid_selected = vid.index_select(0, vid_src_indices)
+            if vid_selected.dtype != output.dtype:
+                vid_selected = vid_selected.to(output.dtype)
+            output.index_copy_(0, vid_out_positions, vid_selected)
         if txt_src_indices.numel() > 0:
-            output.index_copy_(0, txt_out_positions, txt.index_select(0, txt_src_indices))
+            txt_selected = txt.index_select(0, txt_src_indices)
+            if txt_selected.dtype != output.dtype:
+                txt_selected = txt_selected.to(output.dtype)
+            output.index_copy_(0, txt_out_positions, txt_selected)
         
         return output
 
