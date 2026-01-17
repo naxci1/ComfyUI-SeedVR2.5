@@ -12,6 +12,7 @@
 
 from contextlib import nullcontext
 from typing import Literal, Optional, Tuple, Union
+import time as _time_module  # For speed audit logging
 import diffusers
 import torch
 import torch.nn as nn
@@ -1562,7 +1563,14 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                         end_tile = min(tile_id + 4, num_tiles)
                         self.debug.log(f"Decoding tiles {tile_id}-{end_tile} / {num_tiles}", category="vae", indent_level=1)
 
+                # Speed audit: time individual tile decoding for performance monitoring
+                _tile_start = _time_module.time()
                 decoded_tile = self.slicing_decode(tile_latent)
+                _tile_elapsed = _time_module.time() - _tile_start
+                
+                # Log speed audit for every tile (kernel-level monitoring)
+                if self.debug:
+                    self.debug.log(f"[Speed Audit] VAE Tile {tile_id}/{num_tiles} Decoded in {_tile_elapsed:.3f}s", category="vae", force=True)
 
                 # Initialize result tensors using actual decoded shapes on first tile
                 if result is None:
