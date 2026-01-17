@@ -2112,17 +2112,21 @@ class BlackwellNativeFP4Linear(nn.Module):
     """
     Blackwell-native FP4 Linear layer using hardware-accelerated scaled matrix multiplication.
     
-    This layer uses torch._scaled_mm for true FP4/FP8 Tensor Core acceleration on 
-    Blackwell (SM_120) GPUs. Unlike weight-only quantization, this performs the 
-    computation entirely in the low-precision domain.
+    This layer implements STRICT DUAL-PATH architecture:
     
-    Technical Details:
-    - Weights stored as FP8 (E4M3) for optimal Tensor Core utilization
-    - Input activations dynamically quantized to FP8 on-the-fly
+    PATH A (NVFP4 = True, Blackwell SM_120):
+    - Uses explicit Float8 quantization for inputs
+    - Weights stored as FP8 (E4M3) for optimal Tensor Core utilization  
     - Uses torch._scaled_mm for hardware-accelerated matmul
-    - Output returned in BF16 for downstream compatibility
+    - torch._scaled_mm ONLY receives Float8 tensors
+    - 100% Blackwell-Native path
     
-    Requirements:
+    PATH B (NVFP4 = False, Legacy/Compatibility):
+    - Falls back to standard F.linear with dequantized weights
+    - No torch._scaled_mm, no SM_120 specific kernels
+    - Guaranteed stability for non-Blackwell or testing
+    
+    Requirements for Path A:
     - Blackwell GPU (SM_120) or Hopper (SM_90) for FP8 support
     - PyTorch 2.1+ with torch._scaled_mm support
     - CUDA 12.0+
@@ -2132,83 +2136,94 @@ class BlackwellNativeFP4Linear(nn.Module):
     _active_layers = 0
     _total_replaced = 0
     _scaled_mm_calls = 0
+    _fallback_calls = 0
     
-    def __init__(self, original_linear: nn.Linear, debug: Optional[Any] = None):
+    def __init__(self, original_linear: nn.Linear, debug: Optional[Any] = None, 
+                 nvfp4_enabled: bool = True):
         """
         Create Blackwell-native FP4 Linear layer from existing Linear layer.
         
         Args:
             original_linear: Original nn.Linear layer to convert
             debug: Debug instance for logging
+            nvfp4_enabled: If True, use Blackwell FP8 path. If False, use legacy path.
         """
         super().__init__()
-        
-        if not _SCALED_MM_AVAILABLE:
-            raise RuntimeError(
-                "torch._scaled_mm not available. Blackwell Native FP4 requires PyTorch 2.1+ "
-                "with CUDA support. Cannot silently fallback to BF16."
-            )
-        
-        if not _FP8_E4M3_AVAILABLE:
-            raise RuntimeError(
-                "FP8 E4M3 dtype not available. Blackwell Native FP4 requires PyTorch 2.1+ "
-                "with FP8 support. Cannot silently fallback to BF16."
-            )
         
         self.in_features = original_linear.in_features
         self.out_features = original_linear.out_features
         self._debug = debug
-        self._native_fp4_active = True
+        self._nvfp4_enabled = nvfp4_enabled
+        self._native_fp4_active = nvfp4_enabled and _SCALED_MM_AVAILABLE and _FP8_E4M3_AVAILABLE
+        self._is_blackwell = is_blackwell_gpu()
         
         # Get original device
         original_device = original_linear.weight.device
         
-        with torch.no_grad():
-            weight = original_linear.weight.data
-            
-            # Check if weight is already in FP8 format (pre-quantized checkpoint)
-            if weight.dtype == torch.float8_e4m3fn:
-                # Pre-quantized FP8 weight - use directly without re-quantization
-                weight_fp8 = weight
-                # For pre-quantized FP8 weights, infer scale from the data range
-                # Convert FP8 to float temporarily to compute absmax
-                weight_float = weight.to(torch.float32)
-                weight_absmax = weight_float.abs().max()
-                # The scale is inverse of what was used during original quantization
-                # Since values are already scaled to fit in FP8 range, scale factor relates to original range
-                # Use absmax as an estimate - if absmax is near FP8_E4M3_MAX, scale was 1.0
-                weight_scale = (weight_absmax / FP8_E4M3_MAX).clamp(min=1e-12) if weight_absmax > 0 else torch.tensor(1.0, device=original_device)
-                del weight_float  # Free memory
-            else:
-                # Compute per-tensor scale for weight quantization
-                # Use dynamic scaling based on tensor absmax
-                weight_absmax = weight.abs().max()
-                weight_scale = (weight_absmax / FP8_E4M3_MAX).clamp(min=1e-12)
-                
-                # Quantize weight to FP8 E4M3
-                weight_scaled = (weight / weight_scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
-                weight_fp8 = weight_scaled.to(torch.float8_e4m3fn)
-            
-            # Check if weight needs padding for torch._scaled_mm (K dimension must be divisible by 16)
-            k_dim = self.in_features
-            self._k_padding = 0
-            if k_dim % 16 != 0:
-                self._k_padding = 16 - (k_dim % 16)
-                # Pre-pad weight during initialization to avoid per-forward allocation
-                # Pad on input dimension (second dim) - weight shape is [out_features, in_features]
-                # First convert to float for padding, then back to FP8
-                weight_padded = torch.nn.functional.pad(
-                    weight_fp8.view(torch.int8).to(torch.float32),  # View as int8, then to float for padding
-                    (0, self._k_padding),
-                    mode='constant',
-                    value=0
+        # Store original weight for legacy fallback path
+        self.register_buffer('weight_original', original_linear.weight.data.clone().to(original_device))
+        
+        # PATH A: Blackwell NVFP4 setup
+        if self._native_fp4_active:
+            if not _SCALED_MM_AVAILABLE:
+                raise RuntimeError(
+                    "torch._scaled_mm not available. Blackwell Native FP4 requires PyTorch 2.1+ "
+                    "with CUDA support. Cannot silently fallback to BF16."
                 )
-                weight_fp8 = weight_padded.to(torch.int8).view(torch.float8_e4m3fn)
-                del weight_padded  # Free intermediate tensor
             
-            # Store quantized weight (transpose happens in forward pass for torch._scaled_mm)
-            self.register_buffer('weight_fp8', weight_fp8.to(original_device))
-            self.register_buffer('weight_scale', weight_scale.to(torch.float32).to(original_device))
+            if not _FP8_E4M3_AVAILABLE:
+                raise RuntimeError(
+                    "FP8 E4M3 dtype not available. Blackwell Native FP4 requires PyTorch 2.1+ "
+                    "with FP8 support. Cannot silently fallback to BF16."
+                )
+            
+            with torch.no_grad():
+                weight = original_linear.weight.data
+                
+                # Check if weight is already in FP8 format (pre-quantized checkpoint)
+                if weight.dtype == torch.float8_e4m3fn:
+                    # Pre-quantized FP8 weight - use directly without re-quantization
+                    weight_fp8 = weight
+                    # For pre-quantized FP8 weights, infer scale from the data range
+                    # Convert FP8 to float temporarily to compute absmax
+                    weight_float = weight.to(torch.float32)
+                    weight_absmax = weight_float.abs().max()
+                    # The scale is inverse of what was used during original quantization
+                    weight_scale = (weight_absmax / FP8_E4M3_MAX).clamp(min=1e-12) if weight_absmax > 0 else torch.tensor(1.0, device=original_device)
+                    del weight_float  # Free memory
+                else:
+                    # Compute per-tensor scale for weight quantization
+                    # Use dynamic scaling based on tensor absmax
+                    weight_absmax = weight.abs().max()
+                    weight_scale = (weight_absmax / FP8_E4M3_MAX).clamp(min=1e-12)
+                    
+                    # Quantize weight to FP8 E4M3
+                    weight_scaled = (weight / weight_scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
+                    weight_fp8 = weight_scaled.to(torch.float8_e4m3fn)
+                
+                # Check if weight needs padding for torch._scaled_mm (K dimension must be divisible by 16)
+                k_dim = self.in_features
+                self._k_padding = 0
+                if k_dim % 16 != 0:
+                    self._k_padding = 16 - (k_dim % 16)
+                    # Pre-pad weight during initialization to avoid per-forward allocation
+                    weight_padded = torch.nn.functional.pad(
+                        weight_fp8.view(torch.int8).to(torch.float32),
+                        (0, self._k_padding),
+                        mode='constant',
+                        value=0
+                    )
+                    weight_fp8 = weight_padded.to(torch.int8).view(torch.float8_e4m3fn)
+                    del weight_padded
+                
+                # Store quantized weight for Path A
+                self.register_buffer('weight_fp8', weight_fp8.to(original_device))
+                self.register_buffer('weight_scale', weight_scale.to(torch.float32).to(original_device))
+        else:
+            # PATH B: Legacy mode - no FP8 quantization
+            self._k_padding = 0
+            self.register_buffer('weight_fp8', None)
+            self.register_buffer('weight_scale', None)
         
         # Keep bias in BF16/FP16 for precision (ensure it's on the correct device)
         if original_linear.bias is not None:
@@ -2220,15 +2235,17 @@ class BlackwellNativeFP4Linear(nn.Module):
         BlackwellNativeFP4Linear._active_layers += 1
         BlackwellNativeFP4Linear._total_replaced += 1
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_blackwell_fp8(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass using Blackwell-native FP8/FP4 hardware acceleration.
+        PATH A: Blackwell-native FP8/FP4 hardware-accelerated forward pass.
         
-        The computation flow:
-        1. Dynamically quantize input to FP8
-        2. Pad input if needed (torch._scaled_mm requires K dimension divisible by 16)
-        3. Call torch._scaled_mm for hardware-accelerated matmul
-        4. Return result in BF16 for downstream layers
+        STRICT: torch._scaled_mm ONLY receives Float8 tensors, never standard floats.
+        
+        Flow:
+        1. Explicit Float8 quantization of input using torch.ops.aten quantization or manual
+        2. Pad input if needed for Tensor Core alignment
+        3. Call torch._scaled_mm with ONLY Float8 tensors
+        4. Return result in BF16
         """
         original_shape = x.shape
         original_dtype = x.dtype
@@ -2237,65 +2254,60 @@ class BlackwellNativeFP4Linear(nn.Module):
         if x.dim() > 2:
             x = x.reshape(-1, x.shape[-1])
         
+        # Ensure x is on the correct device
+        target_device = self.weight_fp8.device
+        if x.device != target_device:
+            x = x.to(target_device)
+        
         # Pad input if needed (weight was pre-padded during __init__)
-        # torch._scaled_mm requires the inner dimension (K) to be divisible by 16
         if self._k_padding > 0:
-            # Pad input with zeros on the K dimension to match pre-padded weight
             x = torch.nn.functional.pad(x, (0, self._k_padding), mode='constant', value=0)
         
-        # Dynamically quantize input to FP8 E4M3
-        # Note: This is computed per-forward call for dynamic range handling
+        # EXPLICIT Float8 quantization for input
+        # This ensures torch._scaled_mm ONLY receives Float8 tensors
         with torch.no_grad():
             input_absmax = x.abs().max()
             input_scale = (input_absmax / FP8_E4M3_MAX).clamp(min=1e-12)
         
-        # Quantize input
+        # Quantize input to FP8 E4M3 (explicit conversion - never send float to scaled_mm)
         x_scaled = (x / input_scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
         x_fp8 = x_scaled.to(torch.float8_e4m3fn)
         
-        # Weight is already padded (if needed) during __init__
+        # Weight is already in FP8 and pre-padded
         weight_fp8 = self.weight_fp8
         
-        # Prepare scale tensors
+        # Verify both tensors are Float8 before calling scaled_mm
+        assert x_fp8.dtype == torch.float8_e4m3fn, f"Input must be Float8, got {x_fp8.dtype}"
+        assert weight_fp8.dtype == torch.float8_e4m3fn, f"Weight must be Float8, got {weight_fp8.dtype}"
+        
+        # Prepare scale tensors (MUST be float32 for scaled_mm)
         scale_a = input_scale.to(torch.float32).reshape(1)
         scale_b = self.weight_scale.reshape(1)
         
         # Hardware-accelerated scaled matrix multiplication
-        # torch._scaled_mm(input, weight.T, scale_a, scale_b) -> output
-        # For Linear: y = x @ W.T + b
-        try:
-            result = torch._scaled_mm(
-                x_fp8,
-                weight_fp8.t(),
-                scale_a,
-                scale_b,
-                bias=None,  # Add bias separately for better precision
-                out_dtype=torch.bfloat16,
-                use_fast_accum=True  # Enable fast accumulation for Blackwell
-            )
-            
-            # Track that we're using scaled_mm
-            BlackwellNativeFP4Linear._scaled_mm_calls += 1
-            
-        except Exception as e:
-            # This should never happen if requirements are met
-            raise RuntimeError(
-                f"torch._scaled_mm failed: {e}. "
-                "Blackwell Native FP4 cannot silently fallback to BF16. "
-                "Ensure you have a compatible GPU and PyTorch version."
-            )
+        # CRITICAL: Only Float8 tensors enter torch._scaled_mm
+        result = torch._scaled_mm(
+            x_fp8,                      # Float8 input
+            weight_fp8.t(),             # Float8 weight (transposed)
+            scale_a,                    # Float32 input scale
+            scale_b,                    # Float32 weight scale
+            bias=None,                  # Add bias separately for precision
+            out_dtype=torch.bfloat16,   # Output in BF16
+            use_fast_accum=True         # Blackwell fast accumulation
+        )
         
-        # Handle tuple return (older PyTorch versions return (result, absmax))
+        # Track scaled_mm call
+        BlackwellNativeFP4Linear._scaled_mm_calls += 1
+        
+        # Handle tuple return (older PyTorch versions)
         if isinstance(result, tuple):
             result = result[0]
         
-        # Add bias if present
+        # Add bias if present (in BF16)
         if self.bias is not None:
-            # Ensure bias is on the same device as result (may have been moved during model offloading)
             bias = self.bias
             if bias.device != result.device:
                 bias = bias.to(result.device)
-                # Update stored bias to avoid repeated transfers
                 with torch.no_grad():
                     self.bias.data = bias
             result = result + bias
@@ -2304,11 +2316,64 @@ class BlackwellNativeFP4Linear(nn.Module):
         if len(original_shape) > 2:
             result = result.reshape(*original_shape[:-1], self.out_features)
         
-        # Optionally cast back to original dtype if needed
+        # Cast to original dtype if needed
         if original_dtype != torch.bfloat16 and original_dtype in (torch.float16, torch.float32):
             result = result.to(original_dtype)
         
         return result
+    
+    def _forward_legacy(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        PATH B: Legacy/Compatibility fallback forward pass.
+        
+        Uses standard F.linear with the original weight.
+        No torch._scaled_mm, no SM_120 specific kernels.
+        Guaranteed stability for non-Blackwell or testing.
+        """
+        original_dtype = x.dtype
+        
+        # Use original weight (stored during init)
+        weight = self.weight_original.to(x.dtype)
+        
+        # Standard linear operation
+        bias = self.bias
+        if bias is not None and bias.device != x.device:
+            bias = bias.to(x.device)
+        if bias is not None:
+            bias = bias.to(x.dtype)
+        
+        result = nn.functional.linear(x, weight, bias)
+        
+        # Track fallback call
+        BlackwellNativeFP4Linear._fallback_calls += 1
+        
+        return result
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass with STRICT DUAL-PATH routing.
+        
+        Checks:
+        1. If self._nvfp4_enabled AND GPU is Blackwell (SM_120):
+           -> Use PATH A: Explicit Float8 + torch._scaled_mm
+        2. Else:
+           -> Use PATH B: F.linear with standard weight
+        """
+        # PATH A: Blackwell NVFP4 (strict Float8 path)
+        if self._nvfp4_enabled and self._native_fp4_active and self._is_blackwell:
+            try:
+                return self._forward_blackwell_fp8(x)
+            except Exception as e:
+                # If Blackwell path fails, we MUST NOT silently fallback
+                # This is a critical error that needs to be surfaced
+                raise RuntimeError(
+                    f"Blackwell NVFP4 forward pass failed: {e}. "
+                    "Cannot silently fallback to legacy path. "
+                    "Check GPU compatibility and PyTorch version."
+                )
+        
+        # PATH B: Legacy/Compatibility
+        return self._forward_legacy(x)
     
     @classmethod
     def get_active_layer_count(cls) -> int:
@@ -2321,11 +2386,17 @@ class BlackwellNativeFP4Linear(nn.Module):
         return cls._scaled_mm_calls
     
     @classmethod
+    def get_fallback_call_count(cls) -> int:
+        """Get total legacy fallback calls"""
+        return cls._fallback_calls
+    
+    @classmethod
     def reset_counters(cls) -> None:
         """Reset layer counters"""
         cls._active_layers = 0
         cls._total_replaced = 0
         cls._scaled_mm_calls = 0
+        cls._fallback_calls = 0
 
 
 class NVFP4ScaledLinear(nn.Module):
@@ -2581,9 +2652,11 @@ def replace_linear_with_nvfp4(
     for parent, child_name, linear, full_name in replacements:
         if use_native_fp4:
             # Use BlackwellNativeFP4Linear with torch._scaled_mm
-            nvfp4_linear = BlackwellNativeFP4Linear(linear, debug)
+            # Pass nvfp4_enabled=True to enable Blackwell-native FP8 path
+            nvfp4_linear = BlackwellNativeFP4Linear(linear, debug, nvfp4_enabled=True)
         else:
-            # Fallback to weight-only quantization
+            # Fallback to weight-only quantization (PATH B: legacy mode)
+            # Could also use BlackwellNativeFP4Linear with nvfp4_enabled=False
             nvfp4_linear = NVFP4ScaledLinear(linear, config.block_size, debug)
         setattr(parent, child_name, nvfp4_linear)
         replaced_count += 1
@@ -2643,6 +2716,8 @@ def verify_nvfp4_active(model: nn.Module, debug: Optional[Any] = None) -> Dict[s
             - native_fp4_layer_count: Number of BlackwellNativeFP4Linear layers
             - standard_linear_count: Number of standard Linear layers
             - precision_status: String describing active precision
+            - scaled_mm_calls: Number of torch._scaled_mm calls (Path A)
+            - fallback_calls: Number of legacy F.linear calls (Path B)
     """
     nvfp4_count = 0
     native_fp4_count = 0
@@ -2668,13 +2743,19 @@ def verify_nvfp4_active(model: nn.Module, debug: Optional[Any] = None) -> Dict[s
     else:
         precision_status = "Unknown - No Linear layers found"
     
+    # Get call counts for dual-path tracking
+    scaled_mm_calls = BlackwellNativeFP4Linear.get_scaled_mm_call_count()
+    fallback_calls = BlackwellNativeFP4Linear.get_fallback_call_count()
+    
     result = {
         'nvfp4_active': nvfp4_active,
         'native_fp4_active': native_fp4_active,
         'nvfp4_layer_count': nvfp4_count,
         'native_fp4_layer_count': native_fp4_count,
         'standard_linear_count': standard_linear_count,
-        'precision_status': precision_status
+        'precision_status': precision_status,
+        'scaled_mm_calls': scaled_mm_calls,
+        'fallback_calls': fallback_calls
     }
     
     if debug:
@@ -2682,10 +2763,12 @@ def verify_nvfp4_active(model: nn.Module, debug: Optional[Any] = None) -> Dict[s
             debug.log(f"🔥 GPU Active Precision: {precision_status}", 
                      category="nvfp4", force=True)
             # Log torch._scaled_mm call count as proof of hardware acceleration
-            scaled_mm_calls = BlackwellNativeFP4Linear.get_scaled_mm_call_count()
             if scaled_mm_calls > 0:
-                debug.log(f"✅ torch._scaled_mm verified: {scaled_mm_calls} calls during inference", 
+                debug.log(f"✅ PATH A (Blackwell): torch._scaled_mm verified: {scaled_mm_calls} calls", 
                          category="nvfp4", force=True)
+            if fallback_calls > 0:
+                debug.log(f"⚠️ PATH B (Legacy): F.linear fallback: {fallback_calls} calls", 
+                         level="WARNING", category="nvfp4", force=True)
         elif nvfp4_active:
             debug.log(f"🔥 GPU Active Precision: {precision_status}", 
                      category="nvfp4", force=True)
