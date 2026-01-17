@@ -448,8 +448,8 @@ def repeat_concat_idx(
         txt_mask = ~vid_mask
         
         # Get output positions for vid and txt
-        vid_out_positions = torch.arange(total_len, device=device)[vid_mask]
-        txt_out_positions = torch.arange(total_len, device=device)[txt_mask]
+        vid_out_positions = torch.arange(total_len, device=vid.device)[vid_mask]
+        txt_out_positions = torch.arange(total_len, device=vid.device)[txt_mask]
         
         # Get source indices for vid and txt
         vid_src_indices = tgt_idx[vid_mask]
