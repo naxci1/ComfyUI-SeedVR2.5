@@ -136,17 +136,25 @@ class InflatedCausalConv3d(Conv3d):
             x_concat = x
             if prev_cache is not None:
                 x_concat = torch.cat([prev_cache, x], dim=split_dim - 1)
+                # Free prev_cache immediately after concatenation
+                del prev_cache
             
-            def pad_and_forward():
-                padded = safe_pad_operation(x_concat, padding, mode='constant', value=0.0)
-                with ignore_padding(self):
-                    return Conv3d.forward(self, padded)
+            # Direct padding and forward without retry wrapper to avoid memory pile-up
+            padded = safe_pad_operation(x_concat, padding, mode='constant', value=0.0)
+            # Free input tensor immediately after padding
+            del x_concat
             
-            return retry_on_oom(
-                pad_and_forward,
-                debug=getattr(self, 'debug', None),
-                operation_name="InflatedCausalConv3d.pad_and_forward"
-            )
+            with ignore_padding(self):
+                result = Conv3d.forward(self, padded)
+            
+            # Free padded tensor immediately after convolution
+            del padded
+            
+            # Clear CUDA cache after this operation to prevent memory fragmentation
+            if torch.cuda.is_available() and result.is_cuda:
+                torch.cuda.empty_cache()
+            
+            return result
 
         # Exceed memory limit, splitting tensor
 
