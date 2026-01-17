@@ -129,7 +129,9 @@ class TeaCache:
         diff_norm = torch.norm(diff.flatten().float())
         prev_norm = torch.norm(previous.flatten().float())
         
-        if prev_norm < 1e-8:
+        # Convert to scalar for comparison to avoid "Boolean value of Tensor is ambiguous" error
+        prev_norm_scalar = prev_norm.item()
+        if prev_norm_scalar < 1e-8:
             return float('inf')
         
         self._last_l2_delta = (diff_norm / prev_norm).item()

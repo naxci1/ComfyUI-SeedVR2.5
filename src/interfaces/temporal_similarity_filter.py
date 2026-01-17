@@ -76,7 +76,10 @@ class TemporalSimilarityCache:
         norm_current = torch.norm(current_flat)
         norm_previous = torch.norm(previous_flat)
         
-        if norm_current < 1e-8 or norm_previous < 1e-8:
+        # Convert to scalars for comparison to avoid "Boolean value of Tensor is ambiguous" error
+        norm_current_scalar = norm_current.item()
+        norm_previous_scalar = norm_previous.item()
+        if norm_current_scalar < 1e-8 or norm_previous_scalar < 1e-8:
             return 0.0
         
         similarity = (dot_product / (norm_current * norm_previous)).item()
