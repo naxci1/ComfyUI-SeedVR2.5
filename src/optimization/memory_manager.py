@@ -1303,33 +1303,47 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
         if debug:
             debug.log(f"Using Blackwell bypass for NVFP4 model movement", category="general")
         
+        moved_params = 0
+        moved_buffers = 0
+        
         with torch.no_grad():
-            for name, param in model.named_parameters():
+            # First pass: move all parameters (including nested ones)
+            for name, param in list(model.named_parameters()):
                 if param.device != target_device and param.device.type != 'meta':
                     try:
                         new_data = param.data.to(target_device)
-                        param.set_(new_data)
-                    except (RuntimeError, TypeError):
                         try:
-                            param.as_subclass(torch.Tensor).data = new_data.as_subclass(torch.Tensor)
+                            param.set_(new_data)
+                            moved_params += 1
                         except (RuntimeError, TypeError):
-                            # Last resort: replace parameter in parent module
-                            parts = name.rsplit('.', 1)
-                            if len(parts) == 2:
-                                parent_name, param_name = parts
-                                parent = model
-                                for part in parent_name.split('.'):
-                                    parent = getattr(parent, part)
-                                new_parameter = torch.nn.Parameter(new_data, requires_grad=param.requires_grad)
-                                setattr(parent, param_name, new_parameter)
-                            else:
-                                new_parameter = torch.nn.Parameter(new_data, requires_grad=param.requires_grad)
-                                setattr(model, name, new_parameter)
+                            try:
+                                param.as_subclass(torch.Tensor).data = new_data.as_subclass(torch.Tensor)
+                                moved_params += 1
+                            except (RuntimeError, TypeError):
+                                # Last resort: replace parameter in parent module
+                                parts = name.rsplit('.', 1)
+                                if len(parts) == 2:
+                                    parent_name, param_name = parts
+                                    parent = model
+                                    for part in parent_name.split('.'):
+                                        parent = getattr(parent, part)
+                                    new_parameter = torch.nn.Parameter(new_data, requires_grad=param.requires_grad)
+                                    setattr(parent, param_name, new_parameter)
+                                    moved_params += 1
+                                else:
+                                    new_parameter = torch.nn.Parameter(new_data, requires_grad=param.requires_grad)
+                                    setattr(model, name, new_parameter)
+                                    moved_params += 1
+                    except Exception as e:
+                        if debug:
+                            debug.log(f"Warning: Could not move parameter {name}: {e}", 
+                                     level="WARNING", category="memory")
                 elif param.device.type == 'meta':
                     # Handle meta tensor during NVFP4 bypass
                     new_data = torch.empty(param.shape, dtype=param.dtype, device=target_device)
                     try:
                         param.set_(new_data)
+                        moved_params += 1
                     except (RuntimeError, TypeError):
                         parts = name.rsplit('.', 1)
                         if len(parts) == 2:
@@ -1339,21 +1353,33 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
                                 parent = getattr(parent, part)
                             new_parameter = torch.nn.Parameter(new_data, requires_grad=param.requires_grad)
                             setattr(parent, param_name, new_parameter)
+                            moved_params += 1
                         else:
                             new_parameter = torch.nn.Parameter(new_data, requires_grad=param.requires_grad)
                             setattr(model, name, new_parameter)
+                            moved_params += 1
             
-            for name, buffer in model.named_buffers():
+            # Second pass: move all buffers (including nested ones)
+            for name, buffer in list(model.named_buffers()):
+                if buffer is None:
+                    continue
                 if buffer.device != target_device and buffer.device.type != 'meta':
-                    parts = name.rsplit('.', 1)
-                    if len(parts) == 2:
-                        parent_name, buffer_name = parts
-                        parent = model
-                        for part in parent_name.split('.'):
-                            parent = getattr(parent, part)
-                        parent.register_buffer(buffer_name, buffer.to(target_device), persistent=False)
-                    else:
-                        model.register_buffer(name, buffer.to(target_device), persistent=False)
+                    try:
+                        new_buffer = buffer.to(target_device)
+                        parts = name.rsplit('.', 1)
+                        if len(parts) == 2:
+                            parent_name, buffer_name = parts
+                            parent = model
+                            for part in parent_name.split('.'):
+                                parent = getattr(parent, part)
+                            parent.register_buffer(buffer_name, new_buffer, persistent=False)
+                        else:
+                            model.register_buffer(name, new_buffer, persistent=False)
+                        moved_buffers += 1
+                    except Exception as e:
+                        if debug:
+                            debug.log(f"Warning: Could not move buffer {name}: {e}", 
+                                     level="WARNING", category="memory")
                 elif buffer.device.type == 'meta':
                     new_buffer = torch.empty(buffer.shape, dtype=buffer.dtype, device=target_device)
                     parts = name.rsplit('.', 1)
@@ -1365,6 +1391,37 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
                         parent.register_buffer(buffer_name, new_buffer, persistent=False)
                     else:
                         model.register_buffer(name, new_buffer, persistent=False)
+                    moved_buffers += 1
+            
+            # Third pass: recursively check all submodules for any remaining tensors
+            # This catches any direct tensor attributes that aren't registered as parameters/buffers
+            for name, module in model.named_modules():
+                for attr_name in list(dir(module)):
+                    if attr_name.startswith('_'):
+                        continue
+                    try:
+                        attr = getattr(module, attr_name)
+                        if isinstance(attr, torch.Tensor) and attr.device != target_device:
+                            # Skip if it's already a parameter or buffer
+                            if any(attr is p for _, p in module.named_parameters(recurse=False)):
+                                continue
+                            if any(attr is b for _, b in module.named_buffers(recurse=False)):
+                                continue
+                            # Move the tensor attribute
+                            try:
+                                new_attr = attr.to(target_device)
+                                setattr(module, attr_name, new_attr)
+                                if debug:
+                                    debug.log(f"Moved tensor attribute {name}.{attr_name} to {target_device}", 
+                                             category="memory")
+                            except Exception:
+                                pass  # Skip if we can't move it
+                    except (AttributeError, RuntimeError):
+                        pass  # Skip if we can't access the attribute
+        
+        if debug:
+            debug.log(f"Blackwell bypass: moved {moved_params} params and {moved_buffers} buffers to {target_device}", 
+                     category="memory")
     else:
         # Standard movement path (non-NVFP4)
         try:

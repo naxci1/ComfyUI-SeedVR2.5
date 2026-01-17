@@ -2210,9 +2210,9 @@ class BlackwellNativeFP4Linear(nn.Module):
             self.register_buffer('weight_fp8', weight_fp8.to(original_device))
             self.register_buffer('weight_scale', weight_scale.to(torch.float32).to(original_device))
         
-        # Keep bias in BF16/FP16 for precision
+        # Keep bias in BF16/FP16 for precision (ensure it's on the correct device)
         if original_linear.bias is not None:
-            self.bias = nn.Parameter(original_linear.bias.data.to(torch.bfloat16))
+            self.bias = nn.Parameter(original_linear.bias.data.to(torch.bfloat16).to(original_device))
         else:
             self.register_parameter('bias', None)
         
@@ -2374,9 +2374,9 @@ class NVFP4ScaledLinear(nn.Module):
             total_original = weight.shape[0] * weight.shape[1]
             self._cached_scales_expanded = scales.repeat_interleave(block_size)[:total_original].to(original_device)
         
-        # Keep bias in FP16 for precision
+        # Keep bias in FP16 for precision (ensure it's on the correct device)
         if original_linear.bias is not None:
-            self.bias = nn.Parameter(original_linear.bias.data.to(torch.float16))
+            self.bias = nn.Parameter(original_linear.bias.data.to(torch.float16).to(original_device))
         else:
             self.register_parameter('bias', None)
         
