@@ -82,7 +82,8 @@ from ..optimization.nvfp4 import (
     apply_nvfp4_to_dit,
     verify_nvfp4_active,
     NVFP4RequirementError,
-    is_nvfp4_supported
+    is_nvfp4_supported,
+    is_nvfp4_checkpoint
 )
 from ..utils.constants import find_model_file
 
@@ -1268,13 +1269,20 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
                 # Get the actual model to apply NVFP4 to
                 actual_model = model.dit_model if hasattr(model, 'dit_model') else model
                 
+                # Check if this is a pre-quantized NVFP4 checkpoint
+                # This avoids redundant re-quantization of already NVFP4 weights
+                # Use _dit_checkpoint (the actual checkpoint path) - may be None after materialization
+                checkpoint_path = getattr(runner, '_dit_checkpoint', '') or ''
+                is_prequantized = is_nvfp4_checkpoint(checkpoint_path) if checkpoint_path else False
+                
                 # Apply NVFP4 quantization (will raise NVFP4RequirementError if not supported and strict=True)
                 actual_model, offloader = apply_nvfp4_to_dit(
                     actual_model,
                     enable_nvfp4=True,
                     nvfp4_async_offload=nvfp4_async_offload,
                     debug=debug,
-                    strict=True  # No silent fallback - explicit error if requirements not met
+                    strict=True,  # No silent fallback - explicit error if requirements not met
+                    is_prequantized_checkpoint=is_prequantized
                 )
                 
                 # Store offloader on runner for later use

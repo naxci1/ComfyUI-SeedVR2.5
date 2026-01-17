@@ -1568,7 +1568,8 @@ def apply_nvfp4_to_dit(
     enable_nvfp4: bool = True,
     nvfp4_async_offload: bool = True,
     debug: Optional[Any] = None,
-    strict: bool = True
+    strict: bool = True,
+    is_prequantized_checkpoint: bool = False
 ) -> Tuple[nn.Module, Optional['AsyncModelOffloader']]:
     """
     Apply NVFP4 optimization to DiT (Diffusion Transformer) model.
@@ -1576,9 +1577,10 @@ def apply_nvfp4_to_dit(
     This is the main entry point for enabling NVFP4 on the DiT model.
     It performs the following:
     1. Validates NVFP4 requirements (with explicit error if not met)
-    2. Replaces Linear layers with NVFP4-quantized versions
-    3. Optionally enables async offloading with pinned memory
-    4. Logs proof-of-work showing active precision
+    2. If checkpoint is pre-quantized, uses native NVFP4 layers directly (no re-quantization)
+    3. Otherwise, replaces Linear layers with NVFP4-quantized versions
+    4. Optionally enables async offloading with pinned memory
+    5. Logs proof-of-work showing active precision
     
     Args:
         model: DiT model to optimize
@@ -1586,6 +1588,7 @@ def apply_nvfp4_to_dit(
         nvfp4_async_offload: Whether to enable async offloading
         debug: Debug instance for logging
         strict: If True, raise error when NVFP4 not supported
+        is_prequantized_checkpoint: If True, checkpoint contains pre-quantized NVFP4 weights
         
     Returns:
         Tuple of (optimized_model, async_offloader or None)
@@ -1614,17 +1617,41 @@ def apply_nvfp4_to_dit(
                  category="nvfp4", force=True, indent_level=1)
         debug.log(f"  - NVFP4 Supported: {'✅' if status['nvfp4_supported'] else '❌'}", 
                  category="nvfp4", force=True, indent_level=1)
+        debug.log(f"  - Pre-quantized checkpoint: {'✅' if is_prequantized_checkpoint else '❌'}", 
+                 category="nvfp4", force=True, indent_level=1)
     
     # Ensure native FP4 dispatch is configured
     if status['nvfp4_supported']:
         ensure_native_fp4_dispatch()
     
-    # Replace Linear layers with NVFP4 versions
-    config = NVFP4Config()
-    model, stats = replace_linear_with_nvfp4(model, config, debug, strict)
+    # Handle pre-quantized checkpoints - skip redundant quantization
+    if is_prequantized_checkpoint:
+        if debug:
+            debug.log("✅ Using pre-quantized NVFP4 weights directly (zero overhead)", 
+                     category="nvfp4", force=True)
+        # Model already has NVFP4 weights from checkpoint - no quantization needed
+        # Just mark the model and set up offloader
+        stats = {'replaced_count': 0, 'preserved_count': 0, 'total_params': 0, 'prequantized': True}
+        
+        # Count existing Linear layers for logging
+        linear_count = sum(1 for m in model.modules() if isinstance(m, nn.Linear))
+        if debug:
+            debug.log(f"  - Model has {linear_count} Linear layers (pre-quantized in checkpoint)", 
+                     category="nvfp4", force=True, indent_level=1)
+    else:
+        # Quantize Linear layers - this is the slow path
+        quantize_start = time.time()
+        config = NVFP4Config()
+        model, stats = replace_linear_with_nvfp4(model, config, debug, strict)
+        quantize_time = time.time() - quantize_start
+        
+        # Warn if quantization took too long (indicates redundant work)
+        if quantize_time > 1.0 and debug:
+            debug.log(f"⚠️ WARNING: Quantization took {quantize_time:.1f}s - consider using pre-quantized checkpoint", 
+                     level="WARNING", category="nvfp4", force=True)
     
-    # Setup async offloader if requested and NVFP4 is active
-    if nvfp4_async_offload and stats['replaced_count'] > 0:
+    # Setup async offloader if requested
+    if nvfp4_async_offload:
         if debug:
             debug.log("Enabling async offloading with pinned memory for NVFP4", 
                      category="nvfp4", force=True)
@@ -1632,6 +1659,18 @@ def apply_nvfp4_to_dit(
     
     # Verify and log active precision (proof-of-work)
     verify_nvfp4_active(model, debug)
+    
+    # Log first layer dtype for debugging
+    if debug:
+        for name, module in model.named_modules():
+            if isinstance(module, nn.Linear):
+                debug.log(f"🔍 First Linear layer '{name}' weight dtype: {module.weight.dtype}", 
+                         category="nvfp4", force=True)
+                break
+            elif isinstance(module, NVFP4ScaledLinear):
+                debug.log(f"🔍 First NVFP4 layer '{name}' packed dtype: {module.weight_packed.dtype}", 
+                         category="nvfp4", force=True)
+                break
     
     return model, offloader
 
