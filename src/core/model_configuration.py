@@ -1272,8 +1272,14 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
                 # Check if this is a pre-quantized NVFP4 checkpoint
                 # This avoids redundant re-quantization of already NVFP4 weights
                 # Use _dit_checkpoint (the actual checkpoint path) - may be None after materialization
-                checkpoint_path = getattr(runner, '_dit_checkpoint', '') or ''
-                is_prequantized = is_nvfp4_checkpoint(checkpoint_path) if checkpoint_path else False
+                checkpoint_path = getattr(runner, '_dit_checkpoint', None)
+                is_prequantized = False
+                if checkpoint_path and isinstance(checkpoint_path, str) and len(checkpoint_path) > 0:
+                    try:
+                        is_prequantized = is_nvfp4_checkpoint(checkpoint_path)
+                    except Exception:
+                        # If checkpoint check fails, assume not pre-quantized
+                        pass
                 
                 # Apply NVFP4 quantization (will raise NVFP4RequirementError if not supported and strict=True)
                 actual_model, offloader = apply_nvfp4_to_dit(

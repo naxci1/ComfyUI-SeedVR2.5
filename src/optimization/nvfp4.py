@@ -1631,10 +1631,20 @@ def apply_nvfp4_to_dit(
                      category="nvfp4", force=True)
         # Model already has NVFP4 weights from checkpoint - no quantization needed
         # Just mark the model and set up offloader
-        stats = {'replaced_count': 0, 'preserved_count': 0, 'total_params': 0, 'prequantized': True}
         
-        # Count existing Linear layers for logging
+        # Count existing Linear layers for accurate statistics
         linear_count = sum(1 for m in model.modules() if isinstance(m, nn.Linear))
+        nvfp4_layer_count = sum(1 for m in model.modules() if isinstance(m, NVFP4ScaledLinear))
+        total_params = sum(m.weight.numel() for m in model.modules() if isinstance(m, nn.Linear))
+        
+        stats = {
+            'replaced_count': nvfp4_layer_count,  # Pre-quantized layers
+            'preserved_count': 0,
+            'total_params': total_params,
+            'prequantized': True,
+            'linear_count': linear_count
+        }
+        
         if debug:
             debug.log(f"  - Model has {linear_count} Linear layers (pre-quantized in checkpoint)", 
                      category="nvfp4", force=True, indent_level=1)
@@ -1650,8 +1660,10 @@ def apply_nvfp4_to_dit(
             debug.log(f"⚠️ WARNING: Quantization took {quantize_time:.1f}s - consider using pre-quantized checkpoint", 
                      level="WARNING", category="nvfp4", force=True)
     
-    # Setup async offloader if requested
-    if nvfp4_async_offload:
+    # Setup async offloader if requested and there are layers to optimize
+    # For pre-quantized checkpoints, we still benefit from async offloading if Linear layers exist
+    has_optimizable_layers = stats.get('replaced_count', 0) > 0 or stats.get('linear_count', 0) > 0
+    if nvfp4_async_offload and has_optimizable_layers:
         if debug:
             debug.log("Enabling async offloading with pinned memory for NVFP4", 
                      category="nvfp4", force=True)
