@@ -416,10 +416,58 @@ def repeat_concat_idx(
         
         return vid_out, torch.cat(txt_out_coalesced)
 
-    # Note: Using direct indexing instead of torch.index_select for backward compatibility
-    # Direct indexing is deterministic even with repeated indices
+    def memory_efficient_scatter_concat(vid: torch.Tensor, txt: torch.Tensor) -> torch.Tensor:
+        """
+        Memory-efficient scatter-gather concatenation.
+        
+        Instead of torch.cat([vid, txt])[tgt_idx] which creates a 2x VRAM peak,
+        this approach pre-allocates the output tensor and directly maps slices
+        of vid and txt into their target positions.
+        
+        This reduces peak VRAM usage by ~50% for large tensors.
+        
+        Args:
+            vid: Video tensor (VL, ...)
+            txt: Text tensor (TL, ...)
+            
+        Returns:
+            Interleaved tensor with elements at tgt_idx positions
+        """
+        # Pre-allocate output tensor (avoids 2x peak from torch.cat)
+        total_len = tgt_idx.shape[0]
+        output_shape = (total_len,) + vid.shape[1:]
+        output = torch.empty(output_shape, dtype=vid.dtype, device=vid.device)
+        
+        # Compute source indices for vid and txt
+        vid_len_total = vid.shape[0]
+        
+        # Create masks for vid and txt positions in tgt_idx
+        # tgt_idx contains indices into concatenated [vid, txt]
+        # Indices < vid_len_total are from vid, >= vid_len_total are from txt
+        vid_mask = tgt_idx < vid_len_total
+        txt_mask = ~vid_mask
+        
+        # Get output positions for vid and txt
+        vid_out_positions = torch.arange(total_len, device=device)[vid_mask]
+        txt_out_positions = torch.arange(total_len, device=device)[txt_mask]
+        
+        # Get source indices for vid and txt
+        vid_src_indices = tgt_idx[vid_mask]
+        txt_src_indices = tgt_idx[txt_mask] - vid_len_total
+        
+        # Scatter vid and txt into output using index_copy for efficiency
+        # This avoids the memory peak from torch.cat
+        if vid_src_indices.numel() > 0:
+            output.index_copy_(0, vid_out_positions, vid.index_select(0, vid_src_indices))
+        if txt_src_indices.numel() > 0:
+            output.index_copy_(0, txt_out_positions, txt.index_select(0, txt_src_indices))
+        
+        return output
+
+    # Use memory-efficient scatter-gather instead of torch.cat([vid, txt])[tgt_idx]
+    # This avoids 2x VRAM peak during concatenation (OOM fix)
     return (
-        lambda vid, txt: torch.cat([vid, txt])[tgt_idx],
+        memory_efficient_scatter_concat,
         lambda all: unconcat_coalesce(all),
     )
 

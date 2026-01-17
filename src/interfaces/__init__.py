@@ -9,6 +9,7 @@ from .video_upscaler import SeedVR2VideoUpscaler
 from .dit_model_loader import SeedVR2LoadDiTModel
 from .vae_model_loader import SeedVR2LoadVAEModel
 from .torch_compile_settings import SeedVR2TorchCompileSettings
+from .temporal_similarity_filter import SeedVR2TemporalSimilarityFilter
 
 
 class SeedVR2Extension(ComfyExtension):
@@ -21,6 +22,7 @@ class SeedVR2Extension(ComfyExtension):
             SeedVR2LoadDiTModel,
             SeedVR2LoadVAEModel,
             SeedVR2TorchCompileSettings,
+            SeedVR2TemporalSimilarityFilter,
         ]
 
 
@@ -34,6 +36,7 @@ __all__ = [
     'SeedVR2LoadDiTModel',
     'SeedVR2LoadVAEModel',
     'SeedVR2TorchCompileSettings',
+    'SeedVR2TemporalSimilarityFilter',
     'SeedVR2Extension',
     'comfy_entrypoint',
 ]

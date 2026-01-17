@@ -29,6 +29,7 @@ from ..optimization.memory_manager import (
     get_device_list
 )
 from ..optimization.compatibility import reset_sparge_sage2_verification
+from ..optimization.nvfp4 import is_blackwell_gpu, log_blackwell_status
 
 # Import ComfyUI progress reporting
 try:
@@ -385,6 +386,9 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
         debug.start_timer("total_execution", force=True)
 
         debug.log("━━━━━━━━━ Model Preparation ━━━━━━━━━", category="none")
+        
+        # Log Blackwell-Optimized status for RTX 50-series GPUs
+        log_blackwell_status(debug)
 
         # Initial memory state
         debug.log_memory_state("Before model preparation", show_tensors=False, detailed_tensors=False)

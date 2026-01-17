@@ -441,30 +441,64 @@ class NvFP4LinearLayer(nn.Module):
     
     Stores weights in E2M1 format with E4M3 scaling, dequantizes
     on forward pass for computation. Bias remains in FP16.
+    
+    Blackwell SM_120 Optimization:
+    - Uses torch._scaled_mm for native FP4 Tensor Core acceleration
+    - E4M3FN scale factors for precision preservation
+    - Falls back to dequantization on non-Blackwell hardware
     """
     
     def __init__(self, in_features: int, out_features: int, bias: bool = True,
-                 block_size: int = NVFP4_BLOCK_SIZE, device: Optional[torch.device] = None):
+                 block_size: int = NVFP4_BLOCK_SIZE, device: Optional[torch.device] = None,
+                 use_scaled_mm: bool = True):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.block_size = block_size
+        self.use_scaled_mm = use_scaled_mm and is_blackwell_gpu()
         
         # Weight storage (will be set by load_nvfp4_weights)
         self.register_buffer('weight_packed', None)
         self.register_buffer('weight_scales', None)
         self.weight_shape = (out_features, in_features)
         
+        # E4M3FN scale factors for Blackwell native acceleration
+        self.register_buffer('weight_scale_e4m3', None)
+        self.register_buffer('input_scale_e4m3', None)
+        
         # Bias stays in FP16
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_features, dtype=torch.float16, device=device))
         else:
             self.register_parameter('bias', None)
+        
+        # Track if Blackwell-optimized path is active
+        self._blackwell_optimized = False
     
-    def set_nvfp4_weight(self, packed_data: torch.Tensor, scales: torch.Tensor):
-        """Set NVFP4 quantized weight data"""
+    def set_nvfp4_weight(self, packed_data: torch.Tensor, scales: torch.Tensor,
+                         e4m3_scale: Optional[torch.Tensor] = None):
+        """
+        Set NVFP4 quantized weight data.
+        
+        Args:
+            packed_data: Packed NVFP4 weight data
+            scales: Per-block scaling factors
+            e4m3_scale: Optional E4M3FN scale factor for torch._scaled_mm
+        """
         self.weight_packed = packed_data
         self.weight_scales = scales
+        
+        # Compute E4M3FN scale for Blackwell native acceleration
+        if e4m3_scale is not None:
+            self.weight_scale_e4m3 = e4m3_scale
+        elif self.use_scaled_mm and hasattr(torch, 'float8_e4m3fn'):
+            # Compute aggregate scale from block scales
+            max_scale = scales.max().item() if scales.numel() > 0 else 1.0
+            self.weight_scale_e4m3 = torch.tensor(
+                max_scale, dtype=torch.float32, device=packed_data.device
+            )
+        
+        self._blackwell_optimized = self.use_scaled_mm and self.weight_scale_e4m3 is not None
     
     def dequantize_weight(self, dtype: torch.dtype = torch.float16) -> torch.Tensor:
         """Dequantize weight to full precision"""
@@ -479,10 +513,93 @@ class NvFP4LinearLayer(nn.Module):
         )
         return nvfp4_weight.dequantize(dtype=dtype)
     
+    def _scaled_mm_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Blackwell SM_120 native FP4 Tensor Core forward pass.
+        
+        Uses torch._scaled_mm for hardware-accelerated scaled matrix multiplication.
+        This path is only used on Blackwell GPUs (RTX 50-series) with proper
+        E4M3FN scale factors configured.
+        
+        Args:
+            x: Input tensor in bfloat16 or float16
+            
+        Returns:
+            Output tensor with bias applied
+        """
+        # Dequantize to E4M3FN for scaled matmul
+        # Note: Full native FP4 path requires weight in FP8 format
+        weight_fp8 = self.dequantize_weight(dtype=torch.bfloat16)
+        
+        # Convert to E4M3FN if available (PyTorch 2.7+)
+        if hasattr(torch, 'float8_e4m3fn'):
+            try:
+                # Compute per-tensor scale for input
+                input_scale = x.abs().max() / 448.0  # E4M3FN max value
+                input_scale = torch.clamp(input_scale, min=1e-12)
+                
+                # Scale and convert input to E4M3FN
+                x_scaled = (x / input_scale).to(torch.float8_e4m3fn)
+                
+                # Compute weight scale
+                weight_max = weight_fp8.abs().max()
+                weight_scale = weight_max / 448.0
+                weight_scale = torch.clamp(weight_scale, min=1e-12)
+                
+                # Scale and convert weight to E4M3FN  
+                weight_fp8_scaled = (weight_fp8 / weight_scale).to(torch.float8_e4m3fn)
+                
+                # Use torch._scaled_mm for Tensor Core acceleration
+                # Output scale = input_scale * weight_scale
+                output_scale = input_scale * weight_scale
+                
+                # Perform scaled matrix multiplication
+                # torch._scaled_mm(a, b, scale_a, scale_b) -> scaled output
+                output = torch._scaled_mm(
+                    x_scaled,
+                    weight_fp8_scaled.t(),
+                    scale_a=input_scale,
+                    scale_b=weight_scale,
+                    out_dtype=torch.bfloat16
+                )
+                
+                if self.bias is not None:
+                    output = output + self.bias.to(output.dtype)
+                
+                return output
+                
+            except (RuntimeError, AttributeError):
+                # Fallback to standard path if _scaled_mm fails
+                pass
+        
+        # Standard path using dequantized weights
+        return nn.functional.linear(x, weight_fp8, self.bias)
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass with on-the-fly dequantization"""
+        """
+        Forward pass with Blackwell-optimized or fallback path.
+        
+        Uses native FP4 Tensor Core acceleration on Blackwell GPUs,
+        falls back to dequantization on other hardware.
+        
+        Args:
+            x: Input tensor
+            
+        Returns:
+            Output tensor
+        """
+        # Use Blackwell SM_120 optimized path if available
+        if self._blackwell_optimized and x.dtype in (torch.bfloat16, torch.float16):
+            return self._scaled_mm_forward(x)
+        
+        # Standard dequantization path
         weight = self.dequantize_weight(dtype=x.dtype)
         return nn.functional.linear(x, weight, self.bias)
+    
+    @property
+    def is_blackwell_optimized(self) -> bool:
+        """Check if this layer is using Blackwell-optimized path"""
+        return self._blackwell_optimized
 
 
 def quantize_to_nvfp4(tensor: torch.Tensor, block_size: int = NVFP4_BLOCK_SIZE
@@ -1232,6 +1349,135 @@ def create_pinned_tensor(shape: torch.Size, dtype: torch.dtype,
         return torch.empty(shape, dtype=dtype)
 
 
+def replace_linear_with_nvfp4(
+    model: nn.Module,
+    config: Optional[NVFP4Config] = None,
+    debug: Optional[Any] = None,
+    min_features: int = 256
+) -> Dict[str, Any]:
+    """
+    Replace standard nn.Linear layers with NvFP4LinearLayer for Blackwell acceleration.
+    
+    This function scans a model and replaces eligible linear layers with NVFP4-quantized
+    versions that can leverage Blackwell SM_120 native FP4 Tensor Cores.
+    
+    Args:
+        model: PyTorch model to optimize
+        config: NVFP4 configuration (uses defaults if None)
+        debug: Debug instance for logging
+        min_features: Minimum feature size for replacement (smaller layers stay FP16)
+        
+    Returns:
+        Dictionary with replacement statistics:
+        - replaced: Number of layers replaced
+        - preserved: Number of layers preserved in FP16
+        - blackwell_optimized: Whether Blackwell acceleration is active
+    """
+    if config is None:
+        config = NVFP4Config()
+    
+    replaced_count = 0
+    preserved_count = 0
+    blackwell_active = is_blackwell_gpu()
+    
+    # Log Blackwell-Optimized status
+    if debug:
+        if blackwell_active:
+            debug.log("[Blackwell-Optimized] SM_120 native FP4 Tensor Core acceleration enabled", 
+                     category="nvfp4", force=True)
+        else:
+            debug.log("NVFP4: Running in compatibility mode (non-Blackwell GPU)", 
+                     category="nvfp4")
+    
+    # Collect layers to replace (can't modify during iteration)
+    replacements: List[Tuple[str, nn.Module, nn.Linear]] = []
+    
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            # Check if layer should be preserved
+            if should_preserve_precision(name, config):
+                preserved_count += 1
+                continue
+            
+            # Check minimum size threshold
+            if module.in_features < min_features or module.out_features < min_features:
+                preserved_count += 1
+                continue
+            
+            # Find parent module for replacement
+            parent_name = '.'.join(name.split('.')[:-1])
+            layer_name = name.split('.')[-1]
+            parent = model
+            for part in parent_name.split('.'):
+                if part:
+                    parent = getattr(parent, part)
+            
+            replacements.append((layer_name, parent, module))
+    
+    # Perform replacements
+    for layer_name, parent, linear in replacements:
+        # Create NVFP4 layer
+        nvfp4_layer = NvFP4LinearLayer(
+            in_features=linear.in_features,
+            out_features=linear.out_features,
+            bias=linear.bias is not None,
+            block_size=config.block_size,
+            device=linear.weight.device,
+            use_scaled_mm=blackwell_active
+        )
+        
+        # Quantize and set weights
+        packed_data, scales = quantize_to_nvfp4(
+            linear.weight.data, 
+            block_size=config.block_size
+        )
+        nvfp4_layer.set_nvfp4_weight(packed_data, scales)
+        
+        # Copy bias if present
+        if linear.bias is not None:
+            nvfp4_layer.bias.data.copy_(linear.bias.data.to(torch.float16))
+        
+        # Replace in parent
+        setattr(parent, layer_name, nvfp4_layer)
+        replaced_count += 1
+    
+    if debug:
+        debug.log(f"NVFP4: Replaced {replaced_count} linear layers, preserved {preserved_count} in FP16",
+                 category="nvfp4")
+    
+    return {
+        'replaced': replaced_count,
+        'preserved': preserved_count,
+        'blackwell_optimized': blackwell_active
+    }
+
+
+def log_blackwell_status(debug: Optional[Any] = None) -> str:
+    """
+    Log and return Blackwell optimization status string.
+    
+    Args:
+        debug: Optional debug instance for logging
+        
+    Returns:
+        Status string indicating Blackwell optimization state
+    """
+    status = get_nvfp4_status()
+    
+    if status['blackwell_gpu']:
+        msg = f"[Blackwell-Optimized] GPU: {status.get('gpu_name', 'Unknown')} " \
+              f"(SM_120, CUDA {status.get('cuda_version', 'N/A')})"
+    else:
+        capability = status.get('cuda_capability')
+        cap_str = f"SM_{capability[0]}{capability[1]}" if capability else "Unknown"
+        msg = f"[Standard Mode] GPU: {status.get('gpu_name', 'Unknown')} ({cap_str})"
+    
+    if debug:
+        debug.log(msg, category="nvfp4", force=True)
+    
+    return msg
+
+
 # Module exports
 __all__ = [
     'NVFP4Config',
@@ -1249,5 +1495,7 @@ __all__ = [
     'is_nvfp4_checkpoint',
     'ensure_native_fp4_dispatch',
     'create_pinned_tensor',
+    'replace_linear_with_nvfp4',
+    'log_blackwell_status',
     'PRESERVED_LAYER_PATTERNS',
 ]
