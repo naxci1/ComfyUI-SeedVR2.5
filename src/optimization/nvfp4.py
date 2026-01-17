@@ -497,23 +497,30 @@ def quantize_to_nvfp4(tensor: torch.Tensor, block_size: int = NVFP4_BLOCK_SIZE
     
     Representable values: 0, ±0.5, ±1.0, ±1.5, ±2.0, ±3.0, ±4.0, ±6.0
     
+    Note: Quantization is performed on CPU to avoid GPU OOM during model conversion.
+    The final packed results are returned on CPU and should be moved to GPU as needed.
+    
     Args:
         tensor: Input tensor to quantize
         block_size: Number of elements per scaling block
         
     Returns:
         Tuple of (packed_data, scales)
-        - packed_data: uint8 tensor with 2 NVFP4 values per byte
-        - scales: E4M3 scaling factors per block
+        - packed_data: uint8 tensor with 2 NVFP4 values per byte (on CPU)
+        - scales: E4M3 scaling factors per block (on CPU)
     """
-    original_shape = tensor.shape
-    flat_tensor = tensor.flatten().float()
-    num_elements = flat_tensor.numel()
+    original_device = tensor.device
+    
+    # Move to CPU for quantization to avoid GPU OOM
+    # Quantization creates many intermediate tensors that would exhaust GPU memory
+    cpu_tensor = tensor.detach().cpu().float()
+    num_elements = cpu_tensor.numel()
+    flat_tensor = cpu_tensor.flatten()
     
     # Pad to multiple of block_size
     padding = (block_size - (num_elements % block_size)) % block_size
     if padding > 0:
-        flat_tensor = torch.cat([flat_tensor, torch.zeros(padding, device=tensor.device)])
+        flat_tensor = torch.cat([flat_tensor, torch.zeros(padding)])
     
     # Reshape into blocks
     num_blocks = flat_tensor.numel() // block_size
@@ -540,6 +547,9 @@ def quantize_to_nvfp4(tensor: torch.Tensor, block_size: int = NVFP4_BLOCK_SIZE
     sign = (normalized < 0).int()
     magnitude = normalized.abs()
     
+    # Free intermediate tensors as we go to reduce memory pressure
+    del normalized, blocks, flat_tensor, cpu_tensor
+    
     # E2M1 magnitude encoding:
     # exp=0, m=0 -> 0     (code 0)
     # exp=0, m=1 -> 0.5   (code 1)  
@@ -550,25 +560,29 @@ def quantize_to_nvfp4(tensor: torch.Tensor, block_size: int = NVFP4_BLOCK_SIZE
     # exp=3, m=0 -> 4.0   (code 6)
     # exp=3, m=1 -> 6.0   (code 7)
     
-    # Quantize magnitude to nearest E2M1 value
+    # Quantize magnitude to nearest E2M1 value using vectorized operations
     mag_code = torch.zeros_like(magnitude, dtype=torch.int8)
-    mag_code = torch.where(magnitude >= 5.0, torch.tensor(7, dtype=torch.int8, device=tensor.device), mag_code)
-    mag_code = torch.where((magnitude >= 3.5) & (magnitude < 5.0), torch.tensor(6, dtype=torch.int8, device=tensor.device), mag_code)
-    mag_code = torch.where((magnitude >= 2.5) & (magnitude < 3.5), torch.tensor(5, dtype=torch.int8, device=tensor.device), mag_code)
-    mag_code = torch.where((magnitude >= 1.75) & (magnitude < 2.5), torch.tensor(4, dtype=torch.int8, device=tensor.device), mag_code)
-    mag_code = torch.where((magnitude >= 1.25) & (magnitude < 1.75), torch.tensor(3, dtype=torch.int8, device=tensor.device), mag_code)
-    mag_code = torch.where((magnitude >= 0.75) & (magnitude < 1.25), torch.tensor(2, dtype=torch.int8, device=tensor.device), mag_code)
-    mag_code = torch.where((magnitude >= 0.25) & (magnitude < 0.75), torch.tensor(1, dtype=torch.int8, device=tensor.device), mag_code)
+    mag_code = torch.where(magnitude >= 5.0, torch.tensor(7, dtype=torch.int8), mag_code)
+    mag_code = torch.where((magnitude >= 3.5) & (magnitude < 5.0), torch.tensor(6, dtype=torch.int8), mag_code)
+    mag_code = torch.where((magnitude >= 2.5) & (magnitude < 3.5), torch.tensor(5, dtype=torch.int8), mag_code)
+    mag_code = torch.where((magnitude >= 1.75) & (magnitude < 2.5), torch.tensor(4, dtype=torch.int8), mag_code)
+    mag_code = torch.where((magnitude >= 1.25) & (magnitude < 1.75), torch.tensor(3, dtype=torch.int8), mag_code)
+    mag_code = torch.where((magnitude >= 0.75) & (magnitude < 1.25), torch.tensor(2, dtype=torch.int8), mag_code)
+    mag_code = torch.where((magnitude >= 0.25) & (magnitude < 0.75), torch.tensor(1, dtype=torch.int8), mag_code)
     # magnitude < 0.25 stays at 0
+    
+    del magnitude  # Free memory
     
     # Combine sign and magnitude code into 4-bit value
     # Format: [sign(1) | exp(2) | mantissa(1)] = [sign | mag_code(3)]
     quantized_4bit = (sign.int() << 3) | mag_code.int()
     quantized_4bit = quantized_4bit.flatten()[:num_elements]
     
+    del sign, mag_code  # Free memory
+    
     # Pack two 4-bit values into each uint8
     packed_len = (num_elements + 1) // 2
-    packed = torch.zeros(packed_len, dtype=torch.uint8, device=tensor.device)
+    packed = torch.zeros(packed_len, dtype=torch.uint8)
     
     # Pack even indices into high nibble, odd into low nibble
     even_values = quantized_4bit[0::2]
@@ -581,6 +595,9 @@ def quantize_to_nvfp4(tensor: torch.Tensor, block_size: int = NVFP4_BLOCK_SIZE
         # packed[:len(odd_values)] is safe since packed_len = (n+1)//2 >= len(odd_values)
         packed[:len(odd_values)] |= odd_values.to(torch.uint8)
     
+    del quantized_4bit  # Free memory
+    
+    # Return on CPU - caller will move to GPU as needed
     return packed, scales
 
 
@@ -1266,21 +1283,24 @@ class NVFP4ScaledLinear(nn.Module):
         self._debug = debug
         self._nvfp4_active = True  # Flag to verify NVFP4 is being used
         
-        # Quantize weights to NVFP4 with scaling
+        # Get original device to restore after CPU-based quantization
+        original_device = original_linear.weight.device
+        
+        # Quantize weights to NVFP4 with scaling (performed on CPU to avoid OOM)
         with torch.no_grad():
             weight = original_linear.weight.data
-            packed_data, scales = quantize_to_nvfp4(weight.float(), block_size)
+            packed_data, scales = quantize_to_nvfp4(weight, block_size)
             
-            # Store quantized weights
-            self.register_buffer('weight_packed', packed_data)
+            # Store quantized weights - move to original device
+            self.register_buffer('weight_packed', packed_data.to(original_device))
             # E4M3 is an 8-bit format that can be represented exactly in FP16
-            self.register_buffer('weight_scales', scales.to(torch.float16))
+            self.register_buffer('weight_scales', scales.to(torch.float16).to(original_device))
             self.weight_shape = tuple(weight.shape)
             
             # Pre-compute expanded scales for efficient inference
             # This avoids recomputing repeat_interleave on every forward pass
             total_original = weight.shape[0] * weight.shape[1]
-            self._cached_scales_expanded = scales.repeat_interleave(block_size)[:total_original]
+            self._cached_scales_expanded = scales.repeat_interleave(block_size)[:total_original].to(original_device)
         
         # Keep bias in FP16 for precision
         if original_linear.bias is not None:
@@ -1447,13 +1467,20 @@ def replace_linear_with_nvfp4(
                 
                 replacements.append((module, child_name, child, full_name))
     
-    # Perform replacements
+    # Perform replacements with memory cleanup between conversions
     for parent, child_name, linear, full_name in replacements:
         nvfp4_linear = NVFP4ScaledLinear(linear, config.block_size, debug)
         setattr(parent, child_name, nvfp4_linear)
         replaced_count += 1
         total_params += linear.weight.numel()
         NVFP4ScaledLinear._total_replaced_layers += 1
+        
+        # Delete the original linear layer reference to free memory
+        del linear
+    
+    # Clear CUDA cache after all replacements to reclaim freed GPU memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
     if debug:
         # Calculate VRAM savings including E4M3 scaling factor overhead
