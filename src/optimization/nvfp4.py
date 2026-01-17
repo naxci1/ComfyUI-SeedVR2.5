@@ -1273,8 +1273,14 @@ class NVFP4ScaledLinear(nn.Module):
             
             # Store quantized weights
             self.register_buffer('weight_packed', packed_data)
-            self.register_buffer('weight_scales', scales.to(torch.float16))  # E4M3 approximated in FP16
+            # E4M3 is an 8-bit format that can be represented exactly in FP16
+            self.register_buffer('weight_scales', scales.to(torch.float16))
             self.weight_shape = tuple(weight.shape)
+            
+            # Pre-compute expanded scales for efficient inference
+            # This avoids recomputing repeat_interleave on every forward pass
+            total_original = weight.shape[0] * weight.shape[1]
+            self._cached_scales_expanded = scales.repeat_interleave(block_size)[:total_original]
         
         # Keep bias in FP16 for precision
         if original_linear.bias is not None:
@@ -1297,15 +1303,11 @@ class NVFP4ScaledLinear(nn.Module):
         # Unpack E2M1 values from packed uint8 data
         packed_data = self.weight_packed
         
-        # Extract high and low nibbles
+        # Extract high and low nibbles and interleave using stack+flatten
+        # This is more efficient than fancy indexing on GPU
         high_nibbles = (packed_data >> 4) & 0x0F
         low_nibbles = packed_data & 0x0F
-        
-        # Interleave to reconstruct original order
-        num_elements = packed_data.numel() * 2
-        unpacked = torch.empty(num_elements, dtype=torch.int8, device=device)
-        unpacked[0::2] = high_nibbles.flatten()
-        unpacked[1::2] = low_nibbles.flatten()
+        unpacked = torch.stack([high_nibbles, low_nibbles], dim=-1).flatten()
         
         # Trim to original size
         total_original = self.weight_shape[0] * self.weight_shape[1]
@@ -1323,10 +1325,8 @@ class NVFP4ScaledLinear(nn.Module):
         # Apply sign
         result = torch.where(sign == 1, -magnitude, magnitude)
         
-        # Apply per-block scaling
-        scales_expanded = self.weight_scales.repeat_interleave(self.block_size)
-        scales_expanded = scales_expanded[:total_original].to(dtype)
-        result = result * scales_expanded
+        # Apply per-block scaling using cached expanded scales
+        result = result * self._cached_scales_expanded.to(device=device, dtype=dtype)
         
         # Reshape to original weight shape
         return result.reshape(self.weight_shape)
@@ -1403,7 +1403,7 @@ def replace_linear_with_nvfp4(
         status = get_nvfp4_status()
         error_msg = (
             f"NVFP4 quantization requested but requirements not met:\n"
-            f"  - Blackwell GPU (SM100+): {'✅' if status['blackwell_gpu'] else '❌'}\n"
+            f"  - Blackwell GPU (SM120, RTX 50-series): {'✅' if status['blackwell_gpu'] else '❌'}\n"
             f"  - PyTorch 2.6+: {'✅' if status['torch_version'] >= '2.6' else '❌'} (found: {status['torch_version']})\n"
             f"  - CUDA 12.8+: {'✅' if status['cuda_version'] else '❌'} (found: {status['cuda_version']})\n"
             f"  - GPU: {status.get('gpu_name', 'N/A')}\n"
@@ -1456,7 +1456,15 @@ def replace_linear_with_nvfp4(
         NVFP4ScaledLinear._total_replaced_layers += 1
     
     if debug:
-        vram_saved_mb = (total_params * 2 - total_params * 0.5) / (1024 * 1024)  # FP16 - FP4
+        # Calculate VRAM savings including E4M3 scaling factor overhead
+        # FP16: 2 bytes per weight
+        # NVFP4: 0.5 bytes per weight + 2 bytes per block (1 FP16 scale per block_size weights)
+        num_blocks = total_params // config.block_size
+        fp16_bytes = total_params * 2
+        nvfp4_bytes = (total_params * 0.5) + (num_blocks * 2)  # 0.5 bytes packed + 2 bytes scale per block
+        vram_saved_mb = (fp16_bytes - nvfp4_bytes) / (1024 * 1024)
+        vram_reduction_pct = ((fp16_bytes - nvfp4_bytes) / fp16_bytes) * 100 if fp16_bytes > 0 else 0
+        
         debug.log(f"✅ NVFP4 Quantization Complete:", category="nvfp4", force=True)
         debug.log(f"  - Replaced: {replaced_count} Linear layers", 
                  category="nvfp4", force=True, indent_level=1)
@@ -1464,7 +1472,7 @@ def replace_linear_with_nvfp4(
                  category="nvfp4", force=True, indent_level=1)
         debug.log(f"  - Parameters: {total_params:,}", 
                  category="nvfp4", force=True, indent_level=1)
-        debug.log(f"  - Est. VRAM Saved: {vram_saved_mb:.1f}MB", 
+        debug.log(f"  - Est. VRAM Saved: {vram_saved_mb:.1f}MB ({vram_reduction_pct:.1f}% reduction)", 
                  category="nvfp4", force=True, indent_level=1)
     
     return model, {
