@@ -1386,8 +1386,9 @@ class BlackwellNativeFP4Linear(nn.Module):
         
         The computation flow:
         1. Dynamically quantize input to FP8
-        2. Call torch._scaled_mm for hardware-accelerated matmul
-        3. Return result in BF16 for downstream layers
+        2. Pad input if needed (torch._scaled_mm requires K dimension divisible by 16)
+        3. Call torch._scaled_mm for hardware-accelerated matmul
+        4. Return result in BF16 for downstream layers
         """
         original_shape = x.shape
         original_dtype = x.dtype
@@ -1395,6 +1396,15 @@ class BlackwellNativeFP4Linear(nn.Module):
         # Flatten input for 2D matmul
         if x.dim() > 2:
             x = x.reshape(-1, x.shape[-1])
+        
+        # Check if input K dimension needs padding for torch._scaled_mm
+        # torch._scaled_mm requires the inner dimension (K) to be divisible by 16
+        k_dim = x.shape[-1]
+        k_padding = 0
+        if k_dim % 16 != 0:
+            k_padding = 16 - (k_dim % 16)
+            # Pad input with zeros on the K dimension
+            x = torch.nn.functional.pad(x, (0, k_padding), mode='constant', value=0)
         
         # Dynamically quantize input to FP8 E4M3
         # Note: This is computed per-forward call for dynamic range handling
@@ -1406,6 +1416,18 @@ class BlackwellNativeFP4Linear(nn.Module):
         x_scaled = (x / input_scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
         x_fp8 = x_scaled.to(torch.float8_e4m3fn)
         
+        # Get weight for matmul - pad weight if input was padded
+        weight_fp8 = self.weight_fp8
+        if k_padding > 0:
+            # Pad weight along input dimension (in_features) to match padded input
+            # Weight shape is [out_features, in_features], pad the second dimension
+            weight_fp8 = torch.nn.functional.pad(
+                weight_fp8.to(torch.float32),  # Pad requires float
+                (0, k_padding), 
+                mode='constant', 
+                value=0
+            ).to(torch.float8_e4m3fn)
+        
         # Prepare scale tensors
         scale_a = input_scale.to(torch.float32).reshape(1)
         scale_b = self.weight_scale.reshape(1)
@@ -1416,7 +1438,7 @@ class BlackwellNativeFP4Linear(nn.Module):
         try:
             result = torch._scaled_mm(
                 x_fp8,
-                self.weight_fp8.t(),
+                weight_fp8.t(),
                 scale_a,
                 scale_b,
                 bias=None,  # Add bias separately for better precision
