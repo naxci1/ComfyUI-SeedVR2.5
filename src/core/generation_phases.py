@@ -659,11 +659,12 @@ def upscale_all_batches(
         from ..models.dit_3b.nadit import TeaCacheConfig
         from ..optimization.compatibility import BLACKWELL_GPU_DETECTED
         
-        # BLACKWELL SM_120 OPTIMIZATION: Enable TF32 for matmul acceleration
+        # BLACKWELL SM_120 OPTIMIZATION: Enable TF32 and cudnn benchmark for matmul acceleration
+        # cudnn.benchmark enables dynamic kernel selection for optimal performance per input size
         if BLACKWELL_GPU_DETECTED and torch.cuda.is_available():
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-            debug.log("[Blackwell] TF32 acceleration enabled for matmul kernels", category="dit", force=True)
+            torch.backends.cudnn.benchmark = True
         
         # Access the actual DiT model (handle CompatibleDiT wrapper if present)
         dit_model = runner.dit.dit_model if hasattr(runner.dit, 'dit_model') else runner.dit
@@ -707,9 +708,6 @@ def upscale_all_batches(
             debug.log(f"Using seed: {seed} for deterministic generation", category="dit")
 
             debug.start_timer(f"upscale_batch_{upscale_idx+1}")
-            
-            # Track frame timing for speed monitoring
-            frame_start_time = time.time()
             
             # Move to DiT device with correct dtype for upscaling (no-op if already there)
             latent = manage_tensor(
@@ -757,10 +755,6 @@ def upscale_all_batches(
                 # Free original latent
                 release_tensor_memory(ctx['all_latents'][batch_idx])
                 ctx['all_latents'][batch_idx] = None
-                
-                # Speed monitoring: Frame bypassed (shows overhead time, DiT saved)
-                frame_elapsed = time.time() - frame_start_time
-                debug.log(f"[Speed Monitor] Frame {upscale_idx+1}: DiT: 0.00s (BYPASSED, overhead: {frame_elapsed:.2f}s) | Saved: 100%", category="timing", force=True)
                 
                 debug.end_timer(f"upscale_batch_{upscale_idx+1}", f"Bypassed batch {upscale_idx+1} (reused previous)")
                 
@@ -847,10 +841,6 @@ def upscale_all_batches(
             ctx['all_latents'][batch_idx] = None
             
             del noises, aug_noises, latent, conditions, condition, base_noise, upscaled_latents
-            
-            # Speed monitoring: Log frame timing
-            frame_elapsed = time.time() - frame_start_time
-            debug.log(f"[Speed Monitor] Frame {upscale_idx+1}: DiT: {frame_elapsed:.2f}s", category="timing", force=True)
             
             debug.end_timer(f"upscale_batch_{upscale_idx+1}", f"Upscaled batch {upscale_idx+1}")
             
