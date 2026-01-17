@@ -1346,9 +1346,15 @@ class BlackwellNativeFP4Linear(nn.Module):
             if weight.dtype == torch.float8_e4m3fn:
                 # Pre-quantized FP8 weight - use directly without re-quantization
                 weight_fp8 = weight
-                # For pre-quantized weights, compute scale from the FP8 range
-                # Since we don't have the original scale, estimate from data
-                weight_scale = torch.tensor(1.0, dtype=torch.float32, device=original_device)
+                # For pre-quantized FP8 weights, infer scale from the data range
+                # Convert FP8 to float temporarily to compute absmax
+                weight_float = weight.to(torch.float32)
+                weight_absmax = weight_float.abs().max()
+                # The scale is inverse of what was used during original quantization
+                # Since values are already scaled to fit in FP8 range, scale factor relates to original range
+                # Use absmax as an estimate - if absmax is near FP8_E4M3_MAX, scale was 1.0
+                weight_scale = (weight_absmax / FP8_E4M3_MAX).clamp(min=1e-12) if weight_absmax > 0 else torch.tensor(1.0, device=original_device)
+                del weight_float  # Free memory
             else:
                 # Compute per-tensor scale for weight quantization
                 # Use dynamic scaling based on tensor absmax
@@ -1915,11 +1921,19 @@ def apply_nvfp4_to_dit(
             debug.log(f"⚠️ WARNING: Quantization took {quantize_time:.1f}s - consider using pre-quantized checkpoint", 
                      level="WARNING", category="nvfp4", force=True)
     
-    # Verify that layers were actually replaced
+    # Verify that layers were actually replaced - this is critical
     replaced = stats.get('replaced_count', 0)
-    if replaced == 0 and debug:
-        debug.log("❌ ERROR: No Linear layers were replaced! Check model structure.", 
-                 level="ERROR", category="nvfp4", force=True)
+    if replaced == 0:
+        # This is a serious configuration issue - raise error instead of silent failure
+        error_msg = (
+            "No Linear layers were replaced with BlackwellNativeFP4Linear! "
+            "This indicates a model structure issue. "
+            "NVFP4 hardware acceleration is NOT active."
+        )
+        if debug:
+            debug.log(f"❌ ERROR: {error_msg}", level="ERROR", category="nvfp4", force=True)
+        if strict:
+            raise NVFP4RequirementError(error_msg)
     elif debug:
         debug.log(f"✅ Successfully replaced {replaced} Linear layers with BlackwellNativeFP4Linear", 
                  category="nvfp4", force=True)
