@@ -938,6 +938,8 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
     """
     Handle device movement for BlockSwap-enabled models.
     
+    Safely handles meta tensors by using to_empty() when needed.
+    
     Args:
         runner: Runner instance with BlockSwap configuration
         model: Model to move (actual unwrapped model)
@@ -953,6 +955,9 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
     """
     # Import here to avoid circular dependency
     from .blockswap import set_blockswap_bypass
+    
+    # Check for meta tensors
+    has_meta = _has_meta_tensors(model)
 
     if target_type == "cpu":
         # Moving to offload device (typically CPU)
@@ -977,7 +982,21 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
             debug.start_timer(timer_name)
         
         # Move entire model to target offload device
-        model.to(target_device)
+        # Handle meta tensors safely
+        if has_meta:
+            if debug:
+                debug.log(f"{model_name} has meta tensors - skipping CPU movement (structure preserved)", 
+                         category="general")
+        else:
+            try:
+                model.to(target_device)
+            except NotImplementedError as e:
+                if "Cannot copy out of meta tensor" in str(e):
+                    if debug:
+                        debug.log(f"Meta tensor detected during to(), skipping movement", 
+                                 level="WARNING", category="memory", force=True)
+                else:
+                    raise
         model.zero_grad(set_to_none=True)
         
         if debug:
@@ -1010,6 +1029,18 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
         if debug:
             debug.start_timer(timer_name)
         
+        # Helper function to safely move a module, handling meta tensors
+        def _safe_module_move(module: torch.nn.Module, device: torch.device) -> None:
+            """Move module to device, using to_empty() for meta tensors."""
+            try:
+                module.to(device)
+            except NotImplementedError as e:
+                if "Cannot copy out of meta tensor" in str(e):
+                    # Use to_empty() for meta tensors
+                    module.to_empty(device=device)
+                else:
+                    raise
+        
         # Restore blocks to their configured devices
         if hasattr(model, "blocks") and hasattr(model, "blocks_to_swap"):
             # Use configured offload_device from BlockSwap config
@@ -1021,22 +1052,22 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
             for b, block in enumerate(model.blocks):
                 if b > model.blocks_to_swap:
                     # This block should be on GPU
-                    block.to(target_device)
+                    _safe_module_move(block, target_device)
                 else:
                     # This block stays on offload device (will be swapped during forward)
-                    block.to(offload_device)
+                    _safe_module_move(block, offload_device)
             
             # Handle I/O components
             if not model._block_swap_config.get("swap_io_components", False):
                 # I/O components should be on GPU if not offloaded
                 for name, module in model.named_children():
                     if name != "blocks":
-                        module.to(target_device)
+                        _safe_module_move(module, target_device)
             else:
                 # I/O components stay on offload device
                 for name, module in model.named_children():
                     if name != "blocks":
-                        module.to(offload_device)
+                        _safe_module_move(module, offload_device)
             
             if debug:
                 # Get actual configuration from runner
@@ -1061,15 +1092,78 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
         return True
 
 
+def _has_meta_tensors(model: torch.nn.Module) -> bool:
+    """
+    Check if a model has any parameters or buffers on the meta device.
+    
+    Args:
+        model: PyTorch model to check
+        
+    Returns:
+        bool: True if any tensor is on meta device
+    """
+    for param in model.parameters():
+        if param.device.type == 'meta':
+            return True
+    for buffer in model.buffers():
+        if buffer.device.type == 'meta':
+            return True
+    return False
+
+
+def _move_model_from_meta(model: torch.nn.Module, target_device: torch.device, 
+                          model_name: str, debug: Optional['Debug'] = None) -> bool:
+    """
+    Safely move a model from meta device to target device.
+    
+    Uses to_empty() for meta tensors instead of to(), which would fail with:
+    "NotImplementedError: Cannot copy out of meta tensor; no data!"
+    
+    After to_empty(), the tensors have the correct shape/dtype but no data.
+    The caller must load weights before inference.
+    
+    Args:
+        model: Model to move from meta
+        target_device: Target device
+        model_name: Name for logging
+        debug: Debug instance
+        
+    Returns:
+        bool: True if successfully moved to empty
+    """
+    if debug:
+        debug.log(f"Moving {model_name} from meta to {_device_str(target_device)} using to_empty()", 
+                  category="general")
+    
+    try:
+        # Use to_empty() instead of to() for meta tensors
+        # This creates tensors with the correct shape but uninitialized data
+        model.to_empty(device=target_device)
+        
+        if debug:
+            debug.log(f"{model_name} moved from meta (weights must be loaded before inference)", 
+                      category="general")
+        return True
+    except Exception as e:
+        if debug:
+            debug.log(f"Failed to move {model_name} from meta: {e}", 
+                      level="WARNING", category="memory", force=True)
+        return False
+
+
 def _standard_model_movement(model: torch.nn.Module, current_device: torch.device,
                             target_device: torch.device, target_type: str, model_name: str,
                             debug: Optional['Debug'] = None, reason: Optional[str] = None) -> bool:
     """
     Handle standard (non-BlockSwap) model movement.
     
+    Safely handles meta tensors by using to_empty() instead of to() when moving
+    from meta device. This is required for NVFP4/Blackwell models that use 
+    meta-initialization for hardware efficiency.
+    
     Args:
         model: Model to move
-        current_device: Current device of the model
+        current_device: Current device of the model (from first parameter)
         target_device: Target device (torch.device object)
         target_type: Target device type
         model_name: Model name for logging
@@ -1079,12 +1173,63 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
     Returns:
         bool: True if model was moved
     """
-    # Check if model is on meta device - can't move meta tensors
+    # Check if model has any meta tensors
+    has_meta = _has_meta_tensors(model)
+    
+    # If model is entirely on meta device, use to_empty() or skip
     if current_device.type == 'meta':
+        if target_type == 'cpu':
+            # Moving meta to CPU - skip (model structure preserved, weights will load later)
+            if debug:
+                debug.log(f"{model_name} is on meta device - skipping CPU movement (structure preserved)", 
+                         category=model_name.lower())
+            return False
+        else:
+            # Moving meta to GPU - use to_empty() then load weights
+            return _move_model_from_meta(model, target_device, model_name, debug)
+    
+    # Check for mixed meta tensors (some on meta, some on real device)
+    if has_meta:
         if debug:
-            debug.log(f"{model_name} is on meta device - skipping movement (will materialize when needed)", 
-                     category=model_name.lower())
-        return False
+            debug.log(f"{model_name} has meta tensors - materializing before movement", 
+                     category="general")
+        
+        # Move non-meta tensors first, then handle meta ones
+        # This happens when model was partially loaded
+        for name, param in model.named_parameters():
+            if param.device.type == 'meta':
+                # Create empty tensor on target device with same shape/dtype
+                with torch.no_grad():
+                    new_param = torch.empty(
+                        param.shape, 
+                        dtype=param.dtype, 
+                        device=target_device
+                    )
+                    # Replace the parameter (will be uninitialized)
+                    param.data = new_param
+        
+        for name, buffer in model.named_buffers():
+            if buffer.device.type == 'meta':
+                # Create empty buffer on target device
+                new_buffer = torch.empty(
+                    buffer.shape, 
+                    dtype=buffer.dtype, 
+                    device=target_device
+                )
+                # Replace buffer - use setattr on parent module
+                parts = name.rsplit('.', 1)
+                if len(parts) == 2:
+                    parent_name, buffer_name = parts
+                    parent = model
+                    for part in parent_name.split('.'):
+                        parent = getattr(parent, part)
+                    parent.register_buffer(buffer_name, new_buffer, persistent=False)
+                else:
+                    model.register_buffer(name, new_buffer, persistent=False)
+        
+        if debug:
+            debug.log(f"{model_name} meta tensors replaced with uninitialized tensors on {_device_str(target_device)}", 
+                     level="WARNING", category="memory", force=True)
     
     # Determine reason for movement
     reason = reason or "inference requirement"
@@ -1101,7 +1246,18 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
         debug.start_timer(timer_name)
     
     # Move model and clear gradients
-    model.to(target_device)
+    # At this point, no meta tensors should remain
+    try:
+        model.to(target_device)
+    except NotImplementedError as e:
+        if "Cannot copy out of meta tensor" in str(e):
+            if debug:
+                debug.log(f"Meta tensor detected during to(), using to_empty() fallback", 
+                         level="WARNING", category="memory", force=True)
+            model.to_empty(device=target_device)
+        else:
+            raise
+    
     model.zero_grad(set_to_none=True)
     
     # Clear VAE memory buffers when moving to CPU
