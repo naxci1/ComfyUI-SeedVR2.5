@@ -1474,9 +1474,9 @@ def replace_linear_with_nvfp4(
         replaced_count += 1
         total_params += linear.weight.numel()
         NVFP4ScaledLinear._total_replaced_layers += 1
-        
-        # Delete the original linear layer reference to free memory
-        del linear
+    
+    # Clear the replacements list to release references to original linear layers
+    replacements.clear()
     
     # Clear CUDA cache after all replacements to reclaim freed GPU memory
     if torch.cuda.is_available():
