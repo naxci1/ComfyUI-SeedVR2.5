@@ -152,7 +152,7 @@ class CUDAWorkspaceManager:
     def get_stats(cls) -> Dict[str, Any]:
         """Get workspace statistics for kernel logging."""
         return {
-            'workspace_size_mb': (cls._workspace_size * 2) / (1024 * 1024) if cls._workspace else 0,
+            'workspace_size_mb': (cls._workspace_size * 2) / (1024 * 1024) if cls._workspace is not None else 0,
             'current_offset': cls._current_offset,
             'allocation_count': cls._allocation_count,
             'reuse_count': cls._reuse_count,
