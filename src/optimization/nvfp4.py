@@ -1342,14 +1342,22 @@ class BlackwellNativeFP4Linear(nn.Module):
         with torch.no_grad():
             weight = original_linear.weight.data
             
-            # Compute per-tensor scale for weight quantization
-            # Use dynamic scaling based on tensor absmax
-            weight_absmax = weight.abs().max()
-            weight_scale = (weight_absmax / FP8_E4M3_MAX).clamp(min=1e-12)
-            
-            # Quantize weight to FP8 E4M3
-            weight_scaled = (weight / weight_scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
-            weight_fp8 = weight_scaled.to(torch.float8_e4m3fn)
+            # Check if weight is already in FP8 format (pre-quantized checkpoint)
+            if weight.dtype == torch.float8_e4m3fn:
+                # Pre-quantized FP8 weight - use directly without re-quantization
+                weight_fp8 = weight
+                # For pre-quantized weights, compute scale from the FP8 range
+                # Since we don't have the original scale, estimate from data
+                weight_scale = torch.tensor(1.0, dtype=torch.float32, device=original_device)
+            else:
+                # Compute per-tensor scale for weight quantization
+                # Use dynamic scaling based on tensor absmax
+                weight_absmax = weight.abs().max()
+                weight_scale = (weight_absmax / FP8_E4M3_MAX).clamp(min=1e-12)
+                
+                # Quantize weight to FP8 E4M3
+                weight_scaled = (weight / weight_scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
+                weight_fp8 = weight_scaled.to(torch.float8_e4m3fn)
             
             # Store quantized weight (transpose happens in forward pass for torch._scaled_mm)
             self.register_buffer('weight_fp8', weight_fp8.to(original_device))
@@ -1882,45 +1890,42 @@ def apply_nvfp4_to_dit(
     if status['nvfp4_supported']:
         ensure_native_fp4_dispatch()
     
-    # Handle pre-quantized checkpoints - skip redundant quantization
-    if is_prequantized_checkpoint:
-        if debug:
-            debug.log("✅ Using pre-quantized NVFP4 weights directly (zero overhead)", 
+    # ALWAYS replace Linear layers with BlackwellNativeFP4Linear for hardware acceleration
+    # Even for pre-quantized checkpoints, we need to swap nn.Linear -> BlackwellNativeFP4Linear
+    # The difference is that pre-quantized weights are already in FP8 format, so no re-quantization needed
+    if debug:
+        if is_prequantized_checkpoint:
+            debug.log("🚀 Replacing Linear layers with BlackwellNativeFP4Linear (using pre-quantized FP8 weights)", 
                      category="nvfp4", force=True)
-        # Model already has NVFP4 weights from checkpoint - no quantization needed
-        # Just mark the model and set up offloader
-        
-        # Count existing Linear layers for accurate statistics
-        linear_count = sum(1 for m in model.modules() if isinstance(m, nn.Linear))
-        nvfp4_layer_count = sum(1 for m in model.modules() if isinstance(m, NVFP4ScaledLinear))
-        total_params = sum(m.weight.numel() for m in model.modules() if isinstance(m, nn.Linear))
-        
-        stats = {
-            'replaced_count': nvfp4_layer_count,  # Pre-quantized layers
-            'preserved_count': 0,
-            'total_params': total_params,
-            'prequantized': True,
-            'linear_count': linear_count
-        }
-        
-        if debug:
-            debug.log(f"  - Model has {linear_count} Linear layers (pre-quantized in checkpoint)", 
-                     category="nvfp4", force=True, indent_level=1)
-    else:
-        # Quantize Linear layers - this is the slow path
-        quantize_start = time.time()
-        config = NVFP4Config()
-        model, stats = replace_linear_with_nvfp4(model, config, debug, strict)
-        quantize_time = time.time() - quantize_start
-        
-        # Warn if quantization took too long (indicates redundant work)
-        if quantize_time > 1.0 and debug:
+        else:
+            debug.log("🚀 Replacing Linear layers with BlackwellNativeFP4Linear (quantizing to FP8)", 
+                     category="nvfp4", force=True)
+    
+    quantize_start = time.time()
+    config = NVFP4Config()
+    model, stats = replace_linear_with_nvfp4(model, config, debug, strict)
+    quantize_time = time.time() - quantize_start
+    
+    # Log timing - for pre-quantized should be fast, for non-pre-quantized may take longer
+    if debug:
+        if is_prequantized_checkpoint and quantize_time > 1.0:
+            debug.log(f"⚠️ WARNING: Layer replacement took {quantize_time:.1f}s (expected <1s for pre-quantized)", 
+                     level="WARNING", category="nvfp4", force=True)
+        elif not is_prequantized_checkpoint and quantize_time > 5.0:
             debug.log(f"⚠️ WARNING: Quantization took {quantize_time:.1f}s - consider using pre-quantized checkpoint", 
                      level="WARNING", category="nvfp4", force=True)
     
+    # Verify that layers were actually replaced
+    replaced = stats.get('replaced_count', 0)
+    if replaced == 0 and debug:
+        debug.log("❌ ERROR: No Linear layers were replaced! Check model structure.", 
+                 level="ERROR", category="nvfp4", force=True)
+    elif debug:
+        debug.log(f"✅ Successfully replaced {replaced} Linear layers with BlackwellNativeFP4Linear", 
+                 category="nvfp4", force=True)
+    
     # Setup async offloader if requested and there are layers to optimize
-    # For pre-quantized checkpoints, we still benefit from async offloading if Linear layers exist
-    has_optimizable_layers = stats.get('replaced_count', 0) > 0 or stats.get('linear_count', 0) > 0
+    has_optimizable_layers = stats.get('replaced_count', 0) > 0
     if nvfp4_async_offload and has_optimizable_layers:
         if debug:
             debug.log("Enabling async offloading with pinned memory for NVFP4", 
