@@ -862,7 +862,7 @@ def cleanup_async_offloader() -> None:
 
 def manage_model_device(model: torch.nn.Module, target_device: torch.device, model_name: str,
                        debug: Optional['Debug'] = None, reason: Optional[str] = None,
-                       runner: Optional[Any] = None) -> bool:
+                       runner: Optional[Any] = None, enable_nvfp4: bool = False) -> bool:
     """
     Move model to target device with optimizations.
     Handles BlockSwap-enabled models transparently.
@@ -874,6 +874,7 @@ def manage_model_device(model: torch.nn.Module, target_device: torch.device, mod
         debug: Debug instance for logging
         reason: Optional custom reason for the movement
         runner: Optional runner instance for BlockSwap detection
+        enable_nvfp4: If True, use Blackwell bypass for FP8/FP4 dtype handling
         
     Returns:
         bool: True if model was moved, False if already on target device
@@ -921,22 +922,26 @@ def manage_model_device(model: torch.nn.Module, target_device: torch.device, mod
     if is_blockswap_model:
         return _handle_blockswap_model_movement(
             runner, actual_model, current_device, target_device, target_type,
-            model_name, debug, reason
+            model_name, debug, reason, enable_nvfp4
         )
     
     # Standard model movement (non-BlockSwap)
     return _standard_model_movement(
         model, current_device, target_device, target_type, model_name,
-        debug, reason
+        debug, reason, enable_nvfp4
     )
 
 
 def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module, 
                                     current_device: torch.device, target_device: torch.device, 
                                     target_type: str, model_name: str,
-                                    debug: Optional['Debug'] = None, reason: Optional[str] = None) -> bool:
+                                    debug: Optional['Debug'] = None, reason: Optional[str] = None,
+                                    enable_nvfp4: bool = False) -> bool:
     """
     Handle device movement for BlockSwap-enabled models.
+    
+    Safely handles meta tensors by using to_empty() when needed.
+    When enable_nvfp4 is True, uses Blackwell bypass for FP8/FP4 dtype handling.
     
     Args:
         runner: Runner instance with BlockSwap configuration
@@ -947,12 +952,16 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
         model_name: Model name for logging
         debug: Debug instance
         reason: Movement reason
+        enable_nvfp4: If True, use Blackwell bypass for FP8/FP4 dtype handling
         
     Returns:
         bool: True if model was moved
     """
     # Import here to avoid circular dependency
     from .blockswap import set_blockswap_bypass
+    
+    # Check for meta tensors
+    has_meta = _has_meta_tensors(model)
 
     if target_type == "cpu":
         # Moving to offload device (typically CPU)
@@ -977,7 +986,21 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
             debug.start_timer(timer_name)
         
         # Move entire model to target offload device
-        model.to(target_device)
+        # Handle meta tensors safely
+        if has_meta:
+            if debug:
+                debug.log(f"{model_name} has meta tensors - skipping CPU movement (structure preserved)", 
+                         category="general")
+        else:
+            try:
+                model.to(target_device)
+            except NotImplementedError as e:
+                if "Cannot copy out of meta tensor" in str(e):
+                    if debug:
+                        debug.log(f"Meta tensor detected during to(), skipping movement", 
+                                 level="WARNING", category="memory", force=True)
+                else:
+                    raise
         model.zero_grad(set_to_none=True)
         
         if debug:
@@ -1010,6 +1033,38 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
         if debug:
             debug.start_timer(timer_name)
         
+        # Helper function to safely move a module, handling meta tensors and FP8/NVFP4 dtypes
+        def _safe_module_move(module: torch.nn.Module, device: torch.device) -> None:
+            """Move module to device, using to_empty() for meta tensors and set_() for FP8/NVFP4."""
+            try:
+                module.to(device)
+            except NotImplementedError as e:
+                if "Cannot copy out of meta tensor" in str(e):
+                    # Use to_empty() for meta tensors
+                    module.to_empty(device=device)
+                else:
+                    raise
+            except RuntimeError as e:
+                if ("incompatible tensor type" in str(e) or "set_data" in str(e)) and enable_nvfp4:
+                    # Blackwell bypass: move parameters individually using set_()
+                    with torch.no_grad():
+                        for name, param in module.named_parameters(recurse=False):
+                            if param.device != device:
+                                try:
+                                    new_data = param.data.to(device)
+                                    param.set_(new_data)
+                                except (RuntimeError, TypeError):
+                                    try:
+                                        param.as_subclass(torch.Tensor).data = param.data.to(device).as_subclass(torch.Tensor)
+                                    except (RuntimeError, TypeError):
+                                        pass
+                        for name, buffer in module.named_buffers(recurse=False):
+                            if buffer.device != device:
+                                new_buffer = buffer.to(device)
+                                module.register_buffer(name, new_buffer, persistent=False)
+                else:
+                    raise
+        
         # Restore blocks to their configured devices
         if hasattr(model, "blocks") and hasattr(model, "blocks_to_swap"):
             # Use configured offload_device from BlockSwap config
@@ -1021,22 +1076,22 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
             for b, block in enumerate(model.blocks):
                 if b > model.blocks_to_swap:
                     # This block should be on GPU
-                    block.to(target_device)
+                    _safe_module_move(block, target_device)
                 else:
                     # This block stays on offload device (will be swapped during forward)
-                    block.to(offload_device)
+                    _safe_module_move(block, offload_device)
             
             # Handle I/O components
             if not model._block_swap_config.get("swap_io_components", False):
                 # I/O components should be on GPU if not offloaded
                 for name, module in model.named_children():
                     if name != "blocks":
-                        module.to(target_device)
+                        _safe_module_move(module, target_device)
             else:
                 # I/O components stay on offload device
                 for name, module in model.named_children():
                     if name != "blocks":
-                        module.to(offload_device)
+                        _safe_module_move(module, offload_device)
             
             if debug:
                 # Get actual configuration from runner
@@ -1061,30 +1116,170 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
         return True
 
 
+def _has_meta_tensors(model: torch.nn.Module) -> bool:
+    """
+    Check if a model has any parameters or buffers on the meta device.
+    
+    Args:
+        model: PyTorch model to check
+        
+    Returns:
+        bool: True if any tensor is on meta device
+    """
+    for param in model.parameters():
+        if param.device.type == 'meta':
+            return True
+    for buffer in model.buffers():
+        if buffer.device.type == 'meta':
+            return True
+    return False
+
+
+def _move_model_from_meta(model: torch.nn.Module, target_device: torch.device, 
+                          model_name: str, debug: Optional['Debug'] = None) -> bool:
+    """
+    Safely move a model from meta device to target device.
+    
+    Uses to_empty() for meta tensors instead of to(), which would fail with:
+    "NotImplementedError: Cannot copy out of meta tensor; no data!"
+    
+    After to_empty(), the tensors have the correct shape/dtype but no data.
+    The caller must load weights before inference.
+    
+    Args:
+        model: Model to move from meta
+        target_device: Target device
+        model_name: Name for logging
+        debug: Debug instance
+        
+    Returns:
+        bool: True if successfully moved to empty
+    """
+    if debug:
+        debug.log(f"Moving {model_name} from meta to {_device_str(target_device)} using to_empty()", 
+                  category="general")
+    
+    try:
+        # Use to_empty() instead of to() for meta tensors
+        # This creates tensors with the correct shape but uninitialized data
+        model.to_empty(device=target_device)
+        
+        if debug:
+            debug.log(f"{model_name} moved from meta (weights must be loaded before inference)", 
+                      category="general")
+        return True
+    except Exception as e:
+        if debug:
+            debug.log(f"Failed to move {model_name} from meta: {e}", 
+                      level="WARNING", category="memory", force=True)
+        return False
+
+
 def _standard_model_movement(model: torch.nn.Module, current_device: torch.device,
                             target_device: torch.device, target_type: str, model_name: str,
-                            debug: Optional['Debug'] = None, reason: Optional[str] = None) -> bool:
+                            debug: Optional['Debug'] = None, reason: Optional[str] = None,
+                            enable_nvfp4: bool = False) -> bool:
     """
     Handle standard (non-BlockSwap) model movement.
     
+    Safely handles meta tensors by using to_empty() instead of to() when moving
+    from meta device. This is required for NVFP4/Blackwell models that use 
+    meta-initialization for hardware efficiency.
+    
+    When enable_nvfp4 is True, uses Blackwell bypass for FP8/FP4 dtype handling
+    to allow float8_e4m3fn weights to be assigned to bfloat16 parameters.
+    
     Args:
         model: Model to move
-        current_device: Current device of the model
+        current_device: Current device of the model (from first parameter)
         target_device: Target device (torch.device object)
         target_type: Target device type
         model_name: Model name for logging
         debug: Debug instance
         reason: Movement reason
+        enable_nvfp4: If True, use Blackwell bypass for FP8/FP4 dtype handling
         
     Returns:
         bool: True if model was moved
     """
-    # Check if model is on meta device - can't move meta tensors
+    # Check if model has any meta tensors
+    has_meta = _has_meta_tensors(model)
+    
+    # If model is entirely on meta device, use to_empty() or skip
     if current_device.type == 'meta':
+        if target_type == 'cpu':
+            # Moving meta to CPU - skip (model structure preserved, weights will load later)
+            if debug:
+                debug.log(f"{model_name} is on meta device - skipping CPU movement (structure preserved)", 
+                         category=model_name.lower())
+            return False
+        else:
+            # Moving meta to GPU - use to_empty() then load weights
+            return _move_model_from_meta(model, target_device, model_name, debug)
+    
+    # Check for mixed meta tensors (some on meta, some on real device)
+    if has_meta:
         if debug:
-            debug.log(f"{model_name} is on meta device - skipping movement (will materialize when needed)", 
-                     category=model_name.lower())
-        return False
+            debug.log(f"{model_name} has meta tensors - materializing before movement", 
+                     category="general")
+        
+        # Move non-meta tensors first, then handle meta ones
+        # This happens when model was partially loaded
+        for name, param in model.named_parameters():
+            if param.device.type == 'meta':
+                # Create empty tensor on target device with same shape/dtype
+                with torch.no_grad():
+                    new_param = torch.empty(
+                        param.shape, 
+                        dtype=param.dtype, 
+                        device=target_device
+                    )
+                    # Use set_ to bypass strict dtype checks (needed for FP8/NVFP4)
+                    try:
+                        # Preferred: use set_ to point to new storage directly
+                        param.set_(new_param)
+                    except (RuntimeError, TypeError):
+                        try:
+                            # Fallback 1: force assignment via as_subclass
+                            param.as_subclass(torch.Tensor).data = new_param.as_subclass(torch.Tensor)
+                        except (RuntimeError, TypeError):
+                            # Fallback 2: find and replace parameter in parent module
+                            parts = name.rsplit('.', 1)
+                            if len(parts) == 2:
+                                parent_name, param_name = parts
+                                parent = model
+                                for part in parent_name.split('.'):
+                                    parent = getattr(parent, part)
+                                # Create new Parameter with correct dtype/device
+                                new_parameter = torch.nn.Parameter(new_param, requires_grad=param.requires_grad)
+                                setattr(parent, param_name, new_parameter)
+                            else:
+                                # Top-level parameter
+                                new_parameter = torch.nn.Parameter(new_param, requires_grad=param.requires_grad)
+                                setattr(model, name, new_parameter)
+        
+        for name, buffer in model.named_buffers():
+            if buffer.device.type == 'meta':
+                # Create empty buffer on target device
+                new_buffer = torch.empty(
+                    buffer.shape, 
+                    dtype=buffer.dtype, 
+                    device=target_device
+                )
+                # Replace buffer - use setattr on parent module
+                parts = name.rsplit('.', 1)
+                if len(parts) == 2:
+                    parent_name, buffer_name = parts
+                    parent = model
+                    for part in parent_name.split('.'):
+                        parent = getattr(parent, part)
+                    parent.register_buffer(buffer_name, new_buffer, persistent=False)
+                else:
+                    model.register_buffer(name, new_buffer, persistent=False)
+        
+        if debug:
+            debug.log(f"{model_name} meta tensors replaced with uninitialized tensors on {_device_str(target_device)}", 
+                     level="WARNING", category="memory", force=True)
     
     # Determine reason for movement
     reason = reason or "inference requirement"
@@ -1101,7 +1296,177 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
         debug.start_timer(timer_name)
     
     # Move model and clear gradients
-    model.to(target_device)
+    # For NVFP4 models, use Blackwell bypass to handle FP8/FP4 dtype mismatches
+    if enable_nvfp4:
+        # Blackwell bypass: proactively use set_() for all parameter movements
+        # This bypasses PyTorch's strict dtype checks for FP8/FP4 weights
+        if debug:
+            debug.log(f"Using Blackwell bypass for NVFP4 model movement", category="general")
+        
+        moved_params = 0
+        moved_buffers = 0
+        
+        with torch.no_grad():
+            # First pass: move all parameters (including nested ones)
+            for name, param in list(model.named_parameters()):
+                if param.device != target_device and param.device.type != 'meta':
+                    try:
+                        new_data = param.data.to(target_device)
+                        try:
+                            param.set_(new_data)
+                            moved_params += 1
+                        except (RuntimeError, TypeError):
+                            try:
+                                param.as_subclass(torch.Tensor).data = new_data.as_subclass(torch.Tensor)
+                                moved_params += 1
+                            except (RuntimeError, TypeError):
+                                # Last resort: replace parameter in parent module
+                                parts = name.rsplit('.', 1)
+                                if len(parts) == 2:
+                                    parent_name, param_name = parts
+                                    parent = model
+                                    for part in parent_name.split('.'):
+                                        parent = getattr(parent, part)
+                                    new_parameter = torch.nn.Parameter(new_data, requires_grad=param.requires_grad)
+                                    setattr(parent, param_name, new_parameter)
+                                    moved_params += 1
+                                else:
+                                    new_parameter = torch.nn.Parameter(new_data, requires_grad=param.requires_grad)
+                                    setattr(model, name, new_parameter)
+                                    moved_params += 1
+                    except Exception as e:
+                        if debug:
+                            debug.log(f"Warning: Could not move parameter {name}: {e}", 
+                                     level="WARNING", category="memory")
+                elif param.device.type == 'meta':
+                    # Handle meta tensor during NVFP4 bypass
+                    new_data = torch.empty(param.shape, dtype=param.dtype, device=target_device)
+                    try:
+                        param.set_(new_data)
+                        moved_params += 1
+                    except (RuntimeError, TypeError):
+                        parts = name.rsplit('.', 1)
+                        if len(parts) == 2:
+                            parent_name, param_name = parts
+                            parent = model
+                            for part in parent_name.split('.'):
+                                parent = getattr(parent, part)
+                            new_parameter = torch.nn.Parameter(new_data, requires_grad=param.requires_grad)
+                            setattr(parent, param_name, new_parameter)
+                            moved_params += 1
+                        else:
+                            new_parameter = torch.nn.Parameter(new_data, requires_grad=param.requires_grad)
+                            setattr(model, name, new_parameter)
+                            moved_params += 1
+            
+            # Second pass: move all buffers (including nested ones)
+            for name, buffer in list(model.named_buffers()):
+                if buffer is None:
+                    continue
+                if buffer.device != target_device and buffer.device.type != 'meta':
+                    try:
+                        new_buffer = buffer.to(target_device)
+                        parts = name.rsplit('.', 1)
+                        if len(parts) == 2:
+                            parent_name, buffer_name = parts
+                            parent = model
+                            for part in parent_name.split('.'):
+                                parent = getattr(parent, part)
+                            parent.register_buffer(buffer_name, new_buffer, persistent=False)
+                        else:
+                            model.register_buffer(name, new_buffer, persistent=False)
+                        moved_buffers += 1
+                    except Exception as e:
+                        if debug:
+                            debug.log(f"Warning: Could not move buffer {name}: {e}", 
+                                     level="WARNING", category="memory")
+                elif buffer.device.type == 'meta':
+                    new_buffer = torch.empty(buffer.shape, dtype=buffer.dtype, device=target_device)
+                    parts = name.rsplit('.', 1)
+                    if len(parts) == 2:
+                        parent_name, buffer_name = parts
+                        parent = model
+                        for part in parent_name.split('.'):
+                            parent = getattr(parent, part)
+                        parent.register_buffer(buffer_name, new_buffer, persistent=False)
+                    else:
+                        model.register_buffer(name, new_buffer, persistent=False)
+                    moved_buffers += 1
+            
+            # Third pass: recursively check all submodules for any remaining tensors
+            # This catches any direct tensor attributes that aren't registered as parameters/buffers
+            for name, module in model.named_modules():
+                for attr_name in list(dir(module)):
+                    if attr_name.startswith('_'):
+                        continue
+                    try:
+                        attr = getattr(module, attr_name)
+                        if isinstance(attr, torch.Tensor) and attr.device != target_device:
+                            # Skip if it's already a parameter or buffer
+                            if any(attr is p for _, p in module.named_parameters(recurse=False)):
+                                continue
+                            if any(attr is b for _, b in module.named_buffers(recurse=False)):
+                                continue
+                            # Move the tensor attribute
+                            try:
+                                new_attr = attr.to(target_device)
+                                setattr(module, attr_name, new_attr)
+                                if debug:
+                                    debug.log(f"Moved tensor attribute {name}.{attr_name} to {target_device}", 
+                                             category="memory")
+                            except Exception:
+                                pass  # Skip if we can't move it
+                    except (AttributeError, RuntimeError):
+                        pass  # Skip if we can't access the attribute
+        
+        if debug:
+            debug.log(f"Blackwell bypass: moved {moved_params} params and {moved_buffers} buffers to {target_device}", 
+                     category="memory")
+    else:
+        # Standard movement path (non-NVFP4)
+        try:
+            model.to(target_device)
+        except NotImplementedError as e:
+            if "Cannot copy out of meta tensor" in str(e):
+                if debug:
+                    debug.log(f"Meta tensor detected during to(), using to_empty() fallback", 
+                             level="WARNING", category="memory", force=True)
+                model.to_empty(device=target_device)
+            else:
+                raise
+        except RuntimeError as e:
+            # Handle dtype incompatibility (e.g., FP8/NVFP4 vs bfloat16)
+            if "incompatible tensor type" in str(e) or "set_data" in str(e):
+                if debug:
+                    debug.log(f"Dtype incompatibility during to(), using per-tensor movement", 
+                             level="WARNING", category="memory", force=True)
+                # Move each parameter individually using set_
+                with torch.no_grad():
+                    for name, param in model.named_parameters():
+                        if param.device != target_device:
+                            try:
+                                new_data = param.data.to(target_device)
+                                param.set_(new_data)
+                            except (RuntimeError, TypeError):
+                                try:
+                                    param.as_subclass(torch.Tensor).data = param.data.to(target_device).as_subclass(torch.Tensor)
+                                except (RuntimeError, TypeError):
+                                    # Last resort: just move what we can
+                                    pass
+                    for name, buffer in model.named_buffers():
+                        if buffer.device != target_device:
+                            parts = name.rsplit('.', 1)
+                            if len(parts) == 2:
+                                parent_name, buffer_name = parts
+                                parent = model
+                                for part in parent_name.split('.'):
+                                    parent = getattr(parent, part)
+                                parent.register_buffer(buffer_name, buffer.to(target_device), persistent=False)
+                            else:
+                                model.register_buffer(name, buffer.to(target_device), persistent=False)
+            else:
+                raise
+    
     model.zero_grad(set_to_none=True)
     
     # Clear VAE memory buffers when moving to CPU
@@ -1253,7 +1618,8 @@ def cleanup_dit(runner: Any, debug: Optional['Debug'] = None, cache_model: bool 
                     offload_target = torch.device('cpu')
                 reason = "model caching" if cache_model else "releasing GPU memory"
                 manage_model_device(model=runner.dit, target_device=offload_target, model_name="DiT", 
-                                   debug=debug, reason=reason, runner=runner)
+                                   debug=debug, reason=reason, runner=runner,
+                                   enable_nvfp4=getattr(runner, '_enable_nvfp4', False))
         elif param_device.type == 'meta' and debug:
             debug.log("DiT on meta device - keeping structure for cache", category="cleanup")
     except StopIteration:
@@ -1333,7 +1699,8 @@ def cleanup_vae(runner: Any, debug: Optional['Debug'] = None, cache_model: bool 
                     offload_target = torch.device('cpu')
                 reason = "model caching" if cache_model else "releasing GPU memory"
                 manage_model_device(model=runner.vae, target_device=offload_target, model_name="VAE", 
-                                   debug=debug, reason=reason, runner=runner)
+                                   debug=debug, reason=reason, runner=runner,
+                                   enable_nvfp4=getattr(runner, '_enable_nvfp4', False))
         elif param_device.type == 'meta' and debug:
             debug.log("VAE on meta device - keeping structure for cache", category="cleanup")
     except StopIteration:

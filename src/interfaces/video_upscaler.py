@@ -379,6 +379,10 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
         dit_torch_compile_args = dit.get("torch_compile_args")
         vae_torch_compile_args = vae.get("torch_compile_args")
         
+        # NVFP4 configuration (Blackwell GPU 4-bit quantization)
+        enable_nvfp4 = dit.get("enable_nvfp4", False)
+        nvfp4_async_offload = dit.get("nvfp4_async_offload", True)
+        
         # Print header
         debug.print_header()
 
@@ -436,7 +440,9 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 attention_mode=attention_mode,
                 sparsity_threshold=sparsity_threshold,
                 torch_compile_args_dit=dit_torch_compile_args,
-                torch_compile_args_vae=vae_torch_compile_args
+                torch_compile_args_vae=vae_torch_compile_args,
+                enable_nvfp4=enable_nvfp4,
+                nvfp4_async_offload=nvfp4_async_offload
             )
 
             # Store cache context in ctx for use in generation phases

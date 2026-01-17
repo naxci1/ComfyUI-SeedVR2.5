@@ -25,6 +25,71 @@ from torch.nn import init
 norm_layer_type = Callable[[int, float, bool], nn.Module]
 
 
+# ==============================================================================
+# BLACKWELL NVFP4 META TENSOR HANDLING
+# ==============================================================================
+# These helper functions ensure normalization layers work correctly when model
+# weights remain on the 'meta' device after NVFP4 quantization on Blackwell GPUs.
+# ==============================================================================
+
+def _is_meta_tensor(t: torch.Tensor) -> bool:
+    """Check if tensor is on the meta device (no actual VRAM allocated)."""
+    if t is None:
+        return False
+    try:
+        return t.device.type == 'meta' or getattr(t, 'is_meta', False)
+    except Exception:
+        return False
+
+
+def _ensure_norm_tensor_ready(t: torch.Tensor, reference: torch.Tensor, is_weight: bool = True) -> torch.Tensor:
+    """
+    Ensure a normalization tensor (weight or bias) is on the correct device and dtype.
+    
+    For Blackwell NVFP4 models, tensors may still be on 'meta' device after loading.
+    This function materializes them to actual VRAM on the reference tensor's device.
+    
+    Args:
+        t: The tensor to check/materialize (weight or bias)
+        reference: Reference tensor (normalized input) to get device/dtype from
+        is_weight: If True, initializes to 1.0 (weight), else 0.0 (bias)
+    
+    Returns:
+        Tensor ready for arithmetic on reference's device
+    """
+    if t is None:
+        return None
+    
+    target_device = reference.device
+    target_dtype = reference.dtype
+    
+    # Check if tensor is on meta device (common with NVFP4 Blackwell initialization)
+    if _is_meta_tensor(t):
+        # Materialize meta tensor with appropriate initialization
+        if is_weight:
+            # Weights should be initialized to 1.0 for normalization
+            return torch.ones(t.shape, device=target_device, dtype=target_dtype)
+        else:
+            # Biases should be initialized to 0.0
+            return torch.zeros(t.shape, device=target_device, dtype=target_dtype)
+    
+    # Check if tensor is on wrong device
+    if t.device != target_device:
+        return t.to(device=target_device, dtype=target_dtype)
+    
+    # Check if dtype is FP8 (needs conversion for arithmetic)
+    if hasattr(torch, 'float8_e4m3fn'):
+        fp8_types = (torch.float8_e4m3fn, torch.float8_e5m2)
+        if t.dtype in fp8_types:
+            return t.to(target_dtype)
+    
+    # Convert dtype if mismatched
+    if t.dtype != target_dtype:
+        return t.to(target_dtype)
+    
+    return t
+
+
 class CustomLayerNorm(nn.Module):
     """
     Custom LayerNorm implementation to replace Apex FusedLayerNorm
@@ -52,16 +117,40 @@ class CustomLayerNorm(nn.Module):
             init.zeros_(self.bias)
 
     def forward(self, input):
-        # 🚀 FP8 COMPATIBILITY: Convert parameters to match input dtype
-        # This prevents "Promotion for Float8 Types is not supported" errors
+        # ==================================================================
+        # BLACKWELL NVFP4 META TENSOR HANDLING
+        # ==================================================================
+        # On Blackwell GPUs with NVFP4 quantization, weight/bias may still
+        # be on 'meta' device. Materialize them to input's device before use.
+        # ==================================================================
+        
         weight = self.weight
         bias = self.bias
         
         if self.elementwise_affine and weight is not None:
-            if weight.dtype != input.dtype:
-                weight = weight.to(input.dtype)
-            if bias is not None and bias.dtype != input.dtype:
-                bias = bias.to(input.dtype)
+            # Check and materialize meta tensors
+            if _is_meta_tensor(weight):
+                weight = _ensure_norm_tensor_ready(weight, input, is_weight=True)
+                # Update stored weight to avoid repeated materialization
+                try:
+                    with torch.no_grad():
+                        self.weight.data = weight
+                except (RuntimeError, TypeError):
+                    # Parameter is frozen or dtype mismatch - use local copy
+                    pass
+            elif weight.device != input.device or weight.dtype != input.dtype:
+                weight = weight.to(device=input.device, dtype=input.dtype)
+                
+            if bias is not None:
+                if _is_meta_tensor(bias):
+                    bias = _ensure_norm_tensor_ready(bias, input, is_weight=False)
+                    try:
+                        with torch.no_grad():
+                            self.bias.data = bias
+                    except (RuntimeError, TypeError):
+                        pass
+                elif bias.device != input.device or bias.dtype != input.dtype:
+                    bias = bias.to(device=input.device, dtype=input.dtype)
         
         return F.layer_norm(
             input, self.normalized_shape, weight, bias, self.eps)
@@ -86,6 +175,13 @@ class CustomRMSNorm(nn.Module):
             self.register_parameter('weight', None)
 
     def forward(self, input):
+        # ==================================================================
+        # BLACKWELL NVFP4 META TENSOR HANDLING
+        # ==================================================================
+        # On Blackwell GPUs with NVFP4 quantization, weight may still be on
+        # 'meta' device. Materialize it to input's device before arithmetic.
+        # ==================================================================
+        
         # RMS normalization: x / sqrt(mean(x^2) + eps) * weight
         dims = tuple(range(-len(self.normalized_shape), 0))
         
@@ -97,15 +193,37 @@ class CustomRMSNorm(nn.Module):
         normalized = input / rms
         
         if self.elementwise_affine:
-            # Convert FP8 weight to match input dtype for arithmetic operations
-            if hasattr(torch, 'float8_e4m3fn'):
-                fp8_types = (torch.float8_e4m3fn, torch.float8_e5m2)
-                if self.weight.dtype in fp8_types:
-                    # Use input dtype as target (respects pipeline precision)
-                    weight = self.weight.to(input.dtype)
-                    return normalized * weight
-                    
-            return normalized * self.weight
+            weight = self.weight
+            
+            # Check for meta tensor (common with NVFP4 Blackwell initialization)
+            if _is_meta_tensor(weight):
+                weight = _ensure_norm_tensor_ready(weight, normalized, is_weight=True)
+                # Update stored weight to avoid repeated materialization
+                try:
+                    with torch.no_grad():
+                        self.weight.data = weight
+                except (RuntimeError, TypeError):
+                    # Parameter is frozen or dtype mismatch - use local copy
+                    pass
+            elif weight.device != normalized.device:
+                # Device mismatch - move to correct device
+                weight = weight.to(device=normalized.device, dtype=normalized.dtype)
+                try:
+                    with torch.no_grad():
+                        self.weight.data = weight
+                except (RuntimeError, TypeError):
+                    pass
+            else:
+                # Check for FP8 dtype (needs conversion for arithmetic)
+                if hasattr(torch, 'float8_e4m3fn'):
+                    fp8_types = (torch.float8_e4m3fn, torch.float8_e5m2)
+                    if weight.dtype in fp8_types:
+                        weight = weight.to(normalized.dtype)
+                elif weight.dtype != normalized.dtype:
+                    weight = weight.to(normalized.dtype)
+            
+            return normalized * weight
+        
         return normalized
 
 

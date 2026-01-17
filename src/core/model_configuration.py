@@ -72,10 +72,19 @@ from ..models.video_vae_v3.modules.causal_inflation_lib import InflatedCausalCon
 from ..optimization.compatibility import (
     CompatibleDiT,
     TRITON_AVAILABLE,
-    validate_attention_mode
+    validate_attention_mode,
+    NVFP4_AVAILABLE,
+    BLACKWELL_GPU_DETECTED
 )
 from ..optimization.blockswap import is_blockswap_enabled, validate_blockswap_config, apply_block_swap_to_dit, cleanup_blockswap
 from ..optimization.memory_manager import cleanup_dit, cleanup_vae
+from ..optimization.nvfp4 import (
+    apply_nvfp4_to_dit,
+    verify_nvfp4_active,
+    NVFP4RequirementError,
+    is_nvfp4_supported,
+    is_nvfp4_checkpoint
+)
 from ..utils.constants import find_model_file
 
 
@@ -780,7 +789,9 @@ def configure_runner(
     attention_mode: str = 'sdpa',
     sparsity_threshold: float = 0.5,
     torch_compile_args_dit: Optional[Dict[str, Any]] = None,
-    torch_compile_args_vae: Optional[Dict[str, Any]] = None
+    torch_compile_args_vae: Optional[Dict[str, Any]] = None,
+    enable_nvfp4: bool = False,
+    nvfp4_async_offload: bool = True
 ) -> Tuple[VideoDiffusionInfer, Dict[str, Any]]:
     """
     Configure VideoDiffusionInfer runner with model loading and settings.
@@ -810,6 +821,8 @@ def configure_runner(
                            Maps to performance modes: Fast=0.3, Balanced=0.5, High Quality=0.7
         torch_compile_args_dit: Optional torch.compile configuration for DiT model
         torch_compile_args_vae: Optional torch.compile configuration for VAE model
+        enable_nvfp4: Enable NVFP4 4-bit quantization for Blackwell GPUs (default: False)
+        nvfp4_async_offload: Enable async offloading with pinned memory for NVFP4 (default: True)
         
     Returns:
         Tuple[VideoDiffusionInfer, Dict[str, Any]]: (configured runner, cache context dict)
@@ -820,9 +833,11 @@ def configure_runner(
         - Optional torch.compile optimization for inference speedup
         - Separate encode/decode tiling configuration for optimal performance
         - Memory optimization and BlockSwap integration
+        - NVFP4 4-bit quantization for Blackwell GPUs (no silent fallback)
         
     Raises:
         ValueError: If debug instance is not provided
+        NVFP4RequirementError: If enable_nvfp4=True but requirements not met
     """
     
     if debug is None:
@@ -855,7 +870,7 @@ def configure_runner(
         decode_tiled, decode_tile_size, decode_tile_overlap,
         tile_debug, attention_mode, sparsity_threshold,
         torch_compile_args_dit, torch_compile_args_vae,
-        block_swap_config, debug
+        block_swap_config, enable_nvfp4, nvfp4_async_offload, debug
     )
     
     # Phase 4: Setup models (load from cache or create new)
@@ -882,10 +897,12 @@ def _configure_runner_settings(
     torch_compile_args_dit: Optional[Dict[str, Any]],
     torch_compile_args_vae: Optional[Dict[str, Any]],
     block_swap_config: Optional[Dict[str, Any]],
+    enable_nvfp4: bool,
+    nvfp4_async_offload: bool,
     debug: Optional['Debug'] = None
 ) -> None:
     """
-    Configure runner settings for VAE tiling, torch.compile, and BlockSwap.
+    Configure runner settings for VAE tiling, torch.compile, BlockSwap, and NVFP4.
     
     Stores configuration settings on runner for later comparison and application.
     Settings are stored in temporary "_new_*" attributes and later validated/applied
@@ -908,6 +925,8 @@ def _configure_runner_settings(
         torch_compile_args_dit: torch.compile configuration for DiT model or None
         torch_compile_args_vae: torch.compile configuration for VAE model or None
         block_swap_config: BlockSwap configuration for DiT model or None
+        enable_nvfp4: Enable NVFP4 4-bit quantization for Blackwell GPUs
+        nvfp4_async_offload: Enable async offloading with pinned memory for NVFP4
         debug: Debug instance (stored on runner for model access)
     """
     # VAE tiling settings
@@ -934,6 +953,10 @@ def _configure_runner_settings(
         'decode_tile_size': decode_tile_size,
         'decode_tile_overlap': decode_tile_overlap
     }
+    
+    # NVFP4 settings (stored directly, applied in apply_model_specific_config)
+    runner._enable_nvfp4 = enable_nvfp4
+    runner._nvfp4_async_offload = nvfp4_async_offload
     
     # Store device configuration on runner for submodule access (e.g., BlockSwap, Cleanup)
     runner._dit_device = ctx['dit_device']
@@ -1227,6 +1250,71 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
             debug.end_timer("CompatibleDiT", "Compatibility wrapper application")
         else:
             debug.log("Reusing existing DiT compatibility wrapper", category="reuse")
+        
+        # Apply NVFP4 optimization for Blackwell GPUs (before BlockSwap and torch.compile)
+        # NVFP4 replaces Linear layers with quantized versions for 4-bit Tensor Core throughput
+        enable_nvfp4 = getattr(runner, '_enable_nvfp4', False)
+        nvfp4_async_offload = getattr(runner, '_nvfp4_async_offload', True)
+        
+        # Check if NVFP4 needs to be applied (not already applied)
+        nvfp4_already_applied = getattr(model, '_nvfp4_applied', False)
+        if hasattr(model, 'dit_model'):
+            nvfp4_already_applied = getattr(model.dit_model, '_nvfp4_applied', False)
+        
+        if enable_nvfp4 and not nvfp4_already_applied:
+            debug.log("Applying NVFP4 Blackwell optimization to DiT", category="setup", force=True)
+            debug.start_timer("NVFP4_application")
+            
+            try:
+                # Get the actual model to apply NVFP4 to
+                actual_model = model.dit_model if hasattr(model, 'dit_model') else model
+                
+                # Check if this is a pre-quantized NVFP4 checkpoint
+                # This avoids redundant re-quantization of already NVFP4 weights
+                # Use _dit_checkpoint (the actual checkpoint path) - may be None after materialization
+                checkpoint_path = getattr(runner, '_dit_checkpoint', None)
+                is_prequantized = False
+                if checkpoint_path and isinstance(checkpoint_path, str) and len(checkpoint_path) > 0:
+                    try:
+                        is_prequantized = is_nvfp4_checkpoint(checkpoint_path)
+                    except Exception:
+                        # If checkpoint check fails, assume not pre-quantized
+                        pass
+                
+                # Apply NVFP4 quantization (will raise NVFP4RequirementError if not supported and strict=True)
+                actual_model, offloader = apply_nvfp4_to_dit(
+                    actual_model,
+                    enable_nvfp4=True,
+                    nvfp4_async_offload=nvfp4_async_offload,
+                    debug=debug,
+                    strict=True,  # No silent fallback - explicit error if requirements not met
+                    is_prequantized_checkpoint=is_prequantized
+                )
+                
+                # Store offloader on runner for later use
+                if offloader:
+                    runner._nvfp4_offloader = offloader
+                
+                # Mark as applied
+                actual_model._nvfp4_applied = True
+                if hasattr(model, 'dit_model'):
+                    model.dit_model = actual_model
+                else:
+                    model = actual_model
+                
+                debug.end_timer("NVFP4_application", "NVFP4 Blackwell optimization applied")
+                
+            except NVFP4RequirementError as e:
+                debug.log(f"NVFP4 Error: {e}", level="ERROR", category="nvfp4", force=True)
+                raise  # Re-raise to prevent silent fallback
+        elif enable_nvfp4 and nvfp4_already_applied:
+            debug.log("Reusing existing NVFP4 quantization", category="reuse")
+            # Verify active precision for proof-of-work logging
+            actual_model = model.dit_model if hasattr(model, 'dit_model') else model
+            verify_nvfp4_active(actual_model, debug)
+        elif not enable_nvfp4 and BLACKWELL_GPU_DETECTED:
+            debug.log("NVFP4 disabled by user (Blackwell GPU detected but not using 4-bit)", 
+                     category="nvfp4", force=True)
         
         # Apply attention mode and compute_dtype to all FlashAttentionVarlen modules
         if hasattr(runner, '_dit_attention_mode'):

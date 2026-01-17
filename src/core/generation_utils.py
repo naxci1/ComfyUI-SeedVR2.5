@@ -439,7 +439,9 @@ def prepare_runner(
     attention_mode: str = 'sdpa',
     sparsity_threshold: float = 0.5,
     torch_compile_args_dit: Optional[Dict[str, Any]] = None,
-    torch_compile_args_vae: Optional[Dict[str, Any]] = None
+    torch_compile_args_vae: Optional[Dict[str, Any]] = None,
+    enable_nvfp4: bool = False,
+    nvfp4_async_offload: bool = True
 ) -> Tuple['VideoDiffusionInfer', Dict[str, Any]]:
     """
     Prepare runner with model state management and global cache integration.
@@ -468,6 +470,8 @@ def prepare_runner(
                            Maps to performance modes: Fast=0.3, Balanced=0.5, High Quality=0.7
         torch_compile_args_dit: Optional torch.compile configuration for DiT model
         torch_compile_args_vae: Optional torch.compile configuration for VAE model
+        enable_nvfp4: Enable NVFP4 4-bit quantization for Blackwell GPUs (default: False)
+        nvfp4_async_offload: Enable async offloading with pinned memory for NVFP4 (default: True)
         
     Returns:
         Tuple['VideoDiffusionInfer', Dict[str, Any]]: Tuple containing:
@@ -485,6 +489,7 @@ def prepare_runner(
         - Optional torch.compile optimization for inference speedup
         - Separate encode/decode tiling configuration for optimal performance
         - Memory optimization and BlockSwap integration
+        - NVFP4 4-bit quantization for Blackwell GPUs
     """
     dit_changed = False
     vae_changed = False
@@ -512,7 +517,9 @@ def prepare_runner(
         attention_mode=attention_mode,
         sparsity_threshold=sparsity_threshold,
         torch_compile_args_dit=torch_compile_args_dit,
-        torch_compile_args_vae=torch_compile_args_vae
+        torch_compile_args_vae=torch_compile_args_vae,
+        enable_nvfp4=enable_nvfp4,
+        nvfp4_async_offload=nvfp4_async_offload
     )
 
     return runner, cache_context

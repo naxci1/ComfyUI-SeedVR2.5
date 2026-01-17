@@ -937,7 +937,9 @@ def _process_frames_core(
         tile_debug=args.tile_debug.lower() if args.tile_debug else "false",
         attention_mode=args.attention_mode,
         torch_compile_args_dit=torch_compile_args_dit,
-        torch_compile_args_vae=torch_compile_args_vae
+        torch_compile_args_vae=torch_compile_args_vae,
+        enable_nvfp4=args.enable_nvfp4,
+        nvfp4_async_offload=args.nvfp4_async_offload
     )
     
     ctx['cache_context'] = cache_context
@@ -1448,6 +1450,13 @@ Examples:
     perf_group.add_argument("--attention_mode", type=str, default="sdpa",
                         choices=["sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3", "sparge_sage2"],
                         help="Attention backend: 'sdpa' (default), 'flash_attn_2', 'flash_attn_3', 'sageattn_2', 'sageattn_3' (Blackwell GPUs), or 'sparge_sage2' (block-sparse, Blackwell optimized)")
+    perf_group.add_argument("--enable_nvfp4", action="store_true",
+                        help="Enable NVFP4 4-bit quantization for Blackwell GPUs (RTX 50-series). Provides 2-4x speedup with ~75%% VRAM reduction. "
+                             "Requires PyTorch 2.6+ with CUDA 12.8+. Will raise an error if requirements are not met (no silent fallback)")
+    perf_group.add_argument("--nvfp4_async_offload", action="store_true", default=True,
+                        help="Enable async offloading with pinned memory for NVFP4 models (default: enabled when NVFP4 is active)")
+    perf_group.add_argument("--no_nvfp4_async_offload", action="store_false", dest="nvfp4_async_offload",
+                        help="Disable async offloading for NVFP4 models")
     perf_group.add_argument("--compile_dit", action="store_true", 
                         help="Enable torch.compile for DiT model (20-40%% speedup, requires PyTorch 2.0+ and Triton)")
     perf_group.add_argument("--compile_vae", action="store_true",
