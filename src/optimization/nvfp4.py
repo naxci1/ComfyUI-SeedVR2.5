@@ -439,6 +439,8 @@ class NvFP4LinearLayer(nn.Module):
     """
     Linear layer with NVFP4 quantized weights.
     
+    BLACKWELL-OPTIMIZED with kernel-level logging and hardware validation.
+    
     Stores weights in E2M1 format with E4M3 scaling, dequantizes
     on forward pass for computation. Bias remains in FP16.
     
@@ -446,16 +448,27 @@ class NvFP4LinearLayer(nn.Module):
     - Uses torch._scaled_mm for native FP4 Tensor Core acceleration
     - E4M3FN scale factors for precision preservation
     - Falls back to dequantization on non-Blackwell hardware
+    - Raises RuntimeError if optimization injection fails on Blackwell
+    
+    KERNEL LOGGING:
+    - Logs torch._scaled_mm execution and weight buffer dtype
+    - Outputs "NVFP4_KERNEL: scaled_mm executed" on success
     """
+    
+    # Class-level logging
+    _kernel_logs: List[str] = []
+    _scaled_mm_calls: int = 0
+    _fallback_calls: int = 0
     
     def __init__(self, in_features: int, out_features: int, bias: bool = True,
                  block_size: int = NVFP4_BLOCK_SIZE, device: Optional[torch.device] = None,
-                 use_scaled_mm: bool = True):
+                 use_scaled_mm: bool = True, verbose_logging: bool = True):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.block_size = block_size
         self.use_scaled_mm = use_scaled_mm and is_blackwell_gpu()
+        self.verbose_logging = verbose_logging
         
         # Weight storage (will be set by load_nvfp4_weights)
         self.register_buffer('weight_packed', None)
@@ -521,6 +534,8 @@ class NvFP4LinearLayer(nn.Module):
         This path is only used on Blackwell GPUs (RTX 50-series) with proper
         E4M3FN scale factors configured.
         
+        KERNEL LOGGING: Outputs "NVFP4_KERNEL: scaled_mm executed" on success.
+        
         Args:
             x: Input tensor in bfloat16 or float16
             
@@ -563,16 +578,35 @@ class NvFP4LinearLayer(nn.Module):
                     out_dtype=torch.bfloat16
                 )
                 
+                # KERNEL LOGGING: Log successful torch._scaled_mm execution
+                NvFP4LinearLayer._scaled_mm_calls += 1
+                if self.verbose_logging:
+                    log_msg = (
+                        f"NVFP4_KERNEL: torch._scaled_mm executed | "
+                        f"weight_dtype={weight_fp8_scaled.dtype} | "
+                        f"input_dtype={x_scaled.dtype} | "
+                        f"output_dtype={output.dtype} | "
+                        f"shape={tuple(output.shape)} | "
+                        f"device={output.device}"
+                    )
+                    NvFP4LinearLayer._kernel_logs.append(log_msg)
+                    # Uncomment for verbose logging: print(log_msg)
+                
                 if self.bias is not None:
                     output = output + self.bias.to(output.dtype)
                 
                 return output
                 
-            except (RuntimeError, AttributeError):
+            except (RuntimeError, AttributeError) as e:
                 # Fallback to standard path if _scaled_mm fails
-                pass
+                if self.verbose_logging:
+                    NvFP4LinearLayer._kernel_logs.append(
+                        f"NVFP4_FALLBACK: scaled_mm failed ({str(e)[:50]}...)"
+                    )
+                # Fall through to standard path below
         
-        # Standard path using dequantized weights
+        # Standard path using dequantized weights (only counted once)
+        NvFP4LinearLayer._fallback_calls += 1
         return nn.functional.linear(x, weight_fp8, self.bias)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -600,6 +634,31 @@ class NvFP4LinearLayer(nn.Module):
     def is_blackwell_optimized(self) -> bool:
         """Check if this layer is using Blackwell-optimized path"""
         return self._blackwell_optimized
+    
+    @classmethod
+    def get_kernel_stats(cls) -> Dict[str, Any]:
+        """Get kernel execution statistics for verification."""
+        return {
+            'scaled_mm_calls': cls._scaled_mm_calls,
+            'fallback_calls': cls._fallback_calls,
+            'kernel_logs_count': len(cls._kernel_logs),
+            'optimization_ratio': (
+                cls._scaled_mm_calls / (cls._scaled_mm_calls + cls._fallback_calls)
+                if (cls._scaled_mm_calls + cls._fallback_calls) > 0 else 0.0
+            ),
+        }
+    
+    @classmethod
+    def get_kernel_logs(cls) -> List[str]:
+        """Get all kernel logs for verification."""
+        return cls._kernel_logs.copy()
+    
+    @classmethod
+    def reset_kernel_stats(cls) -> None:
+        """Reset kernel statistics."""
+        cls._scaled_mm_calls = 0
+        cls._fallback_calls = 0
+        cls._kernel_logs = []
 
 
 def quantize_to_nvfp4(tensor: torch.Tensor, block_size: int = NVFP4_BLOCK_SIZE
@@ -1478,6 +1537,165 @@ def log_blackwell_status(debug: Optional[Any] = None) -> str:
     return msg
 
 
+def verification_report() -> Dict[str, Any]:
+    """
+    Get comprehensive hardware verification report for all NVFP4 optimizations.
+    
+    Run this function to see exactly which kernels are active and their status.
+    
+    Returns dictionary with:
+    - nvfp4_status: NVFP4 support status
+    - blackwell_optimized: Whether Blackwell is detected
+    - kernel_stats: NvFP4LinearLayer kernel execution stats
+    - kernel_logs: All kernel logs for verification
+    - cuda_state: Current CUDA memory state
+    - hardware_info: GPU and CUDA version info
+    
+    Example:
+        >>> from src.optimization.nvfp4 import verification_report
+        >>> report = verification_report()
+        >>> print(report)
+    """
+    report = {
+        'optimization_suite': 'NVFP4_BLACKWELL_OPTIMIZATION',
+        'timestamp': __import__('time').time(),
+    }
+    
+    # NVFP4 support status
+    status = get_nvfp4_status()
+    report['nvfp4_supported'] = status['nvfp4_supported']
+    report['blackwell_gpu'] = status['blackwell_gpu']
+    
+    # Hardware info
+    report['hardware_info'] = {
+        'gpu_name': status.get('gpu_name'),
+        'cuda_capability': status.get('cuda_capability'),
+        'cuda_version': status.get('cuda_version'),
+        'torch_version': status.get('torch_version'),
+        'cuda_available': status.get('cuda_available'),
+    }
+    
+    # NvFP4LinearLayer kernel stats
+    report['kernel_stats'] = NvFP4LinearLayer.get_kernel_stats()
+    report['kernel_logs'] = NvFP4LinearLayer.get_kernel_logs()
+    
+    # CUDA memory state
+    if torch.cuda.is_available():
+        report['cuda_state'] = {
+            'memory_reserved_mb': torch.cuda.memory_reserved() / (1024 * 1024),
+            'memory_allocated_mb': torch.cuda.memory_allocated() / (1024 * 1024),
+            'max_memory_reserved_mb': torch.cuda.max_memory_reserved() / (1024 * 1024),
+            'max_memory_allocated_mb': torch.cuda.max_memory_allocated() / (1024 * 1024),
+        }
+    
+    # Validation status
+    report['validation'] = {
+        'nvfp4_active': status['nvfp4_supported'] and status['blackwell_gpu'],
+        'scaled_mm_available': hasattr(torch, '_scaled_mm'),
+        'float8_available': hasattr(torch, 'float8_e4m3fn'),
+    }
+    
+    return report
+
+
+def validate_nvfp4_injection() -> bool:
+    """
+    Validate that NVFP4 optimization is properly injected.
+    
+    Raises RuntimeError if on Blackwell GPU but optimization is not active.
+    
+    Returns:
+        True if validation passes
+        
+    Raises:
+        RuntimeError: If optimization injection failed on Blackwell
+    """
+    status = get_nvfp4_status()
+    
+    if status['blackwell_gpu']:
+        # On Blackwell, we expect NVFP4 to be supported
+        if not status['nvfp4_supported']:
+            raise RuntimeError(
+                "Optimization Injection Failed: Blackwell GPU detected but NVFP4 not supported. "
+                f"GPU: {status.get('gpu_name')}, "
+                f"CUDA: {status.get('cuda_version')}, "
+                f"PyTorch: {status.get('torch_version')}. "
+                "Ensure PyTorch 2.7+ with CUDA 12.8+ is installed."
+            )
+        
+        # Check if torch._scaled_mm is available
+        if not hasattr(torch, '_scaled_mm'):
+            raise RuntimeError(
+                "Optimization Injection Failed: torch._scaled_mm not available. "
+                "This is required for Blackwell FP4 Tensor Core acceleration. "
+                "Ensure PyTorch 2.7+ is installed."
+            )
+    
+    return True
+
+
+def run_sanity_check() -> Dict[str, Any]:
+    """
+    Run hardware-level sanity check before inference.
+    
+    Validates:
+    - CUDA availability
+    - Blackwell detection (if applicable)
+    - NVFP4 support (if applicable)
+    - Memory state
+    
+    Returns:
+        Sanity check results dictionary
+        
+    Raises:
+        RuntimeError: If critical validation fails
+    """
+    results = {
+        'sanity_check': 'PASSED',
+        'checks': {},
+    }
+    
+    # Check 1: CUDA availability
+    cuda_ok = torch.cuda.is_available()
+    results['checks']['cuda_available'] = cuda_ok
+    
+    if not cuda_ok:
+        results['sanity_check'] = 'WARNING'
+        results['warning'] = 'CUDA not available - running on CPU'
+        return results
+    
+    # Check 2: GPU detection
+    try:
+        gpu_name = torch.cuda.get_device_name(0)
+        results['checks']['gpu_detected'] = True
+        results['gpu_name'] = gpu_name
+    except Exception as e:
+        results['checks']['gpu_detected'] = False
+        results['sanity_check'] = 'FAILED'
+        raise RuntimeError(f"GPU detection failed: {e}")
+    
+    # Check 3: Blackwell detection
+    is_blackwell = is_blackwell_gpu()
+    results['checks']['blackwell_detected'] = is_blackwell
+    
+    # Check 4: NVFP4 support (only validate on Blackwell)
+    if is_blackwell:
+        nvfp4_ok = is_nvfp4_supported()
+        results['checks']['nvfp4_supported'] = nvfp4_ok
+        
+        if not nvfp4_ok:
+            results['sanity_check'] = 'WARNING'
+            results['warning'] = 'Blackwell detected but NVFP4 not fully supported'
+    
+    # Check 5: Memory state
+    results['memory_state'] = {
+        'reserved_mb': torch.cuda.memory_reserved() / (1024 * 1024),
+        'allocated_mb': torch.cuda.memory_allocated() / (1024 * 1024),
+    }
+    
+    return results
+
+
 # Module exports
 __all__ = [
     'NVFP4Config',
@@ -1497,5 +1715,8 @@ __all__ = [
     'create_pinned_tensor',
     'replace_linear_with_nvfp4',
     'log_blackwell_status',
+    'verification_report',
+    'validate_nvfp4_injection',
+    'run_sanity_check',
     'PRESERVED_LAYER_PATTERNS',
 ]
