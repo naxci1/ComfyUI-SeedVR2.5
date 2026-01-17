@@ -636,8 +636,12 @@ def _handle_nvfp4_shape_mismatches(model: torch.nn.Module, state: Dict[str, torc
     """
     Handle NVFP4 checkpoint weight shape mismatches.
     
-    NVFP4 "extreme" checkpoints may store weights in packed/reshaped formats.
-    This function detects shape mismatches and reshapes tensors to match model expectations.
+    NVFP4 "extreme" checkpoints store weights in packed uint8 format with microscaling:
+    - Weights: uint8 tensors (two 4-bit values packed per byte)
+    - Scales: float16 tensors (one scale per 16 elements, microscaling)
+    
+    This function detects packed NVFP4 tensors and unpacks them using the correct
+    NVFP4 microscaling algorithm for Blackwell Tensor Cores.
     
     Args:
         model: Target model (for reference shapes)
@@ -645,14 +649,21 @@ def _handle_nvfp4_shape_mismatches(model: torch.nn.Module, state: Dict[str, torc
         debug: Debug instance
         
     Returns:
-        State dict with reshaped tensors where needed
+        State dict with unpacked/dequantized tensors where needed
     """
+    from ..optimization.nvfp4 import (
+        unpack_and_dequantize_nvfp4, 
+        NVFP4_MICROSCALE_BLOCK_SIZE,
+        NVFP4Tensor
+    )
+    
     model_state = model.state_dict()
     reshaped_count = 0
+    unpacked_count = 0
     config = NVFP4Config()
     
     for name in list(state.keys()):
-        # Skip scale tensors
+        # Skip scale tensors - they will be processed with their weight
         if name.endswith('_scales'):
             continue
             
@@ -665,29 +676,76 @@ def _handle_nvfp4_shape_mismatches(model: torch.nn.Module, state: Dict[str, torc
         model_shape = model_state[name].shape
         tensor_shape = tensor.shape
         
-        # If shapes match, no action needed
-        if tensor_shape == model_shape:
-            continue
-        
-        # Check if this is a packed NVFP4 tensor that needs dequantization
+        # Check if this is a packed NVFP4 tensor (uint8 with _scales suffix)
         scales_key = f"{name}_scales"
         scales = state.get(scales_key)
         
-        if scales is not None:
-            # This is a packed NVFP4 tensor - need to dequantize and reshape
+        if scales is not None and tensor.dtype == torch.uint8:
+            # This is a packed NVFP4 microscaled tensor - use proper unpacking
             try:
-                from ..optimization.nvfp4 import NVFP4Tensor
+                if debug:
+                    debug.log(f"Unpacking NVFP4 microscaled tensor '{name}': {tensor_shape} -> {model_shape}", 
+                             category="nvfp4")
                 
-                # Create NVFP4Tensor with the model's expected shape
+                # Use NVFP4 microscaling unpacking (16:1 scale mapping)
+                dequantized = unpack_and_dequantize_nvfp4(
+                    packed_weight=tensor,
+                    scales=scales,
+                    target_shape=model_shape,
+                    block_size=NVFP4_MICROSCALE_BLOCK_SIZE,
+                    output_dtype=torch.float16,
+                    use_microscaling=True  # Use strict NVFP4 microscaling
+                )
+                
+                # Verify shape matches
+                if dequantized.shape == model_shape:
+                    state[name] = dequantized
+                    unpacked_count += 1
+                    # Remove the scales key since we've dequantized
+                    if scales_key in state:
+                        del state[scales_key]
+                else:
+                    # Try reshape if element count matches
+                    if dequantized.numel() == model_state[name].numel():
+                        state[name] = dequantized.reshape(model_shape)
+                        unpacked_count += 1
+                        if scales_key in state:
+                            del state[scales_key]
+                        if debug:
+                            debug.log(f"Reshaped unpacked tensor '{name}': {dequantized.shape} -> {model_shape}", 
+                                     category="nvfp4")
+                    else:
+                        if debug:
+                            debug.log(f"Cannot reshape '{name}': {dequantized.numel()} != {model_state[name].numel()} elements",
+                                     level="WARNING", category="nvfp4")
+                                     
+            except Exception as e:
+                if debug:
+                    debug.log(f"Failed to unpack NVFP4 tensor '{name}': {e}", level="WARNING", category="nvfp4")
+                # Fallback to old NVFP4Tensor method
+                try:
+                    nvfp4_tensor = NVFP4Tensor(
+                        tensor, scales, model_shape,
+                        block_size=config.block_size, debug=debug
+                    )
+                    dequantized = nvfp4_tensor.dequantize(dtype=torch.float16)
+                    if dequantized.shape == model_shape:
+                        state[name] = dequantized
+                        reshaped_count += 1
+                except Exception as e2:
+                    if debug:
+                        debug.log(f"Fallback dequantization also failed for '{name}': {e2}", 
+                                 level="WARNING", category="nvfp4")
+        
+        elif scales is not None:
+            # Non-uint8 packed tensor with scales - use old NVFP4Tensor method
+            try:
                 nvfp4_tensor = NVFP4Tensor(
                     tensor, scales, model_shape,
                     block_size=config.block_size, debug=debug
                 )
-                
-                # Dequantize to the model's expected shape
                 dequantized = nvfp4_tensor.dequantize(dtype=torch.float16)
                 
-                # Verify shape matches
                 if dequantized.shape == model_shape:
                     state[name] = dequantized
                     reshaped_count += 1
@@ -695,8 +753,6 @@ def _handle_nvfp4_shape_mismatches(model: torch.nn.Module, state: Dict[str, torc
                         debug.log(f"Dequantized NVFP4 tensor '{name}': {tensor_shape} -> {model_shape}", 
                                  category="nvfp4")
                 else:
-                    # Shape still doesn't match after dequantization
-                    # Try simple reshape if element count matches
                     if dequantized.numel() == model_state[name].numel():
                         state[name] = dequantized.reshape(model_shape)
                         reshaped_count += 1
@@ -711,7 +767,8 @@ def _handle_nvfp4_shape_mismatches(model: torch.nn.Module, state: Dict[str, torc
             except Exception as e:
                 if debug:
                     debug.log(f"Failed to dequantize '{name}': {e}", level="WARNING", category="nvfp4")
-        else:
+        
+        elif tensor_shape != model_shape:
             # No scales - try simple reshape if element count matches
             if tensor.numel() == model_state[name].numel():
                 state[name] = tensor.reshape(model_shape)
@@ -720,8 +777,8 @@ def _handle_nvfp4_shape_mismatches(model: torch.nn.Module, state: Dict[str, torc
                     debug.log(f"Reshaped tensor '{name}': {tensor_shape} -> {model_shape}", 
                              category="nvfp4")
     
-    if reshaped_count > 0 and debug:
-        debug.log(f"NVFP4 shape handling: reshaped {reshaped_count} tensors to match model", 
+    if (reshaped_count > 0 or unpacked_count > 0) and debug:
+        debug.log(f"NVFP4 processing: {unpacked_count} unpacked (microscaled), {reshaped_count} reshaped", 
                  category="nvfp4", force=True)
     
     return state

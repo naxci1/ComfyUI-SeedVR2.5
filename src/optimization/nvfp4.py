@@ -117,8 +117,22 @@ class NVFP4Config:
 
 
 # =============================================================================
-# NVFP4 Extreme Packed Weight Support (uint8 packed, block-wise scaled)
 # =============================================================================
+# NVFP4 Microscaling (MX Format) Support for Blackwell
+# =============================================================================
+# 
+# NVFP4 is NVIDIA's 4-bit floating point format using Microscaling (MX).
+# Unlike standard E2M1 FP4, NVFP4 uses micro-scaled groups where:
+# - Each group of 16 elements shares a single scaling factor (microscale)
+# - Weights are stored as uint8 (two 4-bit values packed per byte)
+# - Scales are stored as float16, one per 16-element micro-block
+# 
+# This is distinct from standard FP4 quantization and is specifically
+# designed for Blackwell Tensor Cores which natively support MX formats.
+# =============================================================================
+
+# NVFP4 Microscale block size (fixed by hardware specification)
+NVFP4_MICROSCALE_BLOCK_SIZE = 16
 
 def unpack_nvfp4_uint8(packed_data: torch.Tensor) -> torch.Tensor:
     """
@@ -160,6 +174,104 @@ def unpack_nvfp4_uint8(packed_data: torch.Tensor) -> torch.Tensor:
     
     # Convert to signed int8 for E2M1 interpretation
     return unpacked.to(torch.int8)
+
+
+def dequantize_nvfp4_microscale(
+    unpacked_data: torch.Tensor,
+    scales: torch.Tensor,
+    target_shape: torch.Size,
+    output_dtype: torch.dtype = torch.float16
+) -> torch.Tensor:
+    """
+    De-quantize NVFP4 values using NVIDIA Microscaling (MX) format.
+    
+    NVFP4 Microscaling (MX Format):
+    - Groups of 16 consecutive elements share a single microscale (float16)
+    - Weights are 4-bit values stored in E2M1 format
+    - The microscale is applied uniformly to all 16 elements in its block
+    
+    This differs from standard block-wise quantization:
+    - In MX format, scales are strictly 1:16 (1 scale per 16 elements)
+    - Scales represent the shared exponent for the micro-block
+    - This matches Blackwell Tensor Core MX format requirements
+    
+    NVFP4 4-bit format:
+    - Bit 3: Sign bit (0=positive, 1=negative)
+    - Bits 2-0: Magnitude code (3 bits)
+    
+    Magnitude decoding (E2M1-style):
+    Code 0: 0.0
+    Code 1: 0.5
+    Code 2: 1.0
+    Code 3: 1.5
+    Code 4: 2.0
+    Code 5: 3.0
+    Code 6: 4.0
+    Code 7: 6.0
+    
+    Args:
+        unpacked_data: Unpacked 4-bit values as int8/uint8 tensor
+        scales: Microscale factors (float16), one per 16 elements
+        target_shape: Original weight shape to reshape to
+        output_dtype: Output data type (default: float16)
+        
+    Returns:
+        Dequantized tensor in target_shape with output_dtype
+    """
+    device = unpacked_data.device
+    
+    # Ensure we're working with the right types
+    unpacked = unpacked_data.to(torch.int32)  # Use int32 for bit operations
+    
+    # Trim to match original element count
+    total_elements = target_shape.numel()
+    unpacked = unpacked[:total_elements]
+    
+    # Extract sign and magnitude code from NVFP4 format
+    # Format: [sign(1 bit) | magnitude_code(3 bits)]
+    sign_bit = (unpacked >> 3) & 1  # Bit 3 is sign
+    mag_code = unpacked & 0x7       # Bits 0-2 are magnitude code
+    
+    # NVFP4 magnitude lookup table (E2M1-derived)
+    # This matches NVIDIA's NVFP4 specification for Microscaling
+    nvfp4_magnitude_lut = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        dtype=output_dtype,
+        device=device
+    )
+    
+    # Map magnitude codes to actual values
+    magnitude = nvfp4_magnitude_lut[mag_code.clamp(0, 7).long()]
+    
+    # Apply sign
+    sign_multiplier = torch.where(
+        sign_bit == 1, 
+        torch.tensor(-1.0, dtype=output_dtype, device=device),
+        torch.tensor(1.0, dtype=output_dtype, device=device)
+    )
+    base_values = magnitude * sign_multiplier
+    
+    # Apply NVFP4 Microscaling
+    # Each microscale corresponds to exactly 16 consecutive elements
+    scales_flat = scales.flatten().to(output_dtype)
+    
+    # MX format: strictly 1 scale per 16 elements
+    # Expand scales: each scale is repeated 16 times
+    scales_expanded = scales_flat.repeat_interleave(NVFP4_MICROSCALE_BLOCK_SIZE)
+    
+    # Trim to actual element count (handle edge cases)
+    if scales_expanded.numel() < total_elements:
+        # Extend with last scale value if needed
+        extension = scales_flat[-1].expand(total_elements - scales_expanded.numel())
+        scales_expanded = torch.cat([scales_expanded, extension])
+    else:
+        scales_expanded = scales_expanded[:total_elements]
+    
+    # Apply microscales: dequantized = base_value * microscale
+    dequantized = base_values * scales_expanded
+    
+    # Reshape to target shape
+    return dequantized.reshape(target_shape)
 
 
 def dequantize_nvfp4_blockwise(
@@ -244,7 +356,8 @@ def unpack_and_dequantize_nvfp4(
     scales: torch.Tensor,
     target_shape: torch.Size,
     block_size: int = NVFP4_BLOCK_SIZE,
-    output_dtype: torch.dtype = torch.float16
+    output_dtype: torch.dtype = torch.float16,
+    use_microscaling: bool = True
 ) -> torch.Tensor:
     """
     Complete pipeline to unpack uint8-packed NVFP4 weights and dequantize.
@@ -258,6 +371,8 @@ def unpack_and_dequantize_nvfp4(
         target_shape: Original weight shape
         block_size: Elements per scaling block (default: 16, Blackwell alignment)
         output_dtype: Output data type (default: float16)
+        use_microscaling: If True, use NVFP4 microscaling (MX format). If False,
+                          use standard block-wise scaling. (default: True)
         
     Returns:
         Dequantized weight tensor in target_shape
@@ -265,12 +380,228 @@ def unpack_and_dequantize_nvfp4(
     # Step 1: Unpack two 4-bit values from each uint8 byte
     unpacked = unpack_nvfp4_uint8(packed_weight)
     
-    # Step 2: Dequantize using block-wise scales
-    dequantized = dequantize_nvfp4_blockwise(
-        unpacked, scales, target_shape, block_size, output_dtype
-    )
+    # Step 2: Dequantize using the appropriate method
+    if use_microscaling:
+        # NVFP4 Microscaling (MX format) - strict 1:16 scale mapping
+        dequantized = dequantize_nvfp4_microscale(
+            unpacked, scales, target_shape, output_dtype
+        )
+    else:
+        # Standard block-wise scaling (legacy)
+        dequantized = dequantize_nvfp4_blockwise(
+            unpacked, scales, target_shape, block_size, output_dtype
+        )
     
     return dequantized
+
+
+def load_nvfp4_microscale_weights(
+    state_dict: Dict[str, torch.Tensor],
+    layer_name: str,
+    target_shape: torch.Size,
+    output_dtype: torch.dtype = torch.float16
+) -> Optional[torch.Tensor]:
+    """
+    Load and dequantize a single NVFP4 microscaled weight tensor from state dict.
+    
+    This function handles the NVFP4 naming convention where:
+    - Packed weights are stored as '{layer_name}.weight' (uint8)
+    - Microscales are stored as '{layer_name}.weight_scales' (float16)
+    
+    Args:
+        state_dict: Model state dictionary
+        layer_name: Full layer name (e.g., 'blocks.0.attn.proj_out.vid')
+        target_shape: Expected weight shape
+        output_dtype: Output dtype (default: float16)
+        
+    Returns:
+        Dequantized weight tensor, or None if not found
+    """
+    weight_key = f"{layer_name}.weight"
+    scales_key = f"{layer_name}.weight_scales"
+    
+    # Check for NVFP4 weight/scale pair
+    packed_weight = state_dict.get(weight_key)
+    if packed_weight is None:
+        return None
+        
+    scales = state_dict.get(scales_key)
+    if scales is None:
+        return None
+    
+    # Check if this is actually packed NVFP4 (uint8 or shape mismatch)
+    if packed_weight.dtype != torch.uint8 and packed_weight.shape == target_shape:
+        # Already dequantized or not NVFP4
+        return None
+    
+    # Dequantize using NVFP4 microscaling
+    return unpack_and_dequantize_nvfp4(
+        packed_weight, scales, target_shape, 
+        NVFP4_MICROSCALE_BLOCK_SIZE, output_dtype, 
+        use_microscaling=True
+    )
+
+
+def load_blackwell_nvfp4_ada_blocks(
+    state_dict: Dict[str, torch.Tensor],
+    model: nn.Module,
+    num_blocks: int = 32,
+    debug: Optional[Any] = None
+) -> Dict[str, int]:
+    """
+    Load NVFP4 microscaled weights for Ada-style transformer blocks.
+    
+    This function handles the specific architecture of SEEDVR2 models:
+    - 32 Ada-style blocks
+    - Parallel .vid and .txt paths
+    - NVFP4 microscaling with 1:16 block size
+    
+    Args:
+        state_dict: Model state dictionary with packed NVFP4 tensors
+        model: Target model to load weights into
+        num_blocks: Number of transformer blocks (default: 32)
+        debug: Debug instance for logging
+        
+    Returns:
+        Dictionary with statistics: {'loaded': count, 'skipped': count}
+    """
+    stats = {'loaded': 0, 'skipped': 0, 'errors': 0}
+    
+    # Common Ada-style layer patterns
+    ada_layer_patterns = [
+        'attn.qkv.{path}',
+        'attn.proj_out.{path}',
+        'mlp.fc1.{path}',
+        'mlp.fc2.{path}',
+        'adaln.linear.{path}',
+        'cross_attn.q.{path}',
+        'cross_attn.kv.{path}',
+        'cross_attn.proj_out.{path}',
+    ]
+    
+    paths = ['vid', 'txt']
+    
+    for block_idx in range(num_blocks):
+        for pattern in ada_layer_patterns:
+            for path in paths:
+                layer_pattern = pattern.format(path=path)
+                layer_name = f"blocks.{block_idx}.{layer_pattern}"
+                
+                # Try to find and load the weight
+                weight_key = f"{layer_name}.weight"
+                scales_key = f"{layer_name}.weight_scales"
+                
+                packed_weight = state_dict.get(weight_key)
+                scales = state_dict.get(scales_key)
+                
+                if packed_weight is None or scales is None:
+                    continue
+                
+                # Check if it's packed NVFP4 (uint8)
+                if packed_weight.dtype != torch.uint8:
+                    stats['skipped'] += 1
+                    continue
+                
+                try:
+                    # Get target module to determine shape
+                    module = model
+                    for part in layer_name.split('.'):
+                        if hasattr(module, part):
+                            module = getattr(module, part)
+                        else:
+                            module = None
+                            break
+                    
+                    if module is None or not hasattr(module, 'weight'):
+                        stats['skipped'] += 1
+                        continue
+                    
+                    target_shape = module.weight.shape
+                    
+                    # Dequantize using NVFP4 microscaling
+                    dequantized = unpack_and_dequantize_nvfp4(
+                        packed_weight, scales, target_shape,
+                        NVFP4_MICROSCALE_BLOCK_SIZE, torch.float16,
+                        use_microscaling=True
+                    )
+                    
+                    # Update state dict with dequantized weight
+                    state_dict[weight_key] = dequantized
+                    
+                    # Remove scales key (no longer needed after dequantization)
+                    if scales_key in state_dict:
+                        del state_dict[scales_key]
+                    
+                    stats['loaded'] += 1
+                    
+                except Exception as e:
+                    if debug:
+                        debug.log(f"⚠️ Error loading {layer_name}: {e}")
+                    stats['errors'] += 1
+    
+    # Handle non-block layers (input projections, output layers, etc.)
+    non_block_patterns = [
+        'vid_in.proj',
+        'txt_in',
+        'emb_in.proj_in',
+        'emb_in.proj_hid',
+        'emb_in.proj_out',
+        'out.proj',
+    ]
+    
+    for layer_name in non_block_patterns:
+        weight_key = f"{layer_name}.weight"
+        scales_key = f"{layer_name}.weight_scales"
+        
+        packed_weight = state_dict.get(weight_key)
+        scales = state_dict.get(scales_key)
+        
+        if packed_weight is None or scales is None:
+            continue
+            
+        if packed_weight.dtype != torch.uint8:
+            stats['skipped'] += 1
+            continue
+        
+        try:
+            # Get target module
+            module = model
+            for part in layer_name.split('.'):
+                if hasattr(module, part):
+                    module = getattr(module, part)
+                else:
+                    module = None
+                    break
+            
+            if module is None or not hasattr(module, 'weight'):
+                stats['skipped'] += 1
+                continue
+            
+            target_shape = module.weight.shape
+            
+            # Dequantize
+            dequantized = unpack_and_dequantize_nvfp4(
+                packed_weight, scales, target_shape,
+                NVFP4_MICROSCALE_BLOCK_SIZE, torch.float16,
+                use_microscaling=True
+            )
+            
+            state_dict[weight_key] = dequantized
+            if scales_key in state_dict:
+                del state_dict[scales_key]
+            
+            stats['loaded'] += 1
+            
+        except Exception as e:
+            if debug:
+                debug.log(f"⚠️ Error loading {layer_name}: {e}")
+            stats['errors'] += 1
+    
+    if debug:
+        debug.log(f"🔄 NVFP4 Microscale Loading: {stats['loaded']} loaded, "
+                  f"{stats['skipped']} skipped, {stats['errors']} errors")
+    
+    return stats
 
 
 class BlackwellNVFP4PackedLinear(nn.Module):
@@ -2507,10 +2838,14 @@ __all__ = [
     'verify_nvfp4_active',
     'apply_nvfp4_to_dit',
     'PRESERVED_LAYER_PATTERNS',
-    # New NVFP4 extreme packed weight functions
+    # NVFP4 Microscaling (MX format) packed weight functions
+    'NVFP4_MICROSCALE_BLOCK_SIZE',
     'unpack_nvfp4_uint8',
+    'dequantize_nvfp4_microscale',
     'dequantize_nvfp4_blockwise',
     'unpack_and_dequantize_nvfp4',
+    'load_nvfp4_microscale_weights',
+    'load_blackwell_nvfp4_ada_blocks',
     'load_blackwell_nvfp4_model',
     'FP8_E4M3_MAX',
 ]
