@@ -1366,6 +1366,23 @@ class BlackwellNativeFP4Linear(nn.Module):
                 weight_scaled = (weight / weight_scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
                 weight_fp8 = weight_scaled.to(torch.float8_e4m3fn)
             
+            # Check if weight needs padding for torch._scaled_mm (K dimension must be divisible by 16)
+            k_dim = self.in_features
+            self._k_padding = 0
+            if k_dim % 16 != 0:
+                self._k_padding = 16 - (k_dim % 16)
+                # Pre-pad weight during initialization to avoid per-forward allocation
+                # Pad on input dimension (second dim) - weight shape is [out_features, in_features]
+                # First convert to float for padding, then back to FP8
+                weight_padded = torch.nn.functional.pad(
+                    weight_fp8.view(torch.int8).to(torch.float32),  # View as int8, then to float for padding
+                    (0, self._k_padding),
+                    mode='constant',
+                    value=0
+                )
+                weight_fp8 = weight_padded.to(torch.int8).view(torch.float8_e4m3fn)
+                del weight_padded  # Free intermediate tensor
+            
             # Store quantized weight (transpose happens in forward pass for torch._scaled_mm)
             self.register_buffer('weight_fp8', weight_fp8.to(original_device))
             self.register_buffer('weight_scale', weight_scale.to(torch.float32).to(original_device))
@@ -1397,14 +1414,11 @@ class BlackwellNativeFP4Linear(nn.Module):
         if x.dim() > 2:
             x = x.reshape(-1, x.shape[-1])
         
-        # Check if input K dimension needs padding for torch._scaled_mm
+        # Pad input if needed (weight was pre-padded during __init__)
         # torch._scaled_mm requires the inner dimension (K) to be divisible by 16
-        k_dim = x.shape[-1]
-        k_padding = 0
-        if k_dim % 16 != 0:
-            k_padding = 16 - (k_dim % 16)
-            # Pad input with zeros on the K dimension
-            x = torch.nn.functional.pad(x, (0, k_padding), mode='constant', value=0)
+        if self._k_padding > 0:
+            # Pad input with zeros on the K dimension to match pre-padded weight
+            x = torch.nn.functional.pad(x, (0, self._k_padding), mode='constant', value=0)
         
         # Dynamically quantize input to FP8 E4M3
         # Note: This is computed per-forward call for dynamic range handling
@@ -1416,17 +1430,8 @@ class BlackwellNativeFP4Linear(nn.Module):
         x_scaled = (x / input_scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
         x_fp8 = x_scaled.to(torch.float8_e4m3fn)
         
-        # Get weight for matmul - pad weight if input was padded
+        # Weight is already padded (if needed) during __init__
         weight_fp8 = self.weight_fp8
-        if k_padding > 0:
-            # Pad weight along input dimension (in_features) to match padded input
-            # Weight shape is [out_features, in_features], pad the second dimension
-            weight_fp8 = torch.nn.functional.pad(
-                weight_fp8.to(torch.float32),  # Pad requires float
-                (0, k_padding), 
-                mode='constant', 
-                value=0
-            ).to(torch.float8_e4m3fn)
         
         # Prepare scale tensors
         scale_a = input_scale.to(torch.float32).reshape(1)
