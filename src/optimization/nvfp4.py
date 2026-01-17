@@ -1280,6 +1280,10 @@ def _check_scaled_mm_support() -> bool:
     return False
 
 
+# FP8 E4M3 maximum representable value (used for scaling)
+FP8_E4M3_MAX = 448.0
+
+
 class BlackwellNativeFP4Linear(nn.Module):
     """
     Blackwell-native FP4 Linear layer using hardware-accelerated scaled matrix multiplication.
@@ -1341,16 +1345,13 @@ class BlackwellNativeFP4Linear(nn.Module):
             # Compute per-tensor scale for weight quantization
             # Use dynamic scaling based on tensor absmax
             weight_absmax = weight.abs().max()
-            # FP8 E4M3 max value is 448.0
-            fp8_max = 448.0
-            weight_scale = (weight_absmax / fp8_max).clamp(min=1e-12)
+            weight_scale = (weight_absmax / FP8_E4M3_MAX).clamp(min=1e-12)
             
             # Quantize weight to FP8 E4M3
-            weight_scaled = (weight / weight_scale).clamp(-fp8_max, fp8_max)
+            weight_scaled = (weight / weight_scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
             weight_fp8 = weight_scaled.to(torch.float8_e4m3fn)
             
-            # Store quantized weight (transposed for matmul)
-            # torch._scaled_mm expects weight to be transposed
+            # Store quantized weight (transpose happens in forward pass for torch._scaled_mm)
             self.register_buffer('weight_fp8', weight_fp8.to(original_device))
             self.register_buffer('weight_scale', weight_scale.to(torch.float32).to(original_device))
         
@@ -1381,13 +1382,13 @@ class BlackwellNativeFP4Linear(nn.Module):
             x = x.reshape(-1, x.shape[-1])
         
         # Dynamically quantize input to FP8 E4M3
+        # Note: This is computed per-forward call for dynamic range handling
         with torch.no_grad():
             input_absmax = x.abs().max()
-            fp8_max = 448.0
-            input_scale = (input_absmax / fp8_max).clamp(min=1e-12)
+            input_scale = (input_absmax / FP8_E4M3_MAX).clamp(min=1e-12)
         
         # Quantize input
-        x_scaled = (x / input_scale).clamp(-fp8_max, fp8_max)
+        x_scaled = (x / input_scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
         x_fp8 = x_scaled.to(torch.float8_e4m3fn)
         
         # Prepare scale tensors
