@@ -532,6 +532,34 @@ def fp8_safe_activation(activation_fn, x: torch.Tensor) -> torch.Tensor:
     return result
 
 
+def fp8_safe_add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """
+    FP8-safe addition wrapper for residual connections.
+    
+    PyTorch crashes with "ufunc_add_CUDA" not implemented for 'Float8_e4m3fn'.
+    For FP8 VAE models on Blackwell, cast both tensors to bfloat16 for addition,
+    then cast result back to FP8 to preserve VRAM savings.
+    
+    Args:
+        a: First tensor to add
+        b: Second tensor to add
+        
+    Returns:
+        Sum of tensors in original dtype
+    """
+    original_dtype = a.dtype
+    is_fp8 = hasattr(torch, 'float8_e4m3fn') and original_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    
+    if is_fp8:
+        # Cast both to bfloat16 for the operation
+        result = a.to(torch.bfloat16) + b.to(torch.bfloat16)
+        # Cast back to FP8 for VRAM savings
+        return result.to(original_dtype)
+    else:
+        # Non-FP8 path: direct addition
+        return a + b
+
+
 def remove_head(tensor: Tensor, times: int = 1) -> Tensor:
     """
     Remove duplicated first frame features in the up-sampling process.

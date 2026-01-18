@@ -36,6 +36,7 @@ from .causal_inflation_lib import (
     InflatedCausalConv3d,
     causal_norm_wrapper,
     fp8_safe_activation,
+    fp8_safe_add,
     init_causal_conv3d,
     remove_head,
 )
@@ -339,13 +340,13 @@ class ResnetBlock3D(ResnetBlock2D):
             temb = self.time_emb_proj(temb)[:, :, None, None]
 
         if temb is not None and self.time_embedding_norm == "default":
-            hidden_states = hidden_states + temb
+            hidden_states = fp8_safe_add(hidden_states, temb)
 
         hidden_states = causal_norm_wrapper(self.norm2, hidden_states)
 
         if temb is not None and self.time_embedding_norm == "scale_shift":
             scale, shift = torch.chunk(temb, 2, dim=1)
-            hidden_states = hidden_states * (1 + scale) + shift
+            hidden_states = fp8_safe_add(hidden_states * (1 + scale), shift)
 
         # FP8 safe activation: wraps SiLU to handle FP8 tensors on Blackwell
         hidden_states = fp8_safe_activation(self.nonlinearity, hidden_states)
@@ -356,7 +357,7 @@ class ResnetBlock3D(ResnetBlock2D):
         if self.conv_shortcut is not None:
             input_tensor = self.conv_shortcut(input_tensor, memory_state=memory_state)
 
-        output_tensor = (input_tensor + hidden_states) / self.output_scale_factor
+        output_tensor = fp8_safe_add(input_tensor, hidden_states) / self.output_scale_factor
 
         return output_tensor
 
@@ -827,7 +828,7 @@ class Encoder3D(nn.Module):
                     create_custom_forward(down_block), sample, memory_state, use_reentrant=False
                 )
                 if extra_block is not None:
-                    sample = sample + safe_interpolate_operation(extra_block(extra_cond), size=sample.shape[2:])
+                    sample = fp8_safe_add(sample, safe_interpolate_operation(extra_block(extra_cond), size=sample.shape[2:]))
 
             # middle
             sample = self.mid_block(sample, memory_state=memory_state)
@@ -842,7 +843,7 @@ class Encoder3D(nn.Module):
             for down_block, extra_block in zip(self.down_blocks, self.conv_extra_cond):
                 sample = down_block(sample, memory_state=memory_state)
                 if extra_block is not None:
-                    sample = sample + safe_interpolate_operation(extra_block(extra_cond), size=sample.shape[2:])
+                    sample = fp8_safe_add(sample, safe_interpolate_operation(extra_block(extra_cond), size=sample.shape[2:]))
 
             # middle
             sample = self.mid_block(sample, memory_state=memory_state)
