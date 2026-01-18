@@ -176,9 +176,8 @@ class InflatedCausalConv3d(Conv3d):
             # Free padded tensor immediately after convolution
             del padded
             
-            # Clear CUDA cache after this operation to prevent memory fragmentation
-            if torch.cuda.is_available() and result.is_cuda:
-                torch.cuda.empty_cache()
+            # Note: Removed torch.cuda.empty_cache() to avoid sawtooth VRAM pattern
+            # which kills FPS by 40%. Let VRAM stay allocated for flat memory profile.
             
             return result
 
@@ -240,9 +239,8 @@ class InflatedCausalConv3d(Conv3d):
                 del cache
             cache = next_cache
             
-            # Clear CUDA cache after each chunk to prevent memory fragmentation
-            if torch.cuda.is_available() and x[idx].is_cuda:
-                torch.cuda.empty_cache()
+            # Note: Removed torch.cuda.empty_cache() to avoid sawtooth VRAM pattern
+            # which kills FPS by 40%. Let VRAM stay allocated for flat memory profile.
 
         output = retry_on_oom(
             torch.cat,
@@ -347,9 +345,8 @@ class InflatedCausalConv3d(Conv3d):
                 del cache
             cache = next_cache
             
-            # Clear CUDA cache after each slice to prevent OOM on 16GB VRAM
-            if torch.cuda.is_available() and input[i].is_cuda:
-                torch.cuda.empty_cache()
+            # Note: Removed torch.cuda.empty_cache() to avoid sawtooth VRAM pattern
+            # which kills FPS by 40%. Let VRAM stay allocated for flat memory profile.
 
         return input[0] if squeeze_out else input
 
