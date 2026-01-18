@@ -1236,12 +1236,10 @@ def _probe_bfloat16_support() -> bool:
         raise
 
 BFLOAT16_SUPPORTED = _probe_bfloat16_support()
-# Force FP16 on Blackwell SM_120 for better VAE decoding performance
-# Bfloat16 causes overhead during padding operations on these GPUs
-if BLACKWELL_GPU_DETECTED:
-    COMPUTE_DTYPE = torch.float16
-else:
-    COMPUTE_DTYPE = torch.bfloat16 if BFLOAT16_SUPPORTED else torch.float16
+# Use native FP8 path on Blackwell SM_120 when FP8 VAE models are loaded
+# Do NOT force conversion to FP16/BF16 - let the model dtype propagate naturally
+# Memory cleanup (del tensors, torch.cuda.empty_cache) handles VRAM management
+COMPUTE_DTYPE = torch.bfloat16 if BFLOAT16_SUPPORTED else torch.float16
 
 
 def call_rope_with_stability(method, *args, **kwargs):
