@@ -88,20 +88,23 @@ class InflatedCausalConv3d(Conv3d):
         Bug: PyTorch 2.9-2.10 with cuDNN >= 91002 uses 3x memory for Conv3d 
         with fp16/bfloat16 weights due to buggy dispatch layer.
         
-        FP8 Handling: For Blackwell Tensor Cores, match input dtype to weight dtype
-        to enable native FP8 compute paths.
+        FP8 Handling: cuDNN does not support FP8 convolution directly. 
+        For FP8 VAE models on Blackwell, cast to bfloat16 for convolution,
+        then cast result back to FP8 to preserve VRAM savings.
         
         Workaround: Call torch.cudnn_convolution directly to bypass buggy layer.
         Status is logged at startup in compatibility.py.
         """
-        # FP8 NATIVE PATH: Match input dtype to weight dtype for Blackwell Tensor Core support
+        original_dtype = weight.dtype
+        
+        # FP8 CUDNN BYPASS: cuDNN doesn't support FP8 directly
+        # Cast to bfloat16 for the operation, then cast result back to FP8
         if hasattr(torch, 'float8_e4m3fn') and weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-            # Convert input to FP8 to match weight precision for native Blackwell compute
-            if input.dtype != weight.dtype:
-                input = input.to(weight.dtype)
-            # Ensure bias matches if present
-            if bias is not None and bias.dtype != weight.dtype:
-                bias = bias.to(weight.dtype)
+            # Compute in bfloat16 (cuDNN compatible)
+            input = input.to(torch.bfloat16)
+            weight = weight.to(torch.bfloat16)
+            if bias is not None:
+                bias = bias.to(torch.bfloat16)
         
         if (NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND and 
             weight.dtype in (torch.float16, torch.bfloat16) and 
@@ -116,13 +119,24 @@ class InflatedCausalConv3d(Conv3d):
                 )
                 if bias is not None:
                     out += bias.reshape((1, -1) + (1,) * (out.ndim - 2))
+                
+                # Cast result back to FP8 for VRAM savings on Blackwell
+                if hasattr(torch, 'float8_e4m3fn') and original_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    out = out.to(original_dtype)
+                
                 return out
             except RuntimeError:
                 # Fallback if direct cuDNN call fails (dev builds, edge cases)
                 pass
         
         # Use standard path for unaffected configurations or if workaround failed
-        return super()._conv_forward(input, weight, bias, *args, **kwargs)
+        result = super()._conv_forward(input, weight, bias, *args, **kwargs)
+        
+        # Cast result back to FP8 for VRAM savings on Blackwell
+        if hasattr(torch, 'float8_e4m3fn') and original_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            result = result.to(original_dtype)
+        
+        return result
 
     def memory_limit_conv(
         self,
