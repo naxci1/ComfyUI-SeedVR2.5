@@ -522,11 +522,8 @@ def fp8_safe_activation(activation_fn, x: torch.Tensor) -> torch.Tensor:
         # Cast to bfloat16 for the operation
         x = x.to(torch.bfloat16)
         
-    # Apply activation
-    if callable(activation_fn):
-        result = activation_fn(x)
-    else:
-        result = x  # No-op if not callable
+    # Apply activation (must be callable - activation_fn should always be nn.SiLU or similar)
+    result = activation_fn(x)
     
     # Cast back to FP8 for VRAM savings
     if is_fp8:
