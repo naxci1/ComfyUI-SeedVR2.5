@@ -401,20 +401,42 @@ def init_causal_conv3d(
 
 
 def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """
+    Wrapper for normalization layers that handles FP8 tensors.
+    
+    FP8 Handling: PyTorch doesn't support GroupNorm/LayerNorm in FP8.
+    For FP8 VAE models on Blackwell, cast to bfloat16 for normalization,
+    then cast result back to FP8 to preserve VRAM savings.
+    """
+    # FP8 NORMALIZATION BYPASS: PyTorch doesn't support norm ops in FP8
+    # Cast to bfloat16 for the operation, then cast result back to FP8
+    original_dtype = x.dtype
+    is_fp8 = hasattr(torch, 'float8_e4m3fn') and original_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    
+    if is_fp8:
+        x = x.to(torch.bfloat16)
+    
     if isinstance(norm_layer, (nn.LayerNorm, RMSNorm)):
         if x.ndim == 4:
             x = rearrange(x, "b c h w -> b h w c")
             x = norm_layer(x)
             x = rearrange(x, "b h w c -> b c h w")
+            if is_fp8:
+                x = x.to(original_dtype)
             return x
         if x.ndim == 5:
             x = rearrange(x, "b c t h w -> b t h w c")
             x = norm_layer(x)
             x = rearrange(x, "b t h w c -> b c t h w")
+            if is_fp8:
+                x = x.to(original_dtype)
             return x
     if isinstance(norm_layer, (nn.GroupNorm, nn.BatchNorm2d, nn.SyncBatchNorm)):
         if x.ndim <= 4:
-            return norm_layer(x)
+            result = norm_layer(x)
+            if is_fp8:
+                result = result.to(original_dtype)
+            return result
         if x.ndim == 5:
             t = x.size(2)
             x = rearrange(x, "b c t h w -> (b t) c h w")
@@ -425,8 +447,14 @@ def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
                 num_groups_per_chunk = norm_layer.num_groups // num_chunks
 
                 x = list(x.chunk(num_chunks, dim=1))
-                weights = norm_layer.weight.chunk(num_chunks, dim=0)
-                biases = norm_layer.bias.chunk(num_chunks, dim=0)
+                
+                # For FP8, cast weights to bfloat16 as well
+                if is_fp8:
+                    weights = [w.to(torch.bfloat16) for w in norm_layer.weight.chunk(num_chunks, dim=0)]
+                    biases = [b.to(torch.bfloat16) for b in norm_layer.bias.chunk(num_chunks, dim=0)]
+                else:
+                    weights = norm_layer.weight.chunk(num_chunks, dim=0)
+                    biases = norm_layer.bias.chunk(num_chunks, dim=0)
                 
                 for i, (w, b) in enumerate(zip(weights, biases)):
                     def apply_group_norm():
@@ -447,13 +475,21 @@ def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
                     operation_name="GroupNorm.concat_chunks"
                 )
             else:
-                x = retry_on_oom(
-                    norm_layer,
-                    x,
-                    debug=getattr(norm_layer, 'debug', None),
-                    operation_name="GroupNorm.direct"
-                )
+                # For FP8, cast norm layer weights to bfloat16 for the operation
+                if is_fp8 and isinstance(norm_layer, nn.GroupNorm):
+                    weight_bf16 = norm_layer.weight.to(torch.bfloat16)
+                    bias_bf16 = norm_layer.bias.to(torch.bfloat16) if norm_layer.bias is not None else None
+                    x = F.group_norm(x, norm_layer.num_groups, weight_bf16, bias_bf16, norm_layer.eps)
+                else:
+                    x = retry_on_oom(
+                        norm_layer,
+                        x,
+                        debug=getattr(norm_layer, 'debug', None),
+                        operation_name="GroupNorm.direct"
+                    )
             x = rearrange(x, "(b t) c h w -> b c t h w", t=t)
+            if is_fp8:
+                x = x.to(original_dtype)
             return x
     raise NotImplementedError
 
