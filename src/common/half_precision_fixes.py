@@ -19,11 +19,14 @@ def safe_pad_operation(
     value: float = 0.0
 ) -> torch.Tensor:
     """
-    Safe padding operation with automatic float16 compatibility handling.
+    Safe padding operation with automatic float16/FP8 compatibility handling.
     
     Certain padding modes ('replicate', 'reflect', 'circular') are not implemented
     for float16 on some backends. This function automatically detects failures and
     applies a temporary float32 conversion, then restores the original dtype.
+    
+    For FP8 models (float8_e4m3fn, float8_e5m2), uses memory-efficient path
+    without dtype duplication to avoid VRAM overflow on Blackwell GPUs.
     
     Args:
         x: Input tensor of any dtype
@@ -34,6 +37,9 @@ def safe_pad_operation(
     Returns:
         Padded tensor in original dtype
     """
+    # Check if tensor is FP8 - requires special handling
+    is_fp8 = hasattr(torch, 'float8_e4m3fn') and x.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    
     # Modes that may require float16 compatibility fixes
     problematic_modes = ['replicate', 'reflect', 'circular']
     
@@ -41,15 +47,29 @@ def safe_pad_operation(
         try:
             return F.pad(x, padding, mode=mode, value=value)
         except RuntimeError as e:
-            if "not implemented for 'Half'" in str(e):
+            if "not implemented for 'Half'" in str(e) or "not implemented" in str(e):
                 original_dtype = x.dtype
-                result = F.pad(x.float(), padding, mode=mode, value=value)
+                # For FP8, convert to float16 instead of float32 to save memory
+                if is_fp8:
+                    result = F.pad(x.to(torch.float16), padding, mode=mode, value=value)
+                else:
+                    result = F.pad(x.float(), padding, mode=mode, value=value)
                 return result.to(original_dtype)
             else:
                 raise
     else:
-        # 'constant' and other compatible modes work natively
-        return F.pad(x, padding, mode=mode, value=value)
+        # 'constant' mode works natively for all dtypes including FP8
+        # For FP8, try native path first (memory-efficient)
+        if is_fp8:
+            try:
+                return F.pad(x, padding, mode=mode, value=value)
+            except RuntimeError:
+                # Fallback: convert to float16 (not float32) to minimize VRAM
+                original_dtype = x.dtype
+                result = F.pad(x.to(torch.float16), padding, mode=mode, value=value)
+                return result.to(original_dtype)
+        else:
+            return F.pad(x, padding, mode=mode, value=value)
 
 
 def safe_interpolate_operation(

@@ -12,6 +12,7 @@
 
 from contextlib import nullcontext
 from typing import Literal, Optional, Tuple, Union
+import time as _time_module  # For speed audit logging
 import diffusers
 import torch
 import torch.nn as nn
@@ -34,6 +35,10 @@ from ....common.logger import get_logger
 from .causal_inflation_lib import (
     InflatedCausalConv3d,
     causal_norm_wrapper,
+    fp8_safe_activation,
+    fp8_safe_add,
+    fp8_safe_mul,
+    fp8_safe_div,
     init_causal_conv3d,
     remove_head,
 )
@@ -314,12 +319,8 @@ class ResnetBlock3D(ResnetBlock2D):
         hidden_states = input_tensor
 
         hidden_states = causal_norm_wrapper(self.norm1, hidden_states)
-        hidden_states = retry_on_oom(
-            self.nonlinearity,
-            hidden_states,
-            debug=getattr(self, 'debug', None),
-            operation_name="ResnetBlock3D.nonlinearity"
-        )
+        # FP8 safe activation: wraps SiLU to handle FP8 tensors on Blackwell
+        hidden_states = fp8_safe_activation(self.nonlinearity, hidden_states)
 
         if self.upsample is not None:
             # upsample_nearest_nhwc fails with large batch sizes.
@@ -337,19 +338,21 @@ class ResnetBlock3D(ResnetBlock2D):
 
         if self.time_emb_proj is not None:
             if not self.skip_time_act:
-                temb = self.nonlinearity(temb)
+                temb = fp8_safe_activation(self.nonlinearity, temb)
             temb = self.time_emb_proj(temb)[:, :, None, None]
 
         if temb is not None and self.time_embedding_norm == "default":
-            hidden_states = hidden_states + temb
+            hidden_states = fp8_safe_add(hidden_states, temb)
 
         hidden_states = causal_norm_wrapper(self.norm2, hidden_states)
 
         if temb is not None and self.time_embedding_norm == "scale_shift":
             scale, shift = torch.chunk(temb, 2, dim=1)
-            hidden_states = hidden_states * (1 + scale) + shift
+            # FP8 safe multiply: (1 + scale) could fail on FP8 too, so wrap entire operation
+            hidden_states = fp8_safe_add(fp8_safe_mul(hidden_states, fp8_safe_add(torch.ones_like(scale), scale)), shift)
 
-        hidden_states = self.nonlinearity(hidden_states)
+        # FP8 safe activation: wraps SiLU to handle FP8 tensors on Blackwell
+        hidden_states = fp8_safe_activation(self.nonlinearity, hidden_states)
 
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.conv2(hidden_states, memory_state=memory_state)
@@ -357,7 +360,8 @@ class ResnetBlock3D(ResnetBlock2D):
         if self.conv_shortcut is not None:
             input_tensor = self.conv_shortcut(input_tensor, memory_state=memory_state)
 
-        output_tensor = (input_tensor + hidden_states) / self.output_scale_factor
+        # FP8 safe division: wrap the division to handle FP8 tensors
+        output_tensor = fp8_safe_div(fp8_safe_add(input_tensor, hidden_states), self.output_scale_factor)
 
         return output_tensor
 
@@ -828,7 +832,7 @@ class Encoder3D(nn.Module):
                     create_custom_forward(down_block), sample, memory_state, use_reentrant=False
                 )
                 if extra_block is not None:
-                    sample = sample + safe_interpolate_operation(extra_block(extra_cond), size=sample.shape[2:])
+                    sample = fp8_safe_add(sample, safe_interpolate_operation(extra_block(extra_cond), size=sample.shape[2:]))
 
             # middle
             sample = self.mid_block(sample, memory_state=memory_state)
@@ -843,14 +847,15 @@ class Encoder3D(nn.Module):
             for down_block, extra_block in zip(self.down_blocks, self.conv_extra_cond):
                 sample = down_block(sample, memory_state=memory_state)
                 if extra_block is not None:
-                    sample = sample + safe_interpolate_operation(extra_block(extra_cond), size=sample.shape[2:])
+                    sample = fp8_safe_add(sample, safe_interpolate_operation(extra_block(extra_cond), size=sample.shape[2:]))
 
             # middle
             sample = self.mid_block(sample, memory_state=memory_state)
 
         # post-process
         sample = causal_norm_wrapper(self.conv_norm_out, sample)
-        sample = self.conv_act(sample)
+        # FP8 safe activation: wraps SiLU to handle FP8 tensors on Blackwell
+        sample = fp8_safe_activation(self.conv_act, sample)
         sample = self.conv_out(sample, memory_state=memory_state)
 
         return sample
@@ -1029,7 +1034,8 @@ class Decoder3D(nn.Module):
 
         # post-process
         sample = causal_norm_wrapper(self.conv_norm_out, sample)
-        sample = self.conv_act(sample)
+        # FP8 safe activation: wraps SiLU to handle FP8 tensors on Blackwell
+        sample = fp8_safe_activation(self.conv_act, sample)
         sample = self.conv_out(sample, memory_state=memory_state)
 
         return sample
@@ -1562,6 +1568,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                         end_tile = min(tile_id + 4, num_tiles)
                         self.debug.log(f"Decoding tiles {tile_id}-{end_tile} / {num_tiles}", category="vae", indent_level=1)
 
+                # Decode tile (removed per-tile logging to eliminate cuda.synchronize() overhead)
                 decoded_tile = self.slicing_decode(tile_latent)
 
                 # Initialize result tensors using actual decoded shapes on first tile

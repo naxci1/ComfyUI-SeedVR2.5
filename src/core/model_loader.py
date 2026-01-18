@@ -599,12 +599,20 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
     debug.log(f"{action} {model_type} weights to {target_device_str}{cpu_reason}: {checkpoint_path}", 
              category=model_type_lower, force=True)
     
+    # Detect FP8 VAE models (F8_E4M3 format) for Blackwell optimization
+    is_fp8_vae = model_type_lower == "vae" and ("fp8" in checkpoint_path.lower() or "e4m3" in checkpoint_path.lower())
+    if is_fp8_vae and BLACKWELL_GPU_DETECTED:
+        debug.log("[Kernel] VAE Mode: FP8 (F8_E4M3) detected. Activating Blackwell Tensor Core path.", 
+                 category="kernel", force=True)
+        # Skip dtype override for native FP8 models - preserve F8_E4M3 precision
+        override_dtype = None
+    
     # Load state dict from file
     debug.start_timer(f"{model_type_lower}_weights_load")
     state = load_quantized_state_dict(checkpoint_path, target_device, debug)
     debug.end_timer(f"{model_type_lower}_weights_load", f"{model_type} weights loaded from file")
     
-    # Apply dtype conversion if requested
+    # Apply dtype conversion if requested (skipped for FP8 VAE to preserve native precision)
     if override_dtype is not None:
         state = _convert_state_dtype(state, override_dtype, model_type, debug)
     
@@ -614,8 +622,11 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
     # Handle GGUF or standard loading
     if checkpoint_path.endswith('.gguf'):
         model = _load_gguf_weights(model, state, used_meta, model_type_lower, debug)
+        # Mark model as GGUF for 3-way VAE optimization path
+        model._is_gguf = True
     else:
         model = _load_standard_weights(model, state, used_meta, model_type, model_type_lower, debug)
+        model._is_gguf = False
     
     # Clean up state dict
     del state

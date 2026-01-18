@@ -632,6 +632,148 @@ def release_model_memory(model: Optional[torch.nn.Module], debug: Optional['Debu
             debug.log(f"Failed to release model memory: {e}", level="WARNING", category="memory", force=True)
 
 
+def materialize_meta_tensors(model: torch.nn.Module, device: torch.device, 
+                              dtype: Optional[torch.dtype] = None,
+                              debug: Optional['Debug'] = None) -> int:
+    """
+    Materialize meta tensors to real tensors on the specified device.
+    
+    Meta tensors are placeholder tensors used for memory-efficient model initialization.
+    Before using a model with meta tensors, they must be materialized (converted to real
+    tensors with actual data).
+    
+    This is required for Blackwell optimization where SeedVR2 uses Meta Tensors for
+    efficient initialization.
+    
+    Args:
+        model: Model containing potential meta tensors
+        device: Target device for materialized tensors
+        dtype: Optional dtype for materialized tensors
+        debug: Debug instance for logging
+        
+    Returns:
+        Number of meta tensors materialized
+    """
+    if model is None:
+        return 0
+    
+    materialized_count = 0
+    
+    try:
+        # Build module lookup table once for efficiency
+        modules_dict = dict(model.named_modules())
+        
+        # Materialize meta parameters
+        for name, param in model.named_parameters():
+            if param.is_meta:
+                # Use to_empty to create empty tensor on device, then initialize
+                materialized = torch.nn.Parameter(
+                    torch.empty(param.shape, dtype=dtype or param.dtype, device=device),
+                    requires_grad=param.requires_grad
+                )
+                # Set the parameter on the model
+                parts = name.rsplit('.', 1)
+                if len(parts) == 2:
+                    parent_name, param_name = parts
+                    parent = modules_dict.get(parent_name)
+                    if parent is not None:
+                        setattr(parent, param_name, materialized)
+                else:
+                    setattr(model, name, materialized)
+                materialized_count += 1
+        
+        # Materialize meta buffers
+        for name, buffer in model.named_buffers():
+            if buffer is not None and buffer.is_meta:
+                materialized = torch.empty(buffer.shape, dtype=dtype or buffer.dtype, device=device)
+                # Set the buffer on the model
+                parts = name.rsplit('.', 1)
+                if len(parts) == 2:
+                    parent_name, buffer_name = parts
+                    parent = modules_dict.get(parent_name)
+                    if parent is not None:
+                        parent.register_buffer(buffer_name, materialized)
+                else:
+                    model.register_buffer(name, materialized)
+                materialized_count += 1
+        
+        if debug and materialized_count > 0:
+            debug.log(f"Materialized {materialized_count} meta tensors to {device}", 
+                     category="memory")
+                     
+    except Exception as e:
+        if debug:
+            debug.log(f"Failed to materialize meta tensors: {e}", 
+                     level="WARNING", category="memory", force=True)
+    
+    return materialized_count
+
+
+def safe_model_to_device(model: torch.nn.Module, device: torch.device,
+                         dtype: Optional[torch.dtype] = None,
+                         debug: Optional['Debug'] = None,
+                         model_name: str = "model") -> bool:
+    """
+    Safely move model to device, handling meta tensors correctly.
+    
+    This function handles Blackwell Meta Tensor optimization by:
+    1. Detecting if model contains meta tensors
+    2. Using to_empty() for meta tensors before any to() operations
+    3. Falling back to standard to() for non-meta models
+    
+    Args:
+        model: Model to move
+        device: Target device
+        dtype: Optional target dtype
+        debug: Debug instance for logging
+        model_name: Name for logging
+        
+    Returns:
+        True if model was successfully moved
+    """
+    if model is None:
+        return False
+    
+    try:
+        # Check for meta tensors
+        has_meta_tensors = False
+        for param in model.parameters():
+            if param.is_meta:
+                has_meta_tensors = True
+                break
+        if not has_meta_tensors:
+            for buffer in model.buffers():
+                if buffer is not None and buffer.is_meta:
+                    has_meta_tensors = True
+                    break
+        
+        if has_meta_tensors:
+            if debug:
+                debug.log(f"{model_name} contains meta tensors - materializing to {device}", 
+                         category="memory")
+            
+            # Materialize meta tensors first
+            materialized = materialize_meta_tensors(model, device, dtype, debug)
+            
+            if debug and materialized > 0:
+                debug.log(f"Materialized {materialized} meta tensors for {model_name}", 
+                         category="success")
+        
+        # Now safely move to device
+        if dtype is not None:
+            model.to(device, dtype=dtype)
+        else:
+            model.to(device)
+        
+        return True
+        
+    except Exception as e:
+        if debug:
+            debug.log(f"Failed to move {model_name} to device: {e}", 
+                     level="ERROR", category="memory", force=True)
+        raise
+
+
 def manage_tensor(
     tensor: torch.Tensor,
     target_device: torch.device,
@@ -1067,6 +1209,9 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
     """
     Handle standard (non-BlockSwap) model movement.
     
+    Handles Meta Tensors correctly for Blackwell optimization by using
+    to_empty() before any to() operations on uninitialized meta tensors.
+    
     Args:
         model: Model to move
         current_device: Current device of the model
@@ -1079,12 +1224,32 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
     Returns:
         bool: True if model was moved
     """
-    # Check if model is on meta device - can't move meta tensors
+    # Check if model is on meta device - materialize meta tensors first
     if current_device.type == 'meta':
         if debug:
-            debug.log(f"{model_name} is on meta device - skipping movement (will materialize when needed)", 
+            debug.log(f"{model_name} is on meta device - materializing to {target_device}", 
                      category=model_name.lower())
-        return False
+        # Use safe_model_to_device which handles meta tensor materialization
+        return safe_model_to_device(model, target_device, dtype=None, debug=debug, model_name=model_name)
+    
+    # Check for any meta tensors in the model (even if not all on meta device)
+    has_meta_tensors = False
+    for param in model.parameters():
+        if param.is_meta:
+            has_meta_tensors = True
+            break
+    if not has_meta_tensors:
+        for buffer in model.buffers():
+            if buffer is not None and buffer.is_meta:
+                has_meta_tensors = True
+                break
+    
+    if has_meta_tensors:
+        if debug:
+            debug.log(f"{model_name} contains meta tensors - materializing before movement", 
+                     category=model_name.lower())
+        # Materialize meta tensors first, then move
+        materialize_meta_tensors(model, target_device, dtype=None, debug=debug)
     
     # Determine reason for movement
     reason = reason or "inference requirement"

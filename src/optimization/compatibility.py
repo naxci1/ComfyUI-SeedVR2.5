@@ -1236,6 +1236,8 @@ def _probe_bfloat16_support() -> bool:
         raise
 
 BFLOAT16_SUPPORTED = _probe_bfloat16_support()
+# Default compute dtype for all GPUs - bfloat16 if supported, else float16
+# Model-specific precision (FP8, FP16, etc.) is determined by the loaded model files
 COMPUTE_DTYPE = torch.bfloat16 if BFLOAT16_SUPPORTED else torch.float16
 
 

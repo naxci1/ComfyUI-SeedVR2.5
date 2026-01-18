@@ -143,20 +143,62 @@ class VideoDiffusionInfer():
                 batches = [sample.unsqueeze(0) for sample in samples]
 
             # VAE process by each group.
+            # 3-WAY VAE OPTIMIZATION:
+            # PATH A: FP16 VAE (Standard) - Pure FP16, no upcasting
+            # PATH B: Native FP8 VAE (E4M3FN) - No casting, VAE handles FP8 natively
+            # PATH C: GGUF VAE (Quantized) - Uses GGUF wrappers
             for sample in batches:
                 if hasattr(self.vae, "preprocess"):
                     sample = self.vae.preprocess(sample)
 
-                # Detect VAE model dtype
+                # Detect VAE model dtype and type
                 try:
                     vae_dtype = next(self.vae.parameters()).dtype
                 except StopIteration:
                     vae_dtype = dtype  # Fallback
 
-                # Use autocast if VAE dtype differs from input dtype
-                # Skip autocast on MPS (only supports bf16, unified memory = no benefit)
-                # Instead, explicitly convert input to model dtype
-                if vae_dtype != sample.dtype:
+                # Detect VAE type for 3-way optimization
+                is_fp8_vae = hasattr(torch, 'float8_e4m3fn') and vae_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                is_fp16_vae = vae_dtype == torch.float16
+                is_gguf_vae = hasattr(self.vae, '_is_gguf') and self.vae._is_gguf
+                
+                # Log the zero-casting path for FP8/GGUF VAEs (Blackwell optimization)
+                # FP8/GGUF paths pass input directly without casting - VAE handles precision internally
+                if is_fp8_vae or is_gguf_vae:
+                    vae_type = "FP8" if is_fp8_vae else "GGUF"
+                    self.debug.log(f"VAE encode: {sample.dtype} -> {sample.dtype} (No casting) - {vae_type} native path", category="precision")
+                
+                # PATH B: Native FP8 VAE - No casting, float32 input → VAE handles FP8 natively
+                if is_fp8_vae:
+                    # Native FP8 path - no casting, Blackwell handles FP8 compute natively
+                    if use_sample:
+                        latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size, 
+                                                tile_overlap=self.encode_tile_overlap).latent
+                    else:
+                        latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
+                                            tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
+                # PATH C: GGUF VAE - Uses GGUF wrappers, no dtype conversion
+                elif is_gguf_vae:
+                    # GGUF path - quantized weights handle dtype internally
+                    if use_sample:
+                        latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size, 
+                                                tile_overlap=self.encode_tile_overlap).latent
+                    else:
+                        latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
+                                            tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
+                # PATH A: FP16 VAE (Standard) - Pure FP16, no upcasting to float32
+                elif is_fp16_vae:
+                    # Convert input to FP16 if needed, then pure FP16 path
+                    if sample.dtype != torch.float16:
+                        sample = sample.to(torch.float16)
+                    if use_sample:
+                        latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size, 
+                                                tile_overlap=self.encode_tile_overlap).latent
+                    else:
+                        latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
+                                            tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
+                # Fallback: Other dtypes (bfloat16, float32, etc.)
+                elif vae_dtype != sample.dtype:
                     if device.type == 'mps':
                         # MPS: explicit dtype conversion instead of autocast
                         sample = sample.to(vae_dtype)
@@ -167,7 +209,8 @@ class VideoDiffusionInfer():
                             latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
                                                 tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
                     else:
-                        with torch.autocast(device.type, sample.dtype, enabled=True):
+                        # Use autocast for dtype matching (avoids bf16 forcing)
+                        with torch.autocast(device.type, vae_dtype, enabled=True):
                             if use_sample:
                                 latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size, 
                                                         tile_overlap=self.encode_tile_overlap).latent
@@ -234,15 +277,51 @@ class VideoDiffusionInfer():
                 latent = optimized_channels_to_second(latent)
                 latent = latent.squeeze(2)
 
-                # Detect VAE model dtype
+                # Detect VAE model dtype and type
                 try:
                     vae_dtype = next(self.vae.parameters()).dtype
                 except StopIteration:
                     vae_dtype = dtype  # Fallback
 
-                # Use autocast if VAE dtype differs from latent dtype
-                # Skip autocast on MPS (only supports bf16, unified memory = no benefit)
-                if vae_dtype != latent.dtype:
+                # 3-WAY VAE OPTIMIZATION for decode:
+                # PATH A: FP16 VAE (Standard) - Pure FP16, no upcasting
+                # PATH B: Native FP8 VAE (E4M3FN) - No casting, VAE handles FP8 natively
+                # PATH C: GGUF VAE (Quantized) - Uses GGUF wrappers
+                is_fp8_vae = hasattr(torch, 'float8_e4m3fn') and vae_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                is_fp16_vae = vae_dtype == torch.float16
+                is_gguf_vae = hasattr(self.vae, '_is_gguf') and self.vae._is_gguf
+                
+                # Log the zero-casting path for FP8/GGUF VAEs (Blackwell optimization)
+                if is_fp8_vae or is_gguf_vae:
+                    vae_type = "FP8" if is_fp8_vae else "GGUF"
+                    self.debug.log(f"VAE decode using {vae_type} native path (No casting)", category="precision")
+                
+                # PATH B: Native FP8 VAE - No casting, Blackwell handles FP8 natively
+                if is_fp8_vae:
+                    sample = self.vae.decode(
+                        latent,
+                        tiled=self.decode_tiled, tile_size=self.decode_tile_size,
+                        tile_overlap=self.decode_tile_overlap
+                    ).sample
+                # PATH C: GGUF VAE - Uses GGUF wrappers, no dtype conversion
+                elif is_gguf_vae:
+                    sample = self.vae.decode(
+                        latent,
+                        tiled=self.decode_tiled, tile_size=self.decode_tile_size,
+                        tile_overlap=self.decode_tile_overlap
+                    ).sample
+                # PATH A: FP16 VAE (Standard) - Pure FP16, no upcasting to float32
+                elif is_fp16_vae:
+                    # Convert latent to FP16 if needed, then pure FP16 path
+                    if latent.dtype != torch.float16:
+                        latent = latent.to(torch.float16)
+                    sample = self.vae.decode(
+                        latent,
+                        tiled=self.decode_tiled, tile_size=self.decode_tile_size,
+                        tile_overlap=self.decode_tile_overlap
+                    ).sample
+                # Fallback: Other dtypes (bfloat16, float32, etc.)
+                elif vae_dtype != latent.dtype:
                     if device.type == 'mps':
                         # MPS: explicit dtype conversion instead of autocast
                         latent = latent.to(vae_dtype)
@@ -252,7 +331,8 @@ class VideoDiffusionInfer():
                             tile_overlap=self.decode_tile_overlap
                         ).sample
                     else:
-                        with torch.autocast(device.type, latent.dtype, enabled=True):
+                        # Use autocast for dtype matching (avoids bf16 forcing)
+                        with torch.autocast(device.type, vae_dtype, enabled=True):
                             sample = self.vae.decode(
                                 latent,
                                 tiled=self.decode_tiled, tile_size=self.decode_tile_size,
