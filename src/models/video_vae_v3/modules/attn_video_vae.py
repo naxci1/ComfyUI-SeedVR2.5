@@ -37,6 +37,8 @@ from .causal_inflation_lib import (
     causal_norm_wrapper,
     fp8_safe_activation,
     fp8_safe_add,
+    fp8_safe_mul,
+    fp8_safe_div,
     init_causal_conv3d,
     remove_head,
 )
@@ -346,7 +348,8 @@ class ResnetBlock3D(ResnetBlock2D):
 
         if temb is not None and self.time_embedding_norm == "scale_shift":
             scale, shift = torch.chunk(temb, 2, dim=1)
-            hidden_states = fp8_safe_add(hidden_states * (1 + scale), shift)
+            # FP8 safe multiply: (1 + scale) could fail on FP8 too, so wrap entire operation
+            hidden_states = fp8_safe_add(fp8_safe_mul(hidden_states, fp8_safe_add(torch.ones_like(scale), scale)), shift)
 
         # FP8 safe activation: wraps SiLU to handle FP8 tensors on Blackwell
         hidden_states = fp8_safe_activation(self.nonlinearity, hidden_states)
@@ -357,7 +360,8 @@ class ResnetBlock3D(ResnetBlock2D):
         if self.conv_shortcut is not None:
             input_tensor = self.conv_shortcut(input_tensor, memory_state=memory_state)
 
-        output_tensor = fp8_safe_add(input_tensor, hidden_states) / self.output_scale_factor
+        # FP8 safe division: wrap the division to handle FP8 tensors
+        output_tensor = fp8_safe_div(fp8_safe_add(input_tensor, hidden_states), self.output_scale_factor)
 
         return output_tensor
 
