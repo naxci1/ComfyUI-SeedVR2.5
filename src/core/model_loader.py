@@ -622,8 +622,11 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
     # Handle GGUF or standard loading
     if checkpoint_path.endswith('.gguf'):
         model = _load_gguf_weights(model, state, used_meta, model_type_lower, debug)
+        # Mark model as GGUF for 3-way VAE optimization path
+        model._is_gguf = True
     else:
         model = _load_standard_weights(model, state, used_meta, model_type, model_type_lower, debug)
+        model._is_gguf = False
     
     # Clean up state dict
     del state
