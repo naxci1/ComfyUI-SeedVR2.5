@@ -35,6 +35,7 @@ from ....common.logger import get_logger
 from .causal_inflation_lib import (
     InflatedCausalConv3d,
     causal_norm_wrapper,
+    fp8_safe_activation,
     init_causal_conv3d,
     remove_head,
 )
@@ -315,12 +316,8 @@ class ResnetBlock3D(ResnetBlock2D):
         hidden_states = input_tensor
 
         hidden_states = causal_norm_wrapper(self.norm1, hidden_states)
-        hidden_states = retry_on_oom(
-            self.nonlinearity,
-            hidden_states,
-            debug=getattr(self, 'debug', None),
-            operation_name="ResnetBlock3D.nonlinearity"
-        )
+        # FP8 safe activation: wraps SiLU to handle FP8 tensors on Blackwell
+        hidden_states = fp8_safe_activation(self.nonlinearity, hidden_states)
 
         if self.upsample is not None:
             # upsample_nearest_nhwc fails with large batch sizes.
@@ -338,7 +335,7 @@ class ResnetBlock3D(ResnetBlock2D):
 
         if self.time_emb_proj is not None:
             if not self.skip_time_act:
-                temb = self.nonlinearity(temb)
+                temb = fp8_safe_activation(self.nonlinearity, temb)
             temb = self.time_emb_proj(temb)[:, :, None, None]
 
         if temb is not None and self.time_embedding_norm == "default":
@@ -350,7 +347,8 @@ class ResnetBlock3D(ResnetBlock2D):
             scale, shift = torch.chunk(temb, 2, dim=1)
             hidden_states = hidden_states * (1 + scale) + shift
 
-        hidden_states = self.nonlinearity(hidden_states)
+        # FP8 safe activation: wraps SiLU to handle FP8 tensors on Blackwell
+        hidden_states = fp8_safe_activation(self.nonlinearity, hidden_states)
 
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.conv2(hidden_states, memory_state=memory_state)
@@ -851,7 +849,8 @@ class Encoder3D(nn.Module):
 
         # post-process
         sample = causal_norm_wrapper(self.conv_norm_out, sample)
-        sample = self.conv_act(sample)
+        # FP8 safe activation: wraps SiLU to handle FP8 tensors on Blackwell
+        sample = fp8_safe_activation(self.conv_act, sample)
         sample = self.conv_out(sample, memory_state=memory_state)
 
         return sample
@@ -1030,7 +1029,8 @@ class Decoder3D(nn.Module):
 
         # post-process
         sample = causal_norm_wrapper(self.conv_norm_out, sample)
-        sample = self.conv_act(sample)
+        # FP8 safe activation: wraps SiLU to handle FP8 tensors on Blackwell
+        sample = fp8_safe_activation(self.conv_act, sample)
         sample = self.conv_out(sample, memory_state=memory_state)
 
         return sample

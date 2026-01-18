@@ -500,6 +500,41 @@ def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
     raise NotImplementedError
 
 
+def fp8_safe_activation(activation_fn, x: torch.Tensor) -> torch.Tensor:
+    """
+    Wrapper for activation functions (SiLU, sigmoid, etc.) that handles FP8 tensors.
+    
+    FP8 Handling: PyTorch doesn't support activation ops (silu_cuda, sigmoid_cuda) in FP8.
+    For FP8 VAE models on Blackwell, cast to bfloat16 for activation,
+    then cast result back to FP8 to preserve VRAM savings.
+    
+    Args:
+        activation_fn: The activation function/module to apply (nn.SiLU, F.silu, etc.)
+        x: Input tensor
+        
+    Returns:
+        Activated tensor in original dtype
+    """
+    original_dtype = x.dtype
+    is_fp8 = hasattr(torch, 'float8_e4m3fn') and original_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    
+    if is_fp8:
+        # Cast to bfloat16 for the operation
+        x = x.to(torch.bfloat16)
+        
+    # Apply activation
+    if callable(activation_fn):
+        result = activation_fn(x)
+    else:
+        result = x  # No-op if not callable
+    
+    # Cast back to FP8 for VRAM savings
+    if is_fp8:
+        result = result.to(original_dtype)
+    
+    return result
+
+
 def remove_head(tensor: Tensor, times: int = 1) -> Tensor:
     """
     Remove duplicated first frame features in the up-sampling process.
