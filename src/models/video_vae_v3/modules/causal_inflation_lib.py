@@ -451,10 +451,16 @@ def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
                 # For FP8, cast weights to bfloat16 as well
                 if is_fp8:
                     weights = [w.to(torch.bfloat16) for w in norm_layer.weight.chunk(num_chunks, dim=0)]
-                    biases = [b.to(torch.bfloat16) for b in norm_layer.bias.chunk(num_chunks, dim=0)]
+                    if norm_layer.bias is not None:
+                        biases = [b.to(torch.bfloat16) for b in norm_layer.bias.chunk(num_chunks, dim=0)]
+                    else:
+                        biases = [None] * num_chunks
                 else:
                     weights = norm_layer.weight.chunk(num_chunks, dim=0)
-                    biases = norm_layer.bias.chunk(num_chunks, dim=0)
+                    if norm_layer.bias is not None:
+                        biases = norm_layer.bias.chunk(num_chunks, dim=0)
+                    else:
+                        biases = [None] * num_chunks
                 
                 for i, (w, b) in enumerate(zip(weights, biases)):
                     def apply_group_norm():
