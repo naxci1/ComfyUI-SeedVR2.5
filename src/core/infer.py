@@ -163,9 +163,10 @@ class VideoDiffusionInfer():
                 is_gguf_vae = hasattr(self.vae, '_is_gguf') and self.vae._is_gguf
                 
                 # Log the zero-casting path for FP8/GGUF VAEs (Blackwell optimization)
-                if (is_fp8_vae or is_gguf_vae) and sample.dtype == torch.float32:
+                # FP8/GGUF paths pass input directly without casting - VAE handles precision internally
+                if is_fp8_vae or is_gguf_vae:
                     vae_type = "FP8" if is_fp8_vae else "GGUF"
-                    self.debug.log(f"Moving video_batch from CPU to CUDA:0 (No casting) - {vae_type} VAE native path", category="precision")
+                    self.debug.log(f"VAE encode: {sample.dtype} -> {sample.dtype} (No casting) - {vae_type} native path", category="precision")
                 
                 # PATH B: Native FP8 VAE - No casting, float32 input → VAE handles FP8 natively
                 if is_fp8_vae:
