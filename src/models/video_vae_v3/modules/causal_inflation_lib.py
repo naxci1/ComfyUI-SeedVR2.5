@@ -83,14 +83,26 @@ class InflatedCausalConv3d(Conv3d):
     
     def _conv_forward(self, input, weight, bias, *args, **kwargs):
         """
-        Override _conv_forward to work around NVIDIA Conv3d memory bug.
+        Override _conv_forward to work around NVIDIA Conv3d memory bug and handle FP8.
         
         Bug: PyTorch 2.9-2.10 with cuDNN >= 91002 uses 3x memory for Conv3d 
         with fp16/bfloat16 weights due to buggy dispatch layer.
         
+        FP8 Handling: For Blackwell Tensor Cores, match input dtype to weight dtype
+        to enable native FP8 compute paths.
+        
         Workaround: Call torch.cudnn_convolution directly to bypass buggy layer.
         Status is logged at startup in compatibility.py.
         """
+        # FP8 NATIVE PATH: Match input dtype to weight dtype for Blackwell Tensor Core support
+        if hasattr(torch, 'float8_e4m3fn') and weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            # Convert input to FP8 to match weight precision for native Blackwell compute
+            if input.dtype != weight.dtype:
+                input = input.to(weight.dtype)
+            # Ensure bias matches if present
+            if bias is not None and bias.dtype != weight.dtype:
+                bias = bias.to(weight.dtype)
+        
         if (NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND and 
             weight.dtype in (torch.float16, torch.bfloat16) and 
             hasattr(torch.backends.cudnn, 'is_available') and
