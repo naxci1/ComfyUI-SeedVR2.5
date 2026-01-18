@@ -1236,9 +1236,8 @@ def _probe_bfloat16_support() -> bool:
         raise
 
 BFLOAT16_SUPPORTED = _probe_bfloat16_support()
-# Use native FP8 path on Blackwell SM_120 when FP8 VAE models are loaded
-# Do NOT force conversion to FP16/BF16 - let the model dtype propagate naturally
-# Memory cleanup (del tensors, torch.cuda.empty_cache) handles VRAM management
+# Default compute dtype for all GPUs - bfloat16 if supported, else float16
+# Model-specific precision (FP8, FP16, etc.) is determined by the loaded model files
 COMPUTE_DTYPE = torch.bfloat16 if BFLOAT16_SUPPORTED else torch.float16
 
 
