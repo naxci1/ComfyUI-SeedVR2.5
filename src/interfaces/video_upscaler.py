@@ -123,6 +123,21 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                         "Ideally match to shot length for best quality."
                     )
                 ),
+                io.Combo.Input("decode_vae_divide",
+                    options=["False", "2", "4"],
+                    default="False",
+                    tooltip=(
+                        "Division factor for VAE decoding (default: False = no division).\n"
+                        "Controls how latent chunks are split for decoding.\n"
+                        "\n"
+                        "• False: Decode entire chunk at once (fastest, needs more VRAM)\n"
+                        "• 2: Split each chunk in half (moderate VRAM savings)\n"
+                        "• 4: Split each chunk into quarters (max VRAM savings)\n"
+                        "\n"
+                        "Use 2 or 4 on 16GB GPUs (RTX 5070 Ti) to avoid OOM.\n"
+                        "On RTX 50-series GPUs, bfloat16 is automatically used."
+                    )
+                ),
                 io.Boolean.Input("uniform_batch_size",
                     default=False,
                     tooltip=(
@@ -227,7 +242,8 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
     @classmethod
     def execute(cls, image: torch.Tensor, dit: Dict[str, Any], vae: Dict[str, Any], 
                 seed: int, resolution: int = 1080, max_resolution: int = 0, batch_size: int = 5,
-                uniform_batch_size: bool = False, temporal_overlap: int = 0, prepend_frames: int = 0,
+                decode_vae_divide: str = "False", uniform_batch_size: bool = False, 
+                temporal_overlap: int = 0, prepend_frames: int = 0,
                 color_correction: str = "wavelet", input_noise_scale: float = 0.0,
                 latent_noise_scale: float = 0.0, offload_device: str = "none", 
                 enable_debug: bool = False) -> io.NodeOutput:
@@ -246,6 +262,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             resolution: Target resolution for shortest edge (maintains aspect ratio)
             max_resolution: Maximum resolution for any edge (0 = no limit)
             batch_size: Frames per batch (minimum 5 for temporal consistency)
+            decode_vae_divide: Division factor for VAE decoding ("False", "2", "4")
             uniform_batch_size: Whether to pad final batch to match batch_size
             temporal_overlap: Overlapping frames between batches (0-16)
             prepend_frames: Frames to prepend (0-32) to reduce initial artifacts.
@@ -505,7 +522,8 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 ctx=ctx,
                 debug=debug,
                 progress_callback=progress_callback,
-                cache_model=vae_cache
+                cache_model=vae_cache,
+                decode_vae_divide=decode_vae_divide
             )
 
             # Phase 4: Post-processing
