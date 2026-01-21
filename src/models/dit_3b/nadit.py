@@ -213,9 +213,14 @@ class NaDiT(nn.Module):
         # Video input.
         # Sequence parallel slicing is done inside patching class.
         vid, vid_shape = self.vid_in(vid, vid_shape, cache)
+        
+        # NUMERICAL STABILITY: Clamp initial latents to prevent signal explosion
+        # This stabilizes the input to NVFP4 quantized layers (Blackwell SM120)
+        vid = torch.clamp(vid, -10.0, 10.0)
 
         # Embedding input.
-        emb = self.emb_in(timestep, device=vid.device, dtype=vid.dtype)
+        # NUMERICAL STABILITY: Keep embeddings in FP32 for maximum precision
+        emb = self.emb_in(timestep, device=vid.device, dtype=torch.float32)
 
         # Body
         for i, block in enumerate(self.blocks):

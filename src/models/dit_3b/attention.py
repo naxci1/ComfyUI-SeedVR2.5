@@ -62,11 +62,30 @@ def pytorch_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q=N
         k_i_fp32 = k_i.to(torch.float32)
         v_i_fp32 = v_i.to(torch.float32)
         
-        output_i = F.scaled_dot_product_attention(
-            q_i_fp32, k_i_fp32, v_i_fp32, 
-            dropout_p=dropout_p if not deterministic else 0.0,
-            is_causal=causal
-        )
+        # NUMERICAL STABILITY: Soft-capping attention scores before softmax
+        # This is a known fix for DiT stability on Blackwell (prevents attention explosion)
+        # Compute attention scores manually with soft-cap
+        d_k = q_i_fp32.size(-1)
+        scale = 1.0 / (d_k ** 0.5)
+        attn_scores = torch.matmul(q_i_fp32, k_i_fp32.transpose(-2, -1)) * scale
+        
+        # Apply soft-cap: attn = (attn / scale).tanh() * scale (with scale=30.0 for stability)
+        soft_cap_scale = 30.0
+        attn_scores = torch.tanh(attn_scores / soft_cap_scale) * soft_cap_scale
+        
+        # Apply causal mask if needed
+        if causal:
+            seq_len = attn_scores.size(-2)
+            causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=attn_scores.device, dtype=torch.bool), diagonal=1)
+            attn_scores = attn_scores.masked_fill(causal_mask, float('-inf'))
+        
+        # Softmax and dropout
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        if dropout_p > 0.0 and not deterministic:
+            attn_weights = F.dropout(attn_weights, p=dropout_p)
+        
+        # Apply attention weights to values
+        output_i = torch.matmul(attn_weights, v_i_fp32)
         
         # Convert back to original dtype
         output_i = output_i.to(q_dtype_orig)

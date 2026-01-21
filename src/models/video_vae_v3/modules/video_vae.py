@@ -926,6 +926,10 @@ class VideoAutoencoderKLWrapper(VideoAutoencoderKL):
         if z.dtype not in [torch.float32, torch.bfloat16, torch.float16]:
             z = z.to(torch.bfloat16)
         
+        # NUMERICAL STABILITY: Force-fix any NaN/Inf values before VAE decode
+        # Replaces NaN→0, +Inf→1, -Inf→-1 to prevent black screen from broken pixels
+        z = torch.nan_to_num(z, nan=0.0, posinf=1.0, neginf=-1.0)
+        
         if z.ndim == 4:
             z = z.unsqueeze(2)
         x = super().decode(z).sample.squeeze(2)

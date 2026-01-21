@@ -111,7 +111,10 @@ class NaMMSRTransformerBlock(nn.Module):
         vid_attn, txt_attn = self.ada(vid_attn, txt_attn, layer="attn", mode="in", **ada_kwargs)
         vid_attn, txt_attn = self.attn(vid_attn, txt_attn, vid_shape, txt_shape, cache)
         vid_attn, txt_attn = self.ada(vid_attn, txt_attn, layer="attn", mode="out", **ada_kwargs)
-        vid_attn, txt_attn = (vid_attn + vid), (txt_attn + txt)
+        
+        # NUMERICAL STABILITY: Apply residual scaling to prevent signal explosion
+        # Multiply by 0.99 before adding to skip connection (DiT stability fix for Blackwell)
+        vid_attn, txt_attn = (vid_attn * 0.99 + vid), (txt_attn * 0.99 + txt)
 
         vid_mlp, txt_mlp = self.mlp_norm(vid_attn, txt_attn)
         # ADD BY NUMZ
@@ -123,6 +126,9 @@ class NaMMSRTransformerBlock(nn.Module):
         vid_mlp, txt_mlp = self.ada(vid_mlp, txt_mlp, layer="mlp", mode="in", **ada_kwargs)
         vid_mlp, txt_mlp = self.mlp(vid_mlp, txt_mlp)
         vid_mlp, txt_mlp = self.ada(vid_mlp, txt_mlp, layer="mlp", mode="out", **ada_kwargs)
-        vid_mlp, txt_mlp = (vid_mlp + vid_attn), (txt_mlp + txt_attn)
+        
+        # NUMERICAL STABILITY: Apply residual scaling to prevent signal explosion
+        # Multiply by 0.99 before adding to skip connection (DiT stability fix for Blackwell)
+        vid_mlp, txt_mlp = (vid_mlp * 0.99 + vid_attn), (txt_mlp * 0.99 + txt_attn)
 
         return vid_mlp, txt_mlp, vid_shape, txt_shape
