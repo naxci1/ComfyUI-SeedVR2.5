@@ -100,8 +100,24 @@ def _unpack_4bit_to_fp32(
     # Epsilon prevents division by zero and extreme quantization artifacts
     scale = tl.maximum(scale, 1e-6)  # Increased protection threshold
     
-    # Apply scale
-    fp32_value = base_value * scale
+    # CHECKERBOARD FIX: Smooth scales across adjacent MX blocks
+    scale_idx_next = (offsets + MX_BLOCK_SIZE) // MX_BLOCK_SIZE
+    scale_next = tl.load(scale_ptr + scale_idx_next, mask=mask, other=scale)
+    
+    # Calculate position within MX block for blending
+    block_pos = offsets % MX_BLOCK_SIZE
+    blend = block_pos.to(tl.float32) / MX_BLOCK_SIZE
+    
+    # Smooth transition between blocks
+    scale_smoothed = scale * (1.0 - blend) + scale_next * blend
+    
+    # Apply smoothed scale
+    fp32_value = base_value * scale_smoothed
+    
+    # CHECKERBOARD FIX: Add dithering to smooth quantization
+    dither_noise = ((offsets * 1103515245 + 12345) % 65536).to(tl.float32) / 65536.0
+    dither_noise = (dither_noise - 0.5) * 0.01  # ±0.005 amplitude
+    fp32_value = fp32_value + dither_noise * tl.abs(fp32_value)
     
     # NUMERICAL STABILITY: Clamp output to prevent overflow/underflow
     # BF16 range: -65504 to 65504
@@ -208,8 +224,28 @@ def _nvfp4_matmul_kernel(
         # NUMERICAL STABILITY: Clamp scales to prevent extreme values (black screen fix)
         scales = tl.maximum(scales, 1e-6)  # Increased protection threshold
         
-        # Apply scaling (vectorized)
-        b_unpacked = base_value * scales
+        # CHECKERBOARD FIX: Smooth scales across adjacent MX blocks
+        # Load neighboring scales for interpolation to reduce grid artifacts
+        scale_idx_next = (flat_idx + MX_BLOCK_SIZE) // MX_BLOCK_SIZE
+        scales_next = tl.load(b_scale_ptr + scale_idx_next, mask=b_mask, other=scales)
+        
+        # Calculate position within MX block (0-15)
+        block_pos = flat_idx % MX_BLOCK_SIZE
+        # Blend factor: 0.0 at block start, 1.0 at block end
+        blend = block_pos.to(tl.float32) / MX_BLOCK_SIZE
+        
+        # Linear interpolation between current and next block scales
+        # This smooths the transition between MX blocks and eliminates grid pattern
+        scales_smoothed = scales * (1.0 - blend) + scales_next * blend
+        
+        # Apply scaling (vectorized) with smoothed scales
+        b_unpacked = base_value * scales_smoothed
+        
+        # CHECKERBOARD FIX: Add dithering to smooth 4-bit quantization steps
+        # Use low-amplitude noise based on position to break up visual artifacts
+        dither_noise = ((flat_idx * 1103515245 + 12345) % 65536).to(tl.float32) / 65536.0
+        dither_noise = (dither_noise - 0.5) * 0.01  # ±0.005 amplitude
+        b_unpacked = b_unpacked + dither_noise * tl.abs(b_unpacked)
         
         # NUMERICAL STABILITY: Clamp unpacked weights to prevent overflow
         # This prevents numerical collapse that causes black screen artifacts
