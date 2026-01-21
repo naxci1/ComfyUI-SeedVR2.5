@@ -1061,6 +1061,72 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
         return True
 
 
+def _move_model_with_nvfp4_support(model: torch.nn.Module, target_device: torch.device, 
+                                   debug: Optional['Debug'] = None):
+    """
+    Move model to target device with special handling for NVFP4LinearKernel modules.
+    
+    NVFP4LinearKernel modules may have buffers on meta device that need to be
+    materialized using to_empty() before standard .to() can work.
+    
+    This function:
+    1. Detects NVFP4LinearKernel modules
+    2. Materializes their meta tensor buffers using to_empty()
+    3. Then performs standard model.to(device)
+    
+    Args:
+        model: Model to move
+        target_device: Target device
+        debug: Optional debug instance
+    """
+    try:
+        # Try to import NVFP4LinearKernel
+        from .nvfp4_production import NVFP4LinearKernel
+        has_nvfp4_module = True
+    except ImportError:
+        has_nvfp4_module = False
+    
+    # If NVFP4 module exists, check for NVFP4LinearKernel instances
+    if has_nvfp4_module:
+        nvfp4_modules_found = 0
+        nvfp4_modules_materialized = 0
+        
+        for name, module in model.named_modules():
+            if isinstance(module, NVFP4LinearKernel):
+                nvfp4_modules_found += 1
+                
+                # Check if this module has meta tensors
+                has_meta = any(
+                    hasattr(module, attr) and 
+                    isinstance(getattr(module, attr), torch.Tensor) and
+                    getattr(module, attr).device.type == 'meta'
+                    for attr in ['weight_quantized', 'weight_scale', 'input_scale']
+                )
+                
+                if has_meta:
+                    # Materialize meta tensors to target device
+                    try:
+                        # Use to_empty to allocate memory without copying
+                        module.weight_quantized = torch.empty_like(module.weight_quantized, device=target_device)
+                        module.weight_scale = torch.empty_like(module.weight_scale, device=target_device)
+                        module.input_scale = torch.empty_like(module.input_scale, device=target_device)
+                        module._device = target_device
+                        nvfp4_modules_materialized += 1
+                    except Exception as e:
+                        if debug:
+                            debug.log(f"Warning: Failed to materialize NVFP4 module {name}: {e}", level="warning")
+        
+        if nvfp4_modules_found > 0 and debug:
+            if nvfp4_modules_materialized > 0:
+                debug.log(f"Materialized {nvfp4_modules_materialized}/{nvfp4_modules_found} NVFP4 modules from meta device", 
+                         category="success")
+            else:
+                debug.log(f"Found {nvfp4_modules_found} NVFP4 modules (already materialized)", category="general")
+    
+    # Now perform standard model movement
+    model.to(target_device)
+
+
 def _standard_model_movement(model: torch.nn.Module, current_device: torch.device,
                             target_device: torch.device, target_type: str, model_name: str,
                             debug: Optional['Debug'] = None, reason: Optional[str] = None) -> bool:
@@ -1101,7 +1167,8 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
         debug.start_timer(timer_name)
     
     # Move model and clear gradients
-    model.to(target_device)
+    # Special handling for NVFP4LinearKernel modules to avoid meta tensor errors
+    _move_model_with_nvfp4_support(model, target_device, debug)
     model.zero_grad(set_to_none=True)
     
     # Clear VAE memory buffers when moving to CPU

@@ -289,6 +289,55 @@ class NVFP4LinearKernel(nn.Module):
         except:
             return False
     
+    def _apply(self, fn):
+        """
+        Override _apply to handle meta tensor materialization during device movement.
+        
+        This is critical for compatibility with memory_manager.py which calls model.to(device).
+        Without this override, calling .to() on a model with meta tensors raises:
+        "NotImplementedError: Cannot copy out of meta tensor"
+        
+        Solution: Detect when moving from meta device to a real device, and use
+        to_empty() to allocate memory BEFORE the standard _apply tries to copy data.
+        """
+        # Check if any of our buffers are on meta device
+        has_meta_tensors = any(
+            hasattr(self, name) and 
+            isinstance(getattr(self, name), torch.Tensor) and 
+            getattr(self, name).device.type == 'meta'
+            for name in ['weight_quantized', 'weight_scale', 'input_scale']
+        )
+        
+        # If we have meta tensors and fn is a device conversion function
+        if has_meta_tensors:
+            # Try to extract target device from fn
+            # fn is typically a lambda like: lambda t: t.to(device=...)
+            try:
+                # Create a dummy tensor to test the function
+                dummy = torch.empty(1)
+                result = fn(dummy)
+                target_device = result.device
+                
+                # If moving to a real device (cuda/cpu), materialize first
+                if target_device.type in ['cuda', 'cpu']:
+                    # Use to_empty to allocate memory without copying
+                    # This creates real tensors from meta tensors
+                    self.weight_quantized = torch.empty_like(self.weight_quantized, device=target_device)
+                    self.weight_scale = torch.empty_like(self.weight_scale, device=target_device)
+                    self.input_scale = torch.empty_like(self.input_scale, device=target_device)
+                    
+                    # Update internal device tracker
+                    self._device = target_device
+                    
+                    # Now proceed with normal _apply which will work on real tensors
+                    return super()._apply(fn)
+            except:
+                # If we can't determine the target device, just proceed
+                pass
+        
+        # Standard path: no meta tensors or couldn't handle it specially
+        return super()._apply(fn)
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Kernel-level forward pass using torch._scaled_mm
