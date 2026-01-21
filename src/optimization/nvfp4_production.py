@@ -22,6 +22,8 @@ from dataclasses import dataclass
 
 # NVFP4 configuration
 NVFP4_BLOCK_SIZE = 16
+# Blackwell alignment requirement (16 bytes = 128 bits)
+BLACKWELL_ALIGNMENT = 16
 
 
 @dataclass
@@ -29,13 +31,19 @@ class NVFP4Config:
     """Configuration for NVFP4 quantization"""
     block_size: int = NVFP4_BLOCK_SIZE
     preserve_patterns: Set[str] = None
+    enforce_all_layers: bool = True  # NEW: Force quantization on ALL layers
+    handle_padding: bool = True      # NEW: Handle 16-byte alignment padding
     
     def __post_init__(self):
         if self.preserve_patterns is None:
-            # Preserve critical layers in FP16
-            self.preserve_patterns = {
-                'bias', 'norm', 'embed', 'lm_head', 'cls', 'position'
-            }
+            if self.enforce_all_layers:
+                # Empty set - quantize ALL layers including bias, norm, head
+                self.preserve_patterns = set()
+            else:
+                # Preserve critical layers in FP16 (legacy mode)
+                self.preserve_patterns = {
+                    'bias', 'norm', 'embed', 'lm_head', 'cls', 'position'
+                }
 
 
 def detect_modelopt_quantized_weights(state_dict: Dict[str, torch.Tensor]) -> Tuple[bool, int]:
@@ -124,13 +132,15 @@ class NVFP4LinearKernel(nn.Module):
                                input_scale: Optional[torch.Tensor] = None,
                                block_size: int = 8):
         """
-        Load quantized weights from model-optimizer format.
+        Load quantized weights from model-optimizer format with adaptive padding support.
         
         CRITICAL: This must be called AFTER the module has been moved to a real device
         (not meta device). The module must be materialized first using to_empty().
         
-        Handles 4-bit packing: Model-optimizer packs 2 FP4 weights per byte.
-        If the tensor size doesn't match expected shape, assumes 4-bit packing and unpacks.
+        Handles:
+        1. 4-bit packing: Model-optimizer packs 2 FP4 weights per byte
+        2. 16-byte alignment padding: Weights padded to multiples of 16 for Blackwell
+        3. Dynamic scale broadcasting for padded dimensions
         
         Args:
             weight_quantized: Quantized weight tensor (FP8 E4M3, INT8, or 4-bit packed)
@@ -155,7 +165,7 @@ class NVFP4LinearKernel(nn.Module):
             # Default input scale
             input_scale = torch.ones(1, device=self._device, dtype=torch.float32)
         
-        # Expected shape for this layer
+        # Expected shape for this layer (original dimensions without padding)
         expected_shape = (self.out_features, self.in_features)
         expected_elements = expected_shape[0] * expected_shape[1]
         current_elements = weight_quantized.numel()
@@ -187,6 +197,48 @@ class NVFP4LinearKernel(nn.Module):
             if block_size == 8:
                 block_size = 16  # Adjust for 4-bit quantization
         
+        # ADAPTIVE PADDING DETECTION AND HANDLING
+        # Check if weights are padded for 16-byte alignment (Blackwell requirement)
+        current_elements = weight_quantized.numel()
+        is_padded = current_elements > expected_elements
+        
+        if is_padded:
+            # Padded for Blackwell 16-byte alignment
+            # Calculate padding amount
+            padding_amount = current_elements - expected_elements
+            
+            print(f"INFO: Detected {padding_amount} padded elements (Blackwell alignment)")
+            print(f"  Original shape: {expected_shape} ({expected_elements} elements)")
+            print(f"  Padded shape: ({current_elements} elements)")
+            
+            # Check if scale tensor is also padded
+            # If weight is padded but scale isn't, we need to broadcast scale to padded dimensions
+            num_scales = weight_scale.numel()
+            
+            # Handle scale broadcasting for padded weights
+            if num_scales < current_elements:
+                # Scale is NOT padded to match weight padding
+                # We need to extend the scale tensor to match the padded weight dimensions
+                
+                # For block-wise quantization with padding:
+                # Calculate how many blocks we need for padded weight
+                num_blocks_original = (expected_elements + block_size - 1) // block_size
+                num_blocks_padded = (current_elements + block_size - 1) // block_size
+                
+                if num_scales == num_blocks_original:
+                    # Scale tensor matches original (unpadded) block count
+                    # Extend scale to cover padded blocks
+                    extra_blocks = num_blocks_padded - num_blocks_original
+                    if extra_blocks > 0:
+                        # Replicate last scale for padded blocks
+                        last_scale = weight_scale[-1].unsqueeze(0)
+                        padding_scales = last_scale.repeat(extra_blocks)
+                        weight_scale = torch.cat([weight_scale, padding_scales], dim=0)
+                        print(f"  Extended scale tensor: {num_scales} -> {weight_scale.numel()} elements")
+                
+                # Update num_scales after potential extension
+                num_scales = weight_scale.numel()
+        
         # Convert to FP8 E4M3 if not already
         if weight_quantized.dtype != torch.float8_e4m3fn:
             # If INT8, convert to FP8 E4M3
@@ -195,6 +247,7 @@ class NVFP4LinearKernel(nn.Module):
                 num_elements = weight_quantized.numel()
                 num_scales = weight_scale.numel()
                 
+                # IMPROVED BROADCASTING LOGIC FOR PADDED WEIGHTS
                 # Check if this is block-wise quantization
                 if num_scales * block_size == num_elements:
                     # Block-wise quantization: each scale applies to a block of elements
@@ -204,15 +257,21 @@ class NVFP4LinearKernel(nn.Module):
                     # Ensure we have exactly the right number of elements
                     if weight_scale_expanded.numel() > num_elements:
                         weight_scale_expanded = weight_scale_expanded[:num_elements]
+                    elif weight_scale_expanded.numel() < num_elements:
+                        # Pad with last scale value if needed
+                        padding_needed = num_elements - weight_scale_expanded.numel()
+                        last_scale = weight_scale_expanded[-1].unsqueeze(0)
+                        padding_scales = last_scale.repeat(padding_needed)
+                        weight_scale_expanded = torch.cat([weight_scale_expanded, padding_scales], dim=0)
                     
                     # Dequantize INT8 -> FP32 -> FP8 with block-wise scaling
-                    weight_fp32 = weight_quantized.float() * weight_scale_expanded
+                    weight_fp32 = weight_quantized.float() * weight_scale_expanded.float()
                     weight_quantized = weight_fp32.to(torch.float8_e4m3fn)
                     weight_scale = torch.ones(1, device=self._device, dtype=torch.float32)
                     
                 elif num_scales == num_elements:
                     # Per-element scaling (no expansion needed)
-                    weight_fp32 = weight_quantized.float() * weight_scale
+                    weight_fp32 = weight_quantized.float() * weight_scale.float()
                     weight_quantized = weight_fp32.to(torch.float8_e4m3fn)
                     weight_scale = torch.ones(1, device=self._device, dtype=torch.float32)
                     
@@ -223,43 +282,81 @@ class NVFP4LinearKernel(nn.Module):
                     weight_scale = torch.ones(1, device=self._device, dtype=torch.float32)
                     
                 else:
-                    # Dimension mismatch - log error and use fallback
-                    print(f"WARNING: Scale dimension mismatch: weight={num_elements}, scale={num_scales}, block_size={block_size}")
-                    print(f"Expected: scale * block_size == weight (i.e., {num_scales} * {block_size} == {num_elements})")
-                    print(f"Attempting per-channel scaling fallback...")
+                    # Dimension mismatch - try intelligent broadcasting
+                    print(f"INFO: Attempting adaptive scale broadcasting")
+                    print(f"  Weight elements: {num_elements}, Scale elements: {num_scales}, Block size: {block_size}")
                     
-                    # Try per-channel (per-row or per-column)
-                    weight_shape = weight_quantized.shape
-                    if len(weight_shape) == 2:
+                    # Calculate ratio to determine broadcasting strategy
+                    ratio = num_elements / num_scales
+                    
+                    if ratio == int(ratio) and ratio > 1:
+                        # Can broadcast by repeating each scale
+                        repeat_factor = int(ratio)
+                        weight_scale_expanded = weight_scale.repeat_interleave(repeat_factor)
+                        
+                        # Ensure exact match
+                        if weight_scale_expanded.numel() > num_elements:
+                            weight_scale_expanded = weight_scale_expanded[:num_elements]
+                        elif weight_scale_expanded.numel() < num_elements:
+                            padding_needed = num_elements - weight_scale_expanded.numel()
+                            last_scale = weight_scale_expanded[-1].unsqueeze(0)
+                            padding_scales = last_scale.repeat(padding_needed)
+                            weight_scale_expanded = torch.cat([weight_scale_expanded, padding_scales], dim=0)
+                        
+                        weight_fp32 = weight_quantized.float() * weight_scale_expanded.float()
+                        weight_quantized = weight_fp32.to(torch.float8_e4m3fn)
+                        weight_scale = torch.ones(1, device=self._device, dtype=torch.float32)
+                        print(f"  Adaptive broadcasting successful: repeated {num_scales} scales × {repeat_factor}")
+                    
+                    else:
+                        # Try per-channel (per-row or per-column)
+                        weight_shape = weight_quantized.view(expected_shape[0], -1).shape  # Handle padding
+                        
                         if num_scales == weight_shape[0]:
                             # Per-row scaling
                             weight_scale_expanded = weight_scale.unsqueeze(1).expand(weight_shape)
-                            weight_fp32 = weight_quantized.float() * weight_scale_expanded
-                            weight_quantized = weight_fp32.to(torch.float8_e4m3fn)
+                            weight_fp32 = weight_quantized.view(weight_shape).float() * weight_scale_expanded.float()
+                            weight_quantized = weight_fp32.flatten().to(torch.float8_e4m3fn)
                             weight_scale = torch.ones(1, device=self._device, dtype=torch.float32)
+                            print(f"  Per-row scaling successful")
                         elif num_scales == weight_shape[1]:
                             # Per-column scaling
                             weight_scale_expanded = weight_scale.unsqueeze(0).expand(weight_shape)
-                            weight_fp32 = weight_quantized.float() * weight_scale_expanded
-                            weight_quantized = weight_fp32.to(torch.float8_e4m3fn)
+                            weight_fp32 = weight_quantized.view(weight_shape).float() * weight_scale_expanded.float()
+                            weight_quantized = weight_fp32.flatten().to(torch.float8_e4m3fn)
                             weight_scale = torch.ones(1, device=self._device, dtype=torch.float32)
+                            print(f"  Per-column scaling successful")
                         else:
                             raise ValueError(
-                                f"Cannot match scale dimensions. Weight: {weight_shape}, Scale: {weight_scale.shape}"
+                                f"Cannot match scale dimensions. Weight: {weight_shape}, Scale: {weight_scale.shape}, "
+                                f"Ratio: {ratio}. Expected: scale * block_size == weight"
                             )
                     else:
                         raise ValueError(
                             f"Unsupported weight shape for scaling: {weight_shape}"
                         )
         
-        # Reshape weight_quantized to match expected shape if needed
+        # PADDING SLICING: Handle weights padded for 16-byte alignment
+        # Reshape weight_quantized to match expected shape
         expected_shape = (self.out_features, self.in_features)
+        expected_elements = expected_shape[0] * expected_shape[1]
+        current_elements = weight_quantized.numel()
+        
+        if current_elements > expected_elements:
+            # Padded weights - slice to original dimensions
+            print(f"INFO: Slicing padded weight from {current_elements} to {expected_elements} elements")
+            weight_quantized = weight_quantized.flatten()[:expected_elements]
+            current_elements = weight_quantized.numel()
+        
         if weight_quantized.shape != expected_shape:
-            if weight_quantized.numel() == expected_shape[0] * expected_shape[1]:
+            if current_elements == expected_elements:
+                # Safe to reshape
                 weight_quantized = weight_quantized.reshape(expected_shape)
             else:
                 raise ValueError(
-                    f"Weight shape mismatch: got {weight_quantized.shape}, expected {expected_shape}"
+                    f"Weight shape mismatch after padding handling: "
+                    f"got {weight_quantized.numel()} elements, expected {expected_elements} elements "
+                    f"(target shape: {expected_shape})"
                 )
         
         # Copy data into registered buffers (not assign references)
@@ -270,8 +367,10 @@ class NVFP4LinearKernel(nn.Module):
         self._weights_loaded = True
         
         # Enable kernel dispatch if hardware supports it
+        # BLACKWELL SM120 OPTIMIZATION: Explicitly check for Blackwell architecture
         if self._has_scaled_mm and self._is_blackwell():
             self._use_kernel_dispatch = True
+            print(f"INFO: Blackwell SM120 kernel dispatch enabled for layer {self.out_features}x{self.in_features}")
         else:
             self._use_kernel_dispatch = False
     
@@ -573,6 +672,11 @@ def replace_with_nvfp4_kernel(model: nn.Module,
     
     def _should_preserve(name: str) -> bool:
         """Check if layer should be preserved in FP16"""
+        # If enforce_all_layers is True, quantize everything
+        if config.enforce_all_layers:
+            return False
+        
+        # Otherwise use preserve patterns
         name_lower = name.lower()
         return any(pattern in name_lower for pattern in config.preserve_patterns)
     
