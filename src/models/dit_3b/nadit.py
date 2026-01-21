@@ -221,6 +221,10 @@ class NaDiT(nn.Module):
         # Embedding input.
         # NUMERICAL STABILITY: Keep embeddings in FP32 for maximum precision
         emb = self.emb_in(timestep, device=vid.device, dtype=torch.float32)
+        
+        # Cast embedding to match model's compute dtype (BF16 for NVFP4)
+        # This prevents dtype mismatch errors when embeddings enter BF16 blocks
+        emb = emb.to(vid.dtype)
 
         # Body
         for i, block in enumerate(self.blocks):
