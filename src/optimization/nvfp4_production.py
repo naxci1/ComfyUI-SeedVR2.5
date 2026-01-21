@@ -289,7 +289,7 @@ class NVFP4LinearKernel(nn.Module):
         except:
             return False
     
-    def _apply(self, fn):
+    def _apply(self, fn, *args, **kwargs):
         """
         Override _apply to handle meta tensor materialization during device movement.
         
@@ -299,6 +299,11 @@ class NVFP4LinearKernel(nn.Module):
         
         Solution: Detect when moving from meta device to a real device, and use
         to_empty() to allocate memory BEFORE the standard _apply tries to copy data.
+        
+        Args:
+            fn: Function to apply (typically device conversion lambda)
+            *args: Additional positional arguments (e.g., recurse in PyTorch 2.9+)
+            **kwargs: Additional keyword arguments
         """
         # Check if any of our buffers are on meta device
         has_meta_tensors = any(
@@ -330,13 +335,13 @@ class NVFP4LinearKernel(nn.Module):
                     self._device = target_device
                     
                     # Now proceed with normal _apply which will work on real tensors
-                    return super()._apply(fn)
+                    return super()._apply(fn, *args, **kwargs)
             except:
                 # If we can't determine the target device, just proceed
                 pass
         
         # Standard path: no meta tensors or couldn't handle it specially
-        return super()._apply(fn)
+        return super()._apply(fn, *args, **kwargs)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """

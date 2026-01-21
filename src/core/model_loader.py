@@ -926,6 +926,10 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                     debug.log(f"All parameters successfully materialized to {target_device}", 
                              category="success", force=True)
             
+            # Log final summary with actual quantized layer count
+            debug.log(f"NVFP4 kernel-level execution ready: {replaced_count} quantized layers using hardware FP4", 
+                     category="success", force=True)
+            
             debug.end_timer(f"{model_type_lower}_state_apply", 
                            f"{model_type} weights loaded with kernel-level NVFP4 execution ({replaced_count} layers)")
             debug.log(f"{model_type} configured for hardware FP4 execution on Blackwell Tensor Cores", 
