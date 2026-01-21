@@ -69,8 +69,10 @@ def pytorch_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q=N
         scale = 1.0 / (d_k ** 0.5)
         attn_scores = torch.matmul(q_i_fp32, k_i_fp32.transpose(-2, -1)) * scale
         
-        # Apply soft-cap: attn = (attn / scale).tanh() * scale (with scale=30.0 for stability)
-        soft_cap_scale = 30.0
+        # Apply soft-cap: attn = (attn / scale).tanh() * scale
+        # VISUAL QUALITY: Using scale=20.0 for tighter capping on Blackwell
+        # This helps prevent "visual spikes" that cause pixel artifacts in NVFP4 quantization
+        soft_cap_scale = 20.0
         attn_scores = torch.tanh(attn_scores / soft_cap_scale) * soft_cap_scale
         
         # Apply causal mask if needed

@@ -926,6 +926,13 @@ class VideoAutoencoderKLWrapper(VideoAutoencoderKL):
         if z.dtype not in [torch.float32, torch.bfloat16, torch.float16]:
             z = z.to(torch.bfloat16)
         
+        # VISUAL QUALITY: Soft normalization for 4-bit DiT output
+        # Helps VAE interpret NVFP4-quantized latents more accurately
+        # Prevents visual artifacts while maintaining signal strength
+        z_std = z.std()
+        if z_std > 1e-6:  # Avoid division by zero
+            z = z / z_std * 0.8
+        
         # NUMERICAL STABILITY: Force-fix any NaN/Inf values before VAE decode
         # Replaces NaN→0, +Inf→1, -Inf→-1 to prevent black screen from broken pixels
         z = torch.nan_to_num(z, nan=0.0, posinf=1.0, neginf=-1.0)

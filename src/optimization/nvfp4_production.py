@@ -766,6 +766,11 @@ def replace_with_nvfp4_kernel(model: nn.Module,
         - LayerNorm, RMSNorm: Must stay FP32 for gradient stability
         - Identity layers: Final projection layers, keep FP32
         - Bias terms: Keep FP32 for accuracy
+        
+        VISUAL QUALITY (NVFP4):
+        - input_blocks.0: First layer critical for reconstruction
+        - out_blocks: Final layers critical for output quality
+        - Keep in BF16 instead of 4-bit for spatial feature preservation
         """
         name_lower = name.lower()
         
@@ -773,6 +778,12 @@ def replace_with_nvfp4_kernel(model: nn.Module,
         critical_patterns = ['layernorm', 'rmsnorm', 'groupnorm', 'batchnorm', 
                             'identity', 'ln', '.norm']
         if any(pattern in name_lower for pattern in critical_patterns):
+            return True
+        
+        # VISUAL QUALITY: Preserve first input block and final output blocks
+        # These are critical for image reconstruction quality with NVFP4
+        visual_critical_patterns = ['input_blocks.0', 'out_blocks', 'conv_in', 'conv_out']
+        if any(pattern in name_lower for pattern in visual_critical_patterns):
             return True
         
         # If enforce_all_layers is True, quantize everything EXCEPT critical layers above
