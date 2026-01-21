@@ -331,10 +331,6 @@ class NVFP4LinearKernel(nn.Module):
                                 f"Cannot match scale dimensions. Weight: {weight_shape}, Scale: {weight_scale.shape}, "
                                 f"Ratio: {ratio}. Expected: scale * block_size == weight"
                             )
-                    else:
-                        raise ValueError(
-                            f"Unsupported weight shape for scaling: {weight_shape}"
-                        )
         
         # PADDING SLICING: Handle weights padded for 16-byte alignment
         # Reshape weight_quantized to match expected shape
