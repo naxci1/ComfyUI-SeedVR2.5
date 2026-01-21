@@ -154,48 +154,51 @@ def _nvfp4_matmul_kernel(
         a_ptrs = a_ptr + offs_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
         a = tl.load(a_ptrs, mask=a_mask, other=0.0).to(tl.float32)
         
-        # Load and unpack B block (4-bit packed → FP32)
+        # Load and unpack B block (4-bit packed → FP32) - VECTORIZED
         # B is stored as packed 4-bit (2 values per byte)
         b_mask = ((k + offs_k[:, None]) < K) & (offs_n[None, :] < N)
         
-        # Allocate shared memory for unpacked B
-        b_unpacked = tl.zeros((BLOCK_SIZE_K, BLOCK_SIZE_N), dtype=tl.float32)
+        # Calculate flat indices for all elements in the B block (vectorized)
+        # flat_idx[i, j] = (k + i) * N + j
+        flat_idx = (k + offs_k[:, None]) * N + offs_n[None, :]
         
-        # For each column in the B block
-        for n_idx in range(BLOCK_SIZE_N):
-            if offs_n[n_idx] < N:
-                # For each row in the K dimension
-                for k_idx in range(BLOCK_SIZE_K):
-                    if (k + k_idx) < K:
-                        # Calculate packed index (2 weights per byte)
-                        flat_idx = (k + k_idx) * N + offs_n[n_idx]
-                        byte_idx = flat_idx // 2
-                        is_even = (flat_idx % 2) == 0
-                        
-                        # Load packed byte
-                        packed_byte = tl.load(b_packed_ptr + byte_idx)
-                        
-                        # Extract nibble
-                        nibble = tl.where(is_even, packed_byte & 0x0F, (packed_byte >> 4) & 0x0F)
-                        
-                        # Decode E2M1
-                        sign = (nibble >> 3) & 0x1
-                        exponent = (nibble >> 1) & 0x3
-                        mantissa = nibble & 0x1
-                        
-                        exp_val = tl.where(exponent == 0, 1.0,
-                                  tl.where(exponent == 1, 2.0,
-                                  tl.where(exponent == 2, 4.0, 8.0)))
-                        mantissa_val = 1.0 + mantissa.to(tl.float32) * 0.5
-                        base_value = exp_val * mantissa_val
-                        base_value = tl.where(sign == 1, -base_value, base_value)
-                        
-                        # Load scale (1:16 microscaling)
-                        scale_idx = flat_idx // MX_BLOCK_SIZE
-                        scale = tl.load(b_scale_ptr + scale_idx)
-                        
-                        # Apply scale and store in shared memory
-                        b_unpacked[k_idx, n_idx] = base_value * scale
+        # Calculate byte indices (2 weights per byte)
+        byte_idx = flat_idx // 2
+        is_even = (flat_idx % 2) == 0
+        
+        # Load packed bytes (vectorized)
+        packed_bytes = tl.load(b_packed_ptr + byte_idx, mask=b_mask, other=0)
+        
+        # Extract nibbles (vectorized bitwise operations)
+        # Even indices: lower 4 bits, Odd indices: upper 4 bits
+        nibble = tl.where(is_even, packed_bytes & 0x0F, (packed_bytes >> 4) & 0x0F)
+        
+        # Decode E2M1 format (fully vectorized)
+        # E2M1 format: 1 sign bit + 2 exponent bits + 1 mantissa bit
+        sign = (nibble >> 3) & 0x1
+        exponent = (nibble >> 1) & 0x3
+        mantissa = nibble & 0x1
+        
+        # Calculate exponent value: 2^exponent
+        exp_val = tl.where(exponent == 0, 1.0,
+                  tl.where(exponent == 1, 2.0,
+                  tl.where(exponent == 2, 4.0, 8.0)))
+        
+        # Calculate mantissa value: 1 + m/2
+        mantissa_val = 1.0 + mantissa.to(tl.float32) * 0.5
+        
+        # Calculate base value: exp_val * mantissa_val
+        base_value = exp_val * mantissa_val
+        
+        # Apply sign (vectorized)
+        base_value = tl.where(sign == 1, -base_value, base_value)
+        
+        # Load scales (1:16 microscaling) - vectorized
+        scale_idx = flat_idx // MX_BLOCK_SIZE
+        scales = tl.load(b_scale_ptr + scale_idx, mask=b_mask, other=1.0)
+        
+        # Apply scaling (vectorized)
+        b_unpacked = base_value * scales
         
         # Perform matrix multiplication using Blackwell Tensor Cores
         # input_precision="float32" ensures proper Blackwell dispatch
