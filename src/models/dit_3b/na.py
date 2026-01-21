@@ -15,8 +15,8 @@
 """
 Native Resolution Transformer (NaDiT) tensor manipulation utilities.
 
-TORCH.COMPILE OPTIMIZED VERSION
-================================
+TORCH.COMPILE OPTIMIZED VERSION + MEMORY OPTIMIZATIONS
+========================================================
 This module has been optimized for torch.compile compatibility by eliminating
 data-dependent operations that cause graph breaks:
 
@@ -26,12 +26,47 @@ Key Changes from Original:
 - Replaced list comprehensions with tensor-based splitting
 - Added _tensor_split helper for compile-friendly splitting
 - Proper device management to ensure tensors stay on correct devices
+
+Memory Optimizations (NEW):
+- Checkpointed torch.cat for large concatenations (prevents OOM)
+- Aggressive tensor cleanup after operations
+- Support for gradient checkpointing during upscaling
 """
 
 from itertools import chain
 from typing import Callable, Dict, List, Tuple
 import einops
 import torch
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
+
+
+def _memory_efficient_cat(tensors: list, dim: int = 0, use_checkpoint: bool = None) -> torch.Tensor:
+    """
+    Memory-efficient tensor concatenation with optional gradient checkpointing.
+    
+    For large concatenations (e.g., torch.cat([vid, txt])), this prevents OOM
+    errors by using gradient checkpointing when beneficial.
+    
+    Args:
+        tensors: List of tensors to concatenate
+        dim: Dimension along which to concatenate
+        use_checkpoint: If True, force checkpointing; if None, auto-detect
+        
+    Returns:
+        Concatenated tensor
+    """
+    if use_checkpoint is None:
+        # Auto-detect: use checkpointing for large tensors during training
+        total_elements = sum(t.numel() for t in tensors)
+        use_checkpoint = torch.is_grad_enabled() and total_elements > 10_000_000
+    
+    if use_checkpoint and torch.is_grad_enabled():
+        # Use gradient checkpointing to save memory
+        def cat_fn(*args):
+            return torch.cat(args, dim=dim)
+        return torch_checkpoint(cat_fn, *tensors, use_reentrant=False)
+    else:
+        return torch.cat(tensors, dim=dim)
 
 
 def _tensor_split(tensor: torch.Tensor, lengths: torch.LongTensor, dim: int = 0) -> List[torch.Tensor]:
@@ -225,7 +260,7 @@ def concat_idx(
     vid_idx_len = len(vid_idx)
     
     return (
-        lambda vid, txt: torch.index_select(torch.cat([vid, txt]), 0, tgt_idx),
+        lambda vid, txt: torch.index_select(_memory_efficient_cat([vid, txt], dim=0), 0, tgt_idx),
         lambda all: torch.index_select(all, 0, src_idx).split([vid_idx_len, len(txt_idx)]),
     )
 
@@ -418,8 +453,9 @@ def repeat_concat_idx(
 
     # Note: Using direct indexing instead of torch.index_select for backward compatibility
     # Direct indexing is deterministic even with repeated indices
+    # MEMORY OPTIMIZATION: Use checkpointed cat for large concatenations
     return (
-        lambda vid, txt: torch.cat([vid, txt])[tgt_idx],
+        lambda vid, txt: _memory_efficient_cat([vid, txt], dim=0)[tgt_idx],
         lambda all: unconcat_coalesce(all),
     )
 

@@ -400,9 +400,17 @@ class NVFP4LinearKernel(nn.Module):
         fp8_e4m3_max = 448.0
         input_scale_dynamic = input_absmax / fp8_e4m3_max
         
+        # MEMORY OPTIMIZATION: Store original dtype then delete high-precision input
+        # This frees VRAM immediately before the torch._scaled_mm call
+        original_dtype = x.dtype
+        
         # CRITICAL FIX 3: Only cast to FP8 if dimensions are compatible
         # Blackwell requires input last dimension divisible by 16
         x_fp8 = x.to(torch.float8_e4m3fn)
+        
+        # MEMORY OPTIMIZATION: Delete original input to free VRAM
+        # This is safe because we've already copied to FP8
+        del x
         
         # Get weight scale (already computed during quantization)
         # Ensure it's a single value for Blackwell kernel compatibility
@@ -424,12 +432,12 @@ class NVFP4LinearKernel(nn.Module):
             input_scale_dynamic = input_scale_dynamic.to(dtype=torch.float32)
             weight_scale_val = weight_scale_val.to(dtype=torch.float32)
         
-        # CRITICAL FIX 1: Cast bias to match input dtype
-        # torch._scaled_mm requires bias dtype to match output dtype (x.dtype)
+        # CRITICAL FIX 1: Cast bias to match original input dtype
+        # torch._scaled_mm requires bias dtype to match output dtype
         # Error: "Bias must be BFloat16 but got Half"
         bias_for_kernel = None
         if self.bias is not None:
-            bias_for_kernel = self.bias.to(x.dtype)
+            bias_for_kernel = self.bias.to(original_dtype)
         
         # torch._scaled_mm: Direct hardware kernel dispatch
         # This executes on Blackwell Tensor Cores with native FP8 support
@@ -438,11 +446,15 @@ class NVFP4LinearKernel(nn.Module):
             output = torch._scaled_mm(
                 x_fp8,                    # Input in FP8 E4M3
                 self.weight_quantized.t(), # Weight in FP8 E4M3 (transposed for matmul)
-                bias=bias_for_kernel,     # Bias in x.dtype (BFloat16 or FP16)
-                out_dtype=x.dtype,        # Match input dtype for numerical stability
+                bias=bias_for_kernel,     # Bias in original_dtype (BFloat16 or FP16)
+                out_dtype=original_dtype,  # Match original input dtype for numerical stability
                 scale_a=input_scale_dynamic,  # Input scale (float32, singleton [1])
                 scale_b=weight_scale_val      # Weight scale (float32, singleton [1])
             )
+            
+            # MEMORY OPTIMIZATION: Clear FP8 tensor after use
+            del x_fp8
+            
             return output
         except Exception as e:
             # Log the specific error for debugging
