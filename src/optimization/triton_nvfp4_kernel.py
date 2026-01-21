@@ -201,8 +201,8 @@ def _nvfp4_matmul_kernel(
         b_unpacked = base_value * scales
         
         # Perform matrix multiplication using Blackwell Tensor Cores
-        # input_precision="float32" ensures proper Blackwell dispatch
-        accumulator += tl.dot(a, b_unpacked, input_precision="float32")
+        # input_precision="tf32" enables TensorFloat-32 for Blackwell/Hopper dispatch
+        accumulator += tl.dot(a, b_unpacked, input_precision="tf32")
     
     # Write output
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
