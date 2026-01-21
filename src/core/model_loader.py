@@ -908,8 +908,21 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                 debug.log(f"Force-materializing {replaced_count} NVFP4 kernel layers to {target_device}", 
                          category=model_type_lower, force=True)
                 
-                # Ensure model is on target device
-                model = model.to(target_device)
+                # Check for meta tensors and materialize them first
+                has_meta_tensors = False
+                for param in model.parameters():
+                    if param.device.type == 'meta':
+                        has_meta_tensors = True
+                        break
+                
+                if has_meta_tensors:
+                    # Use to_empty to materialize meta tensors
+                    debug.log(f"Materializing meta tensors with to_empty before device move", 
+                             category=model_type_lower, force=True)
+                    model = model.to_empty(device=target_device)
+                else:
+                    # Standard device move for already-materialized tensors
+                    model = model.to(target_device)
                 
                 # Verify no meta device tensors remain
                 meta_params = []
