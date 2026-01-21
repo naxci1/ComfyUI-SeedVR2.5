@@ -1,10 +1,11 @@
-# Model Conversion Guide: FP16 to NVFP4/NF4
+# Model Conversion Guide: FP16 to Quantized Format (NVIDIA Model-Optimizer)
 
-This guide explains how to convert SeedVR2 models from FP16 `.safetensors` format to 4-bit quantized formats for reduced VRAM usage and improved performance.
+This guide explains how to convert SeedVR2 models from FP16 `.safetensors` format to quantized formats using **NVIDIA Model-Optimizer** - the official NVIDIA toolkit for professional-grade model quantization.
 
 ## Table of Contents
 
-- [Understanding Quantization Formats](#understanding-quantization-formats)
+- [Understanding NVIDIA Model-Optimizer](#understanding-nvidia-model-optimizer)
+- [Quantization Formats](#quantization-formats)
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
@@ -12,24 +13,46 @@ This guide explains how to convert SeedVR2 models from FP16 `.safetensors` forma
 - [Loading Quantized Models in ComfyUI](#loading-quantized-models-in-comfyui)
 - [Troubleshooting](#troubleshooting)
 
-## Understanding Quantization Formats
+## Understanding NVIDIA Model-Optimizer
+
+**NVIDIA Model-Optimizer** (formerly TensorRT Model-Optimizer) is NVIDIA's official open-source library for model optimization. It provides state-of-the-art quantization algorithms with:
+
+- **Professional-grade accuracy**: Advanced algorithms like SmoothQuant, SVDQuant
+- **Hardware optimization**: Native support for Blackwell FP4, Hopper FP8, and more
+- **Production-ready**: Used by NVIDIA TensorRT, TensorRT-LLM, vLLM, and SGLang
+- **Extensive model support**: LLMs, diffusion models, vision models
+
+### Why Use Model-Optimizer?
+
+✅ **Better Quality**: Superior quantization algorithms vs. basic quantization  
+✅ **Official Support**: Maintained and optimized by NVIDIA  
+✅ **Future-Proof**: Support for latest GPU architectures (Blackwell, Hopper)  
+✅ **Open Source**: Available on GitHub with active development  
+
+**GitHub**: https://github.com/NVIDIA/Model-Optimizer  
+**Documentation**: https://nvidia.github.io/Model-Optimizer
+
+## Quantization Formats
+
+This conversion script supports multiple quantization formats via NVIDIA Model-Optimizer:
 
 ### NVFP4 (Native FP4) - Blackwell GPUs Only
 
 **What is it?**
 - NVIDIA's native 4-bit floating point format (E2M1: 2-bit exponent, 1-bit mantissa)
-- Hardware-accelerated on Blackwell 5th Gen Tensor Cores
+- Hardware-accelerated on Blackwell 5th Gen Tensor Cores via Model-Optimizer
 - Specifically designed for RTX 50-series GPUs (RTX 5070, 5080, 5090)
 
 **Performance Benefits:**
 - 2-4x speedup for linear layers vs FP16
 - ~75% VRAM reduction compared to FP16
-- <1% quality degradation with block-wise E4M3 scaling
+- <1% quality degradation with advanced quantization algorithms
 - Native hardware support for maximum efficiency
 
 **Requirements:**
 - NVIDIA RTX 50-series GPU (Blackwell architecture, compute capability 10.0+)
 - PyTorch 2.6+ with CUDA 12.8+
+- NVIDIA Model-Optimizer
 - NVIDIA Driver 565.xx or newer
 
 **When to Use:**
@@ -37,40 +60,86 @@ This guide explains how to convert SeedVR2 models from FP16 `.safetensors` forma
 - You need maximum performance with minimal quality loss
 - VRAM is limited and you want to run larger models
 
-### NF4 (Normal Float 4) - Universal
+### FP8 - Hopper/Blackwell GPUs
 
 **What is it?**
-- Standard 4-bit quantization using Normal Float distribution
-- Implemented via bitsandbytes library
-- Software-based quantization that works on all modern GPUs
+- 8-bit floating point format (E4M3: 4-bit exponent, 3-bit mantissa)
+- Hardware-accelerated on Hopper (H100) and Blackwell GPUs
+- Optimal balance between speed and accuracy
+
+**Performance Benefits:**
+- 1.5-2x speedup for inference vs FP16
+- ~50% VRAM reduction compared to FP16
+- Minimal quality loss (<0.5% typical)
+- Excellent accuracy/performance trade-off
+
+**Requirements:**
+- NVIDIA Hopper (H100) or Blackwell (RTX 50xx) GPU
+- PyTorch 2.0+ with CUDA 11.8+
+- NVIDIA Model-Optimizer
+
+**When to Use:**
+- You have Hopper or Blackwell GPU
+- You want excellent performance with minimal quality loss
+- More conservative than FP4 but still very fast
+
+### INT8 - Universal (Ampere+)
+
+**What is it?**
+- 8-bit integer quantization with SmoothQuant algorithm
+- Works on all modern NVIDIA GPUs (Ampere, Ada, Hopper, Blackwell)
+- Software-optimized with good performance
+
+**Performance Benefits:**
+- ~2x memory reduction vs FP16
+- Good inference speed on all GPUs
+- Excellent accuracy with SmoothQuant
+- Universal compatibility
+
+**Requirements:**
+- NVIDIA GPU with compute capability 8.0+ (Ampere or newer)
+- PyTorch 2.0+
+- NVIDIA Model-Optimizer
+
+**When to Use:**
+- You have RTX 30xx or 40xx GPU
+- You want good memory savings with broad compatibility
+- You prioritize accuracy and compatibility over maximum speed
+
+### NF4 - Fallback (All GPUs)
+
+**What is it?**
+- Normal Float 4-bit quantization via bitsandbytes
+- Software-based fallback when Model-Optimizer not available
+- Works on all modern GPUs
 
 **Performance Benefits:**
 - ~75% VRAM reduction vs FP16
-- Compatible with Ampere (RTX 30xx), Ada Lovelace (RTX 40xx), Hopper, and Blackwell GPUs
-- Good quality preservation with proper calibration
-- Widely supported across frameworks (ComfyUI, diffusers, transformers)
+- Compatible with most NVIDIA GPUs
+- Good quality preservation
+- Widely supported across frameworks
 
 **Requirements:**
-- Any modern NVIDIA GPU (Ampere/Ada/Hopper/Blackwell)
+- Any modern NVIDIA GPU
 - PyTorch 2.0+
 - bitsandbytes library
 
 **When to Use:**
-- You have an RTX 30xx or 40xx GPU (non-Blackwell)
-- You want broad compatibility
+- Model-Optimizer not available
+- You need maximum compatibility
 - VRAM reduction is priority over raw speed
 
 ### Comparison Table
 
-| Feature | NVFP4 | NF4 |
-|---------|-------|-----|
-| GPU Support | RTX 50-series only | All modern GPUs |
-| Implementation | Hardware Tensor Cores | Software (bitsandbytes) |
-| Speed | 2-4x faster (native) | Comparable to FP16 |
-| VRAM Reduction | ~75% | ~75% |
-| Quality Loss | <1% | <2% |
-| PyTorch Version | 2.6+ | 2.0+ |
-| CUDA Version | 12.8+ | Any |
+| Feature | NVFP4 | FP8 | INT8 | NF4 |
+|---------|-------|-----|------|-----|
+| GPU Support | RTX 50-series only | Hopper/Blackwell | Ampere+ | All modern GPUs |
+| Implementation | Hardware (Model-Optimizer) | Hardware (Model-Optimizer) | Software (Model-Optimizer) | Software (bitsandbytes) |
+| Speed | 2-4x faster | 1.5-2x faster | ~1.2x faster | Comparable to FP16 |
+| VRAM Reduction | ~75% | ~50% | ~50% | ~75% |
+| Quality Loss | <1% | <0.5% | <1% | <2% |
+| PyTorch Version | 2.6+ | 2.0+ | 2.0+ | 2.0+ |
+| CUDA Version | 12.8+ | 11.8+ | Any | Any |
 
 ## Requirements
 
@@ -83,9 +152,15 @@ huggingface_hub>=0.20.0
 tqdm>=4.65.0
 ```
 
-### For NF4 Quantization
+### NVIDIA Model-Optimizer (Recommended)
 ```bash
-# Required for NF4 (Normal Float 4) quantization
+# Official NVIDIA quantization toolkit
+nvidia-modelopt[all]>=0.17.0
+```
+
+### Fallback: bitsandbytes
+```bash
+# Only needed if not using Model-Optimizer
 bitsandbytes>=0.41.0
 ```
 
@@ -97,7 +172,7 @@ pip install --pre torch torchvision --index-url https://download.pytorch.org/whl
 
 ## Installation
 
-### Option 1: Install All Dependencies (Recommended)
+### Option 1: Install with Model-Optimizer (Recommended)
 
 ```bash
 # Install core dependencies

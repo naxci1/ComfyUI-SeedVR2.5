@@ -7,14 +7,30 @@ safetensors>=0.4.0             # SafeTensors format support
 huggingface_hub>=0.20.0        # Download models from HuggingFace
 tqdm>=4.65.0                   # Progress bars
 
-# Quantization Support
-bitsandbytes>=0.41.0           # NF4 quantization (works on all modern GPUs)
+# NVIDIA Model-Optimizer (Recommended - Official NVIDIA quantization toolkit)
+# Provides professional-grade quantization with optimal accuracy
+nvidia-modelopt[all]>=0.17.0   # NVIDIA Model-Optimizer with all dependencies
+
+# Quantization Support (Fallback)
+bitsandbytes>=0.41.0           # NF4 quantization fallback for older GPUs (optional if Model-Optimizer is installed)
 
 # Optional: For NVFP4 on Blackwell GPUs (RTX 50-series)
-# Uncomment the line below and run:
+# If you have Blackwell GPU, install PyTorch nightly with CUDA 12.8:
 # pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128
-# torch>=2.6.0  # PyTorch nightly with CUDA 12.8 for native NVFP4 support
 
 # Development/Testing (Optional)
 # pytest>=7.0.0               # For running tests
 # black>=23.0.0               # Code formatting
+
+# Installation Instructions:
+# 
+# For most users (includes NVIDIA Model-Optimizer):
+#   pip install -r requirements-conversion.txt
+#
+# For Blackwell GPUs (RTX 50-series) - install PyTorch nightly FIRST:
+#   pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128
+#   pip install -r requirements-conversion.txt
+#
+# Minimal installation (without Model-Optimizer, uses NF4 fallback):
+#   pip install torch safetensors huggingface_hub tqdm bitsandbytes
+
