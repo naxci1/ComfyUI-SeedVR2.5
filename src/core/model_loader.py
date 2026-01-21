@@ -933,8 +933,10 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                    torch.cuda.synchronize()  # Ensure all previous operations complete
                 
                 # Materialize meta parameters selectively
+                param_counter = 0
                 for name, param in model.named_parameters():
                     # CRITICAL: Skip if this parameter belongs to an NVFP4LinearKernel
                     # Get the parent module to check its type
@@ -965,12 +967,18 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                     # Only materialize if it's on meta device AND not part of NVFP4
                     if param.device.type == 'meta':
                         meta_param_count += 1
+                        param_counter += 1
                         # CRITICAL: Avoid torch.empty_like - use safer allocation
                         # First create on CPU, then move to GPU to prevent pre-allocation
                         try:
                             with torch.no_grad():
+                                # Determine optimal dtype (use bfloat16 for non-quantized layers to save memory)
+                                target_dtype = param.dtype
+                                if target_dtype == torch.float32 or target_dtype == torch.float16:
+                                    target_dtype = torch.bfloat16  # Save memory for non-quantized layers
+                                
                                 # Create tensor on CPU first, then move to target device
-                                new_param = torch.empty(param.shape, dtype=param.dtype, device='cpu')
+                                new_param = torch.empty(param.shape, dtype=target_dtype, device='cpu')
                                 new_param = new_param.to(target_device)
                                 
                                 # Navigate to parent module and replace parameter
@@ -980,8 +988,19 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                                     module = getattr(module, attr)
                                 setattr(module, attrs[-1], torch.nn.Parameter(new_param))
                                 
+                                # CRITICAL: Force GPU synchronization after each parameter
+                                if torch.cuda.is_available():
+                                    torch.cuda.synchronize()
+                                
                                 # Force delete the old meta reference
                                 del param
+                                
+                                # CRITICAL: Empty cache every 50 parameters to prevent fragmentation
+                                if param_counter % 50 == 0:
+                                    gc.collect()
+                                    if torch.cuda.is_available():
+                                        torch.cuda.empty_cache()
+                                        torch.cuda.synchronize()
                         except RuntimeError as e:
                             # If allocation fails, try smaller allocation or skip
                             if debug:
@@ -989,6 +1008,7 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                                          category=model_type_lower, force=True)
                 
                 # Materialize meta buffers selectively
+                buffer_counter = 0
                 for name, buffer in model.named_buffers():
                     # Skip if this buffer belongs to an NVFP4LinearKernel
                     buffer_module_name = '.'.join(name.split('.')[:-1])  # Remove buffer name
@@ -997,11 +1017,17 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                     
                     if buffer.device.type == 'meta':
                         meta_buffer_count += 1
+                        buffer_counter += 1
                         # CRITICAL: Avoid torch.empty_like - use safer allocation
                         try:
                             with torch.no_grad():
+                                # Determine optimal dtype (use bfloat16 for non-quantized buffers to save memory)
+                                target_dtype = buffer.dtype
+                                if target_dtype == torch.float32 or target_dtype == torch.float16:
+                                    target_dtype = torch.bfloat16  # Save memory
+                                
                                 # Create tensor on CPU first, then move to GPU
-                                new_buffer = torch.empty(buffer.shape, dtype=buffer.dtype, device='cpu')
+                                new_buffer = torch.empty(buffer.shape, dtype=target_dtype, device='cpu')
                                 new_buffer = new_buffer.to(target_device)
                                 
                                 # Navigate to parent module and replace buffer
@@ -1011,8 +1037,19 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                                     module = getattr(module, attr)
                                 module.register_buffer(attrs[-1], new_buffer)
                                 
+                                # CRITICAL: Force GPU synchronization after each buffer
+                                if torch.cuda.is_available():
+                                    torch.cuda.synchronize()
+                                
                                 # Force delete the old meta reference
                                 del buffer
+                                
+                                # CRITICAL: Empty cache every 50 buffers to prevent fragmentation
+                                if buffer_counter % 50 == 0:
+                                    gc.collect()
+                                    if torch.cuda.is_available():
+                                        torch.cuda.empty_cache()
+                                        torch.cuda.synchronize()
                         except RuntimeError as e:
                             # If allocation fails, skip this buffer
                             if debug:
@@ -1026,6 +1063,14 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                 if meta_param_count > 0 or meta_buffer_count > 0:
                     debug.log(f"Selectively materialized {meta_param_count} meta parameters and {meta_buffer_count} meta buffers", 
                              category=model_type_lower, force=True)
+                
+                # CRITICAL: Final memory cleanup after materialization
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    # Reset peak memory stats to prevent false OOM on forward pass
+                    torch.cuda.reset_peak_memory_stats()
                 
                 # Move any remaining non-meta tensors to target device
                 try:
