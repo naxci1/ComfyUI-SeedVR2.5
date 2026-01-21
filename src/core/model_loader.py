@@ -903,17 +903,39 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                 debug=debug
             )
             
+            # CRITICAL: Clear memory after NVFP4 loading to prevent double allocation
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                if debug:
+                    allocated = torch.cuda.memory_allocated() / (1024**3)
+                    debug.log(f"VRAM after NVFP4 loading (before meta materialization): {allocated:.2f} GB",
+                             category=model_type_lower, force=True)
+            
             # Force materialize all layers to CUDA
             if used_meta or replaced_count > 0:
-                debug.log(f"Force-materializing {replaced_count} NVFP4 kernel layers to {target_device}", 
+                debug.log(f"Force-materializing non-quantized layers to {target_device}", 
                          category=model_type_lower, force=True)
+                
+                # Get set of NVFP4LinearKernel modules to skip
+                from src.optimization.nvfp4_production import NVFP4LinearKernel
+                nvfp4_modules = set()
+                for name, module in model.named_modules():
+                    if isinstance(module, NVFP4LinearKernel):
+                        nvfp4_modules.add(name)
                 
                 # Selectively materialize only meta tensors (avoids OOM)
                 meta_param_count = 0
                 meta_buffer_count = 0
+                skipped_nvfp4_count = 0
                 
                 # Materialize meta parameters selectively
                 for name, param in model.named_parameters():
+                    # Skip if this parameter belongs to an NVFP4LinearKernel
+                    param_module_name = '.'.join(name.split('.')[:-1])  # Remove parameter name
+                    if param_module_name in nvfp4_modules:
+                        skipped_nvfp4_count += 1
+                        continue
+                    
                     if param.device.type == 'meta':
                         meta_param_count += 1
                         # Replace meta parameter with empty tensor on target device
@@ -928,6 +950,11 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                 
                 # Materialize meta buffers selectively
                 for name, buffer in model.named_buffers():
+                    # Skip if this buffer belongs to an NVFP4LinearKernel
+                    buffer_module_name = '.'.join(name.split('.')[:-1])  # Remove buffer name
+                    if buffer_module_name in nvfp4_modules:
+                        continue
+                    
                     if buffer.device.type == 'meta':
                         meta_buffer_count += 1
                         # Replace meta buffer with empty tensor on target device
@@ -939,6 +966,10 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                             for attr in attrs[:-1]:
                                 module = getattr(module, attr)
                             module.register_buffer(attrs[-1], new_buffer)
+                
+                if skipped_nvfp4_count > 0:
+                    debug.log(f"Skipped {skipped_nvfp4_count} parameters belonging to NVFP4LinearKernel (already on GPU)",
+                             category=model_type_lower, force=True)
                 
                 if meta_param_count > 0 or meta_buffer_count > 0:
                     debug.log(f"Selectively materialized {meta_param_count} meta parameters and {meta_buffer_count} meta buffers", 
