@@ -116,14 +116,16 @@ class NVFP4LinearKernel(nn.Module):
     
     def load_quantized_weights(self, weight_quantized: torch.Tensor, 
                                weight_scale: torch.Tensor,
-                               input_scale: Optional[torch.Tensor] = None):
+                               input_scale: Optional[torch.Tensor] = None,
+                               block_size: int = 8):
         """
         Load quantized weights from model-optimizer format.
         
         Args:
             weight_quantized: Quantized weight tensor (FP8 E4M3 or INT8)
-            weight_scale: Per-tensor or per-channel weight scaling factors
+            weight_scale: Per-tensor or per-block weight scaling factors
             input_scale: Optional input activation scale
+            block_size: Block size for block-wise quantization (default: 8)
         """
         # Move tensors to CUDA explicitly
         self.weight_quantized = weight_quantized.to(self._device)
@@ -139,10 +141,66 @@ class NVFP4LinearKernel(nn.Module):
         if self.weight_quantized.dtype != torch.float8_e4m3fn:
             # If INT8, convert to FP8 E4M3
             if self.weight_quantized.dtype == torch.int8 or self.weight_quantized.dtype == torch.uint8:
-                # Dequantize INT8 -> FP32 -> FP8
-                weight_fp32 = self.weight_quantized.float() * self.weight_scale
-                self.weight_quantized = weight_fp32.to(torch.float8_e4m3fn)
-                self.weight_scale = torch.tensor(1.0, device=self._device, dtype=torch.float32)
+                # Handle block-wise quantization: expand scales to match weight dimensions
+                num_elements = self.weight_quantized.numel()
+                num_scales = self.weight_scale.numel()
+                
+                # Check if this is block-wise quantization
+                if num_scales * block_size == num_elements:
+                    # Block-wise quantization: each scale applies to a block of elements
+                    # Expand scales: [num_blocks] -> [num_blocks, block_size] -> [num_elements]
+                    weight_scale_expanded = self.weight_scale.unsqueeze(-1).repeat(1, block_size).flatten()
+                    
+                    # Ensure we have exactly the right number of elements
+                    if weight_scale_expanded.numel() > num_elements:
+                        weight_scale_expanded = weight_scale_expanded[:num_elements]
+                    
+                    # Dequantize INT8 -> FP32 -> FP8 with block-wise scaling
+                    weight_fp32 = self.weight_quantized.float() * weight_scale_expanded
+                    self.weight_quantized = weight_fp32.to(torch.float8_e4m3fn)
+                    self.weight_scale = torch.tensor(1.0, device=self._device, dtype=torch.float32)
+                    
+                elif num_scales == num_elements:
+                    # Per-element scaling (no expansion needed)
+                    weight_fp32 = self.weight_quantized.float() * self.weight_scale
+                    self.weight_quantized = weight_fp32.to(torch.float8_e4m3fn)
+                    self.weight_scale = torch.tensor(1.0, device=self._device, dtype=torch.float32)
+                    
+                elif num_scales == 1:
+                    # Per-tensor scaling (single scale for all elements)
+                    weight_fp32 = self.weight_quantized.float() * self.weight_scale.item()
+                    self.weight_quantized = weight_fp32.to(torch.float8_e4m3fn)
+                    self.weight_scale = torch.tensor(1.0, device=self._device, dtype=torch.float32)
+                    
+                else:
+                    # Dimension mismatch - log error and use fallback
+                    print(f"WARNING: Scale dimension mismatch: weight={num_elements}, scale={num_scales}, block_size={block_size}")
+                    print(f"Expected: scale * block_size == weight (i.e., {num_scales} * {block_size} == {num_elements})")
+                    print(f"Attempting per-channel scaling fallback...")
+                    
+                    # Try per-channel (per-row or per-column)
+                    weight_shape = self.weight_quantized.shape
+                    if len(weight_shape) == 2:
+                        if num_scales == weight_shape[0]:
+                            # Per-row scaling
+                            weight_scale_expanded = self.weight_scale.unsqueeze(1).expand(weight_shape)
+                            weight_fp32 = self.weight_quantized.float() * weight_scale_expanded
+                            self.weight_quantized = weight_fp32.to(torch.float8_e4m3fn)
+                            self.weight_scale = torch.tensor(1.0, device=self._device, dtype=torch.float32)
+                        elif num_scales == weight_shape[1]:
+                            # Per-column scaling
+                            weight_scale_expanded = self.weight_scale.unsqueeze(0).expand(weight_shape)
+                            weight_fp32 = self.weight_quantized.float() * weight_scale_expanded
+                            self.weight_quantized = weight_fp32.to(torch.float8_e4m3fn)
+                            self.weight_scale = torch.tensor(1.0, device=self._device, dtype=torch.float32)
+                        else:
+                            raise ValueError(
+                                f"Cannot match scale dimensions. Weight: {weight_shape}, Scale: {self.weight_scale.shape}"
+                            )
+                    else:
+                        raise ValueError(
+                            f"Unsupported weight shape for scaling: {weight_shape}"
+                        )
         
         # Enable kernel dispatch if hardware supports it
         if self._has_scaled_mm and self._is_blackwell():
