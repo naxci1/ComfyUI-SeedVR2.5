@@ -98,10 +98,14 @@ def _unpack_4bit_to_fp32(
     
     # NUMERICAL STABILITY: Clamp scale to prevent extreme values
     # Epsilon prevents division by zero and extreme quantization artifacts
-    scale = tl.maximum(scale, 1e-5)
+    scale = tl.maximum(scale, 1e-6)  # Increased protection threshold
     
     # Apply scale
     fp32_value = base_value * scale
+    
+    # NUMERICAL STABILITY: Clamp output to prevent overflow/underflow
+    # BF16 range: -65504 to 65504
+    fp32_value = tl.clamp(fp32_value, -65504.0, 65504.0)
     
     # Store result
     tl.store(unpacked_ptr + offsets, fp32_value, mask=mask)
@@ -201,11 +205,19 @@ def _nvfp4_matmul_kernel(
         scale_idx = flat_idx // MX_BLOCK_SIZE
         scales = tl.load(b_scale_ptr + scale_idx, mask=b_mask, other=1.0)
         
+        # NUMERICAL STABILITY: Clamp scales to prevent extreme values (black screen fix)
+        scales = tl.maximum(scales, 1e-6)  # Increased protection threshold
+        
         # Apply scaling (vectorized)
         b_unpacked = base_value * scales
         
+        # NUMERICAL STABILITY: Clamp unpacked weights to prevent overflow
+        # This prevents numerical collapse that causes black screen artifacts
+        b_unpacked = tl.clamp(b_unpacked, -65504.0, 65504.0)
+        
         # Perform matrix multiplication using Blackwell Tensor Cores
         # input_precision="tf32" enables TensorFloat-32 for Blackwell/Hopper dispatch
+        # Accumulator stays in FP32 for numerical stability
         accumulator += tl.dot(a, b_unpacked, input_precision="tf32")
     
     # Write output
@@ -213,6 +225,10 @@ def _nvfp4_matmul_kernel(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     c_ptrs = c_ptr + offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn
+    
+    # NUMERICAL STABILITY: Final output clamping before write (black screen fix)
+    # Accumulator is in FP32, clamp before storing
+    accumulator = tl.clamp(accumulator, -65504.0, 65504.0)
     
     tl.store(c_ptrs, accumulator, mask=c_mask)
 

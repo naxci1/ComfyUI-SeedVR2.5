@@ -935,6 +935,12 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()  # Ensure all previous operations complete
                 
+                # ASYNC OFFLOAD: Create dedicated CUDA stream for weight materialization
+                # This enables async transfer while compute happens in main stream
+                async_stream = None
+                if torch.cuda.is_available():
+                    async_stream = torch.cuda.Stream(device=target_device)
+                
                 # Materialize meta parameters selectively
                 param_counter = 0
                 for name, param in model.named_parameters():
@@ -977,9 +983,18 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                                 if target_dtype == torch.float32 or target_dtype == torch.float16:
                                     target_dtype = torch.bfloat16  # Save memory for non-quantized layers
                                 
-                                # Create tensor on CPU first, then move to target device
+                                # ASYNC OFFLOAD: Create tensor on CPU with pinned memory for faster transfers
                                 new_param = torch.empty(param.shape, dtype=target_dtype, device='cpu')
-                                new_param = new_param.to(target_device)
+                                if torch.cuda.is_available() and async_stream is not None:
+                                    # Pin memory for async transfer
+                                    new_param = new_param.pin_memory()
+                                    
+                                    # Use async stream for transfer (non-blocking)
+                                    with torch.cuda.stream(async_stream):
+                                        new_param = new_param.to(target_device, non_blocking=True)
+                                else:
+                                    # Fallback to synchronous transfer
+                                    new_param = new_param.to(target_device)
                                 
                                 # Navigate to parent module and replace parameter
                                 module = model
@@ -989,6 +1004,7 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                                 setattr(module, attrs[-1], torch.nn.Parameter(new_param))
                                 
                                 # CRITICAL: Force GPU synchronization after each parameter
+                                # This prevents async queue buildup but allows overlapped transfers
                                 if torch.cuda.is_available():
                                     torch.cuda.synchronize()
                                 
@@ -1026,9 +1042,18 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                                 if target_dtype == torch.float32 or target_dtype == torch.float16:
                                     target_dtype = torch.bfloat16  # Save memory
                                 
-                                # Create tensor on CPU first, then move to GPU
+                                # ASYNC OFFLOAD: Create tensor on CPU with pinned memory for faster transfers
                                 new_buffer = torch.empty(buffer.shape, dtype=target_dtype, device='cpu')
-                                new_buffer = new_buffer.to(target_device)
+                                if torch.cuda.is_available() and async_stream is not None:
+                                    # Pin memory for async transfer
+                                    new_buffer = new_buffer.pin_memory()
+                                    
+                                    # Use async stream for transfer (non-blocking)
+                                    with torch.cuda.stream(async_stream):
+                                        new_buffer = new_buffer.to(target_device, non_blocking=True)
+                                else:
+                                    # Fallback to synchronous transfer
+                                    new_buffer = new_buffer.to(target_device)
                                 
                                 # Navigate to parent module and replace buffer
                                 module = model
