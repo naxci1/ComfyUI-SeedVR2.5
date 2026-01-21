@@ -98,14 +98,18 @@ class NVFP4LinearKernel(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         
-        # Weight storage - will be set from state dict
-        self.register_buffer('weight_quantized', None)  # FP8 E4M3 quantized weights
-        self.register_buffer('weight_scale', None)      # Per-tensor or per-channel scale
-        self.register_buffer('input_scale', None)       # Input activation scale (optional)
+        # Use meta device initially to avoid unnecessary memory allocation
+        init_device = torch.device('meta') if device is None else device
+        
+        # Weight storage - registered as buffers for proper device handling
+        # Initialize on meta device, will be materialized later
+        self.register_buffer('weight_quantized', torch.empty((out_features, in_features), dtype=torch.float8_e4m3fn, device=init_device))
+        self.register_buffer('weight_scale', torch.ones(1, dtype=torch.float32, device=init_device))
+        self.register_buffer('input_scale', torch.ones(1, dtype=torch.float32, device=init_device))
         
         # Bias in FP16 (critical layer, never quantized)
         if bias:
-            self.bias = nn.Parameter(torch.zeros(out_features, dtype=torch.float16, device=device))
+            self.bias = nn.Parameter(torch.zeros(out_features, dtype=torch.float16, device=init_device))
         else:
             self.register_parameter('bias', None)
         
@@ -113,6 +117,7 @@ class NVFP4LinearKernel(nn.Module):
         self._use_kernel_dispatch = False
         self._has_scaled_mm = hasattr(torch, '_scaled_mm')
         self._device = device if device is not None else torch.device('cuda:0')
+        self._weights_loaded = False
     
     def load_quantized_weights(self, weight_quantized: torch.Tensor, 
                                weight_scale: torch.Tensor,
@@ -121,56 +126,66 @@ class NVFP4LinearKernel(nn.Module):
         """
         Load quantized weights from model-optimizer format.
         
+        CRITICAL: This must be called AFTER the module has been moved to a real device
+        (not meta device). The module must be materialized first using to_empty().
+        
         Args:
             weight_quantized: Quantized weight tensor (FP8 E4M3 or INT8)
             weight_scale: Per-tensor or per-block weight scaling factors
             input_scale: Optional input activation scale
             block_size: Block size for block-wise quantization (default: 8)
         """
-        # Move tensors to CUDA explicitly
-        self.weight_quantized = weight_quantized.to(self._device)
-        self.weight_scale = weight_scale.to(self._device)
+        # Verify we're not on meta device
+        if self.weight_quantized.device.type == 'meta':
+            raise RuntimeError(
+                "Cannot load weights into meta tensor. "
+                "Call module.to_empty(device) first to materialize the module."
+            )
+        
+        # Move tensors to target device
+        weight_quantized = weight_quantized.to(self._device)
+        weight_scale = weight_scale.to(self._device)
         
         if input_scale is not None:
-            self.input_scale = input_scale.to(self._device)
+            input_scale = input_scale.to(self._device)
         else:
             # Default input scale
-            self.input_scale = torch.tensor(1.0, device=self._device, dtype=torch.float32)
+            input_scale = torch.ones(1, device=self._device, dtype=torch.float32)
         
         # Convert to FP8 E4M3 if not already
-        if self.weight_quantized.dtype != torch.float8_e4m3fn:
+        if weight_quantized.dtype != torch.float8_e4m3fn:
             # If INT8, convert to FP8 E4M3
-            if self.weight_quantized.dtype == torch.int8 or self.weight_quantized.dtype == torch.uint8:
+            if weight_quantized.dtype == torch.int8 or weight_quantized.dtype == torch.uint8:
                 # Handle block-wise quantization: expand scales to match weight dimensions
-                num_elements = self.weight_quantized.numel()
-                num_scales = self.weight_scale.numel()
+                num_elements = weight_quantized.numel()
+                num_scales = weight_scale.numel()
                 
                 # Check if this is block-wise quantization
                 if num_scales * block_size == num_elements:
                     # Block-wise quantization: each scale applies to a block of elements
                     # Expand scales: [num_blocks] -> [num_blocks, block_size] -> [num_elements]
-                    weight_scale_expanded = self.weight_scale.unsqueeze(-1).repeat(1, block_size).flatten()
+                    weight_scale_expanded = weight_scale.unsqueeze(-1).repeat(1, block_size).flatten()
                     
                     # Ensure we have exactly the right number of elements
                     if weight_scale_expanded.numel() > num_elements:
                         weight_scale_expanded = weight_scale_expanded[:num_elements]
                     
                     # Dequantize INT8 -> FP32 -> FP8 with block-wise scaling
-                    weight_fp32 = self.weight_quantized.float() * weight_scale_expanded
-                    self.weight_quantized = weight_fp32.to(torch.float8_e4m3fn)
-                    self.weight_scale = torch.tensor(1.0, device=self._device, dtype=torch.float32)
+                    weight_fp32 = weight_quantized.float() * weight_scale_expanded
+                    weight_quantized = weight_fp32.to(torch.float8_e4m3fn)
+                    weight_scale = torch.ones(1, device=self._device, dtype=torch.float32)
                     
                 elif num_scales == num_elements:
                     # Per-element scaling (no expansion needed)
-                    weight_fp32 = self.weight_quantized.float() * self.weight_scale
-                    self.weight_quantized = weight_fp32.to(torch.float8_e4m3fn)
-                    self.weight_scale = torch.tensor(1.0, device=self._device, dtype=torch.float32)
+                    weight_fp32 = weight_quantized.float() * weight_scale
+                    weight_quantized = weight_fp32.to(torch.float8_e4m3fn)
+                    weight_scale = torch.ones(1, device=self._device, dtype=torch.float32)
                     
                 elif num_scales == 1:
                     # Per-tensor scaling (single scale for all elements)
-                    weight_fp32 = self.weight_quantized.float() * self.weight_scale.item()
-                    self.weight_quantized = weight_fp32.to(torch.float8_e4m3fn)
-                    self.weight_scale = torch.tensor(1.0, device=self._device, dtype=torch.float32)
+                    weight_fp32 = weight_quantized.float() * weight_scale.item()
+                    weight_quantized = weight_fp32.to(torch.float8_e4m3fn)
+                    weight_scale = torch.ones(1, device=self._device, dtype=torch.float32)
                     
                 else:
                     # Dimension mismatch - log error and use fallback
@@ -179,28 +194,45 @@ class NVFP4LinearKernel(nn.Module):
                     print(f"Attempting per-channel scaling fallback...")
                     
                     # Try per-channel (per-row or per-column)
-                    weight_shape = self.weight_quantized.shape
+                    weight_shape = weight_quantized.shape
                     if len(weight_shape) == 2:
                         if num_scales == weight_shape[0]:
                             # Per-row scaling
-                            weight_scale_expanded = self.weight_scale.unsqueeze(1).expand(weight_shape)
-                            weight_fp32 = self.weight_quantized.float() * weight_scale_expanded
-                            self.weight_quantized = weight_fp32.to(torch.float8_e4m3fn)
-                            self.weight_scale = torch.tensor(1.0, device=self._device, dtype=torch.float32)
+                            weight_scale_expanded = weight_scale.unsqueeze(1).expand(weight_shape)
+                            weight_fp32 = weight_quantized.float() * weight_scale_expanded
+                            weight_quantized = weight_fp32.to(torch.float8_e4m3fn)
+                            weight_scale = torch.ones(1, device=self._device, dtype=torch.float32)
                         elif num_scales == weight_shape[1]:
                             # Per-column scaling
-                            weight_scale_expanded = self.weight_scale.unsqueeze(0).expand(weight_shape)
-                            weight_fp32 = self.weight_quantized.float() * weight_scale_expanded
-                            self.weight_quantized = weight_fp32.to(torch.float8_e4m3fn)
-                            self.weight_scale = torch.tensor(1.0, device=self._device, dtype=torch.float32)
+                            weight_scale_expanded = weight_scale.unsqueeze(0).expand(weight_shape)
+                            weight_fp32 = weight_quantized.float() * weight_scale_expanded
+                            weight_quantized = weight_fp32.to(torch.float8_e4m3fn)
+                            weight_scale = torch.ones(1, device=self._device, dtype=torch.float32)
                         else:
                             raise ValueError(
-                                f"Cannot match scale dimensions. Weight: {weight_shape}, Scale: {self.weight_scale.shape}"
+                                f"Cannot match scale dimensions. Weight: {weight_shape}, Scale: {weight_scale.shape}"
                             )
                     else:
                         raise ValueError(
                             f"Unsupported weight shape for scaling: {weight_shape}"
                         )
+        
+        # Reshape weight_quantized to match expected shape if needed
+        expected_shape = (self.out_features, self.in_features)
+        if weight_quantized.shape != expected_shape:
+            if weight_quantized.numel() == expected_shape[0] * expected_shape[1]:
+                weight_quantized = weight_quantized.reshape(expected_shape)
+            else:
+                raise ValueError(
+                    f"Weight shape mismatch: got {weight_quantized.shape}, expected {expected_shape}"
+                )
+        
+        # Copy data into registered buffers (not assign references)
+        self.weight_quantized.copy_(weight_quantized)
+        self.weight_scale.copy_(weight_scale) if weight_scale.numel() == 1 else self.weight_scale.resize_(weight_scale.shape).copy_(weight_scale)
+        self.input_scale.copy_(input_scale) if input_scale.numel() == 1 else self.input_scale.resize_(input_scale.shape).copy_(input_scale)
+        
+        self._weights_loaded = True
         
         # Enable kernel dispatch if hardware supports it
         if self._has_scaled_mm and self._is_blackwell():
@@ -392,37 +424,48 @@ def replace_with_nvfp4_kernel(model: nn.Module,
                 # No quantized weights for this layer
                 return module
             
-            # Create NVFP4 kernel layer
+            # Create NVFP4 kernel layer on meta device first
             kernel_layer = NVFP4LinearKernel(
                 in_features=module.in_features,
                 out_features=module.out_features,
                 bias=(module.bias is not None),
-                device=device
+                device=None  # Start on meta device
             )
             
-            # Load quantized weights
-            weight_quantized = state_dict[quant_key].to(device)
-            weight_scale = state_dict[scale_key].to(device)
+            # Materialize from meta to real device using to_empty
+            # This allocates real memory without copying data
+            if kernel_layer.weight_quantized.device.type == 'meta':
+                kernel_layer = kernel_layer.to_empty(device=device)
+            
+            # Now load quantized weights (after materialization)
+            weight_quantized = state_dict[quant_key]
+            weight_scale = state_dict[scale_key]
             
             # Check for input scale (optional)
             input_scale_key = f"{param_path.replace('.weight', '')}._input_scale"
             input_scale = state_dict.get(input_scale_key, None)
-            if input_scale is not None:
-                input_scale = input_scale.to(device)
             
+            # Load weights into materialized buffers
             kernel_layer.load_quantized_weights(weight_quantized, weight_scale, input_scale)
             
             # Load bias if exists
             if module.bias is not None:
                 bias_key = param_path.replace('.weight', '.bias')
                 if bias_key in state_dict:
-                    kernel_layer.bias.data = state_dict[bias_key].to(device)
+                    if kernel_layer.bias.device.type == 'meta':
+                        # Materialize bias if still on meta
+                        kernel_layer.bias = nn.Parameter(
+                            torch.empty_like(kernel_layer.bias, device=device)
+                        )
+                    kernel_layer.bias.data.copy_(state_dict[bias_key].to(device))
                 else:
                     # Copy from original module
-                    kernel_layer.bias.data = module.bias.data.to(device)
-            
-            # Ensure layer is on correct device
-            kernel_layer = kernel_layer.to(device)
+                    if module.bias.device.type != 'meta':
+                        if kernel_layer.bias.device.type == 'meta':
+                            kernel_layer.bias = nn.Parameter(
+                                torch.empty_like(kernel_layer.bias, device=device)
+                            )
+                        kernel_layer.bias.data.copy_(module.bias.data.to(device))
             
             replaced_count += 1
             
