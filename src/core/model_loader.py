@@ -917,7 +917,7 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                          category=model_type_lower, force=True)
                 
                 # Get set of NVFP4LinearKernel modules to skip
-                from src.optimization.nvfp4_production import NVFP4LinearKernel
+                from ..optimization.nvfp4_production import NVFP4LinearKernel
                 nvfp4_modules = set()
                 for name, module in model.named_modules():
                     if isinstance(module, NVFP4LinearKernel):
