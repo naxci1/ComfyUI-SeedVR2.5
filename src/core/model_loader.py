@@ -845,15 +845,79 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                           debug: Optional['Debug'] = None) -> torch.nn.Module:
     """Load standard (non-GGUF) weights into model."""
     debug.start_timer(f"{model_type_lower}_state_apply")
-    model.load_state_dict(state, strict=False, assign=True)
     
-    action = "materialized" if used_meta else "applied"
-    debug.end_timer(f"{model_type_lower}_state_apply", f"{model_type} weights {action}")
+    # Check if this is an NVFP4 quantized model
+    has_nvfp4_weights = any('_nvfp4_data' in k or '_nvfp4_scales' in k for k in state.keys())
     
-    if used_meta:
-        debug.log(f"{model_type} materialized directly from meta with loaded weights", category=model_type_lower)
+    if has_nvfp4_weights and NVFP4_AVAILABLE:
+        debug.log(f"Detected NVFP4 quantized weights - preparing native FP4 execution", 
+                 category=model_type_lower)
+        
+        # Import here to avoid circular dependency
+        from ..optimization.nvfp4 import replace_linear_with_nvfp4_native, NVFP4Config
+        
+        # First load the state dict normally
+        model.load_state_dict(state, strict=False, assign=True)
+        
+        # Replace Linear layers with NVFP4LinearNative for hardware FP4 execution
+        model = replace_linear_with_nvfp4_native(
+            model, 
+            state, 
+            config=NVFP4Config(),
+            enable_native=True,  # Enable native FP4 execution on Blackwell
+            debug=debug
+        )
+        
+        # Force materialize all layers from meta device to CUDA
+        if used_meta:
+            # Get target device from first parameter that's not on meta
+            target_device = None
+            for param in model.parameters():
+                if param.device.type != 'meta':
+                    target_device = param.device
+                    break
+            
+            # If still on meta, get from state dict
+            if target_device is None and state:
+                for tensor in state.values():
+                    if isinstance(tensor, torch.Tensor):
+                        target_device = tensor.device
+                        break
+            
+            # Materialize any remaining meta tensors
+            if target_device is not None:
+                debug.log(f"Force-materializing NVFP4 layers to {target_device}", 
+                         category=model_type_lower)
+                
+                for name, param in model.named_parameters():
+                    if param.device.type == 'meta':
+                        # This should not happen after replace_linear_with_nvfp4_native,
+                        # but handle it just in case
+                        debug.log(f"Warning: Parameter {name} still on meta device after NVFP4 replacement", 
+                                 level="WARNING", category=model_type_lower, force=True)
+                
+                # Ensure all buffers are materialized too
+                for name, buffer in model.named_buffers():
+                    if buffer is not None and buffer.device.type == 'meta':
+                        debug.log(f"Materializing buffer {name} from meta to {target_device}", 
+                                 category=model_type_lower)
+        
+        debug.end_timer(f"{model_type_lower}_state_apply", 
+                       f"{model_type} weights loaded with native NVFP4 execution")
+        debug.log(f"{model_type} configured for hardware FP4 execution on Blackwell Tensor Cores", 
+                 category="success")
     else:
-        debug.log(f"{model_type} weights applied", category=model_type_lower)
+        # Standard loading path (non-NVFP4)
+        model.load_state_dict(state, strict=False, assign=True)
+        
+        action = "materialized" if used_meta else "applied"
+        debug.end_timer(f"{model_type_lower}_state_apply", f"{model_type} weights {action}")
+        
+        if used_meta:
+            debug.log(f"{model_type} materialized directly from meta with loaded weights", 
+                     category=model_type_lower)
+        else:
+            debug.log(f"{model_type} weights applied", category=model_type_lower)
     
     return model
 

@@ -916,6 +916,7 @@ def replace_linear_with_nvfp4_native(model: nn.Module, state_dict: Dict[str, tor
     - Maps scaling factors to hardware-accelerated FP4 GEMM
     - Bypasses PyTorch autograd for direct CUDA kernel dispatch
     - Preserves critical layers (bias, norm, embed) in FP16
+    - Force-materializes layers from meta device to target device
     
     Args:
         model: PyTorch model with Linear layers to replace
@@ -925,7 +926,7 @@ def replace_linear_with_nvfp4_native(model: nn.Module, state_dict: Dict[str, tor
         debug: Debug instance for logging
         
     Returns:
-        Modified model with NVFP4LinearNative layers
+        Modified model with NVFP4LinearNative layers properly materialized
         
     Raises:
         RuntimeError: If Blackwell GPU not detected but native execution requested
@@ -939,59 +940,92 @@ def replace_linear_with_nvfp4_native(model: nn.Module, state_dict: Dict[str, tor
                      "Falling back to dequantization mode.", category="nvfp4")
         enable_native = False
     
+    # Determine target device from state_dict
+    target_device = None
+    for tensor in state_dict.values():
+        if isinstance(tensor, torch.Tensor):
+            target_device = tensor.device
+            break
+    
+    if target_device is None:
+        target_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    if debug:
+        debug.log(f"NVFP4 layer replacement target device: {target_device}", category="nvfp4")
+    
     replaced_count = 0
     preserved_count = 0
     
-    def _replace_module(parent: nn.Module, name: str, module: nn.Module):
+    def _replace_module(parent: nn.Module, name: str, module: nn.Module, full_path: str = ""):
         """Recursively replace Linear layers"""
         nonlocal replaced_count, preserved_count
         
         if isinstance(module, nn.Linear):
+            # Build full parameter path for this layer
+            param_path = f"{full_path}.weight" if full_path else f"{name}.weight"
+            
             # Check if this layer should be preserved in FP16
-            full_name = f"{parent.__class__.__name__}.{name}"
-            if should_preserve_precision(full_name, config):
+            if should_preserve_precision(param_path, config):
                 preserved_count += 1
                 return module
             
             # Check if we have NVFP4 weights for this layer
-            weight_key = f"{name}.weight"
-            packed_key = f"{weight_key}._nvfp4_data"
-            scales_key = f"{weight_key}._nvfp4_scales"
+            packed_key = f"{param_path}._nvfp4_data"
+            scales_key = f"{param_path}._nvfp4_scales"
             
             has_nvfp4_weights = (packed_key in state_dict and scales_key in state_dict)
             
             if has_nvfp4_weights:
-                # Create native NVFP4 linear layer
+                # Create native NVFP4 linear layer with proper device
                 nvfp4_layer = NVFP4LinearNative(
                     in_features=module.in_features,
                     out_features=module.out_features,
                     bias=(module.bias is not None),
                     block_size=config.block_size,
-                    device=next(module.parameters()).device if list(module.parameters()) else None
+                    device=target_device  # Use target device instead of module's device
                 )
                 
-                # Load quantized weights
+                # Load quantized weights (already on target_device from state_dict)
                 packed_data = state_dict[packed_key]
                 scales = state_dict[scales_key]
                 
+                # Ensure weights are on target device
+                if packed_data.device != target_device:
+                    packed_data = packed_data.to(target_device)
+                if scales.device != target_device:
+                    scales = scales.to(target_device)
+                
                 nvfp4_layer.set_nvfp4_weight(packed_data, scales, enable_native=enable_native)
                 
-                # Copy bias if exists
+                # Copy bias if exists, ensuring it's on target device
                 if module.bias is not None:
-                    nvfp4_layer.bias.data = module.bias.data.clone()
+                    if module.bias.device.type == 'meta':
+                        # Bias is on meta device, get from state dict or initialize
+                        bias_key = f"{param_path.replace('.weight', '.bias')}"
+                        if bias_key in state_dict:
+                            nvfp4_layer.bias.data = state_dict[bias_key].to(target_device)
+                        else:
+                            # Initialize bias to zeros on target device
+                            nvfp4_layer.bias.data.zero_()
+                    else:
+                        nvfp4_layer.bias.data = module.bias.data.to(target_device)
+                
+                # Force materialize the layer to target device
+                nvfp4_layer = nvfp4_layer.to(target_device)
                 
                 replaced_count += 1
                 
                 if debug:
                     native_status = "NATIVE FP4" if nvfp4_layer._use_native_fp4 else "DEQUANT FALLBACK"
-                    debug.log(f"Replaced Linear layer '{name}' with NVFP4LinearNative ({native_status})",
+                    debug.log(f"Replaced Linear layer '{param_path}' with NVFP4LinearNative ({native_status}) on {target_device}",
                              category="nvfp4")
                 
                 return nvfp4_layer
         
         # Recursively process child modules
         for child_name, child_module in list(module.named_children()):
-            new_module = _replace_module(module, child_name, child_module)
+            child_full_path = f"{full_path}.{child_name}" if full_path else child_name
+            new_module = _replace_module(module, child_name, child_module, child_full_path)
             if new_module is not child_module:
                 setattr(module, child_name, new_module)
         
@@ -999,7 +1033,7 @@ def replace_linear_with_nvfp4_native(model: nn.Module, state_dict: Dict[str, tor
     
     # Start replacement from root
     for name, module in list(model.named_children()):
-        new_module = _replace_module(model, name, module)
+        new_module = _replace_module(model, name, module, name)
         if new_module is not module:
             setattr(model, name, new_module)
     
@@ -1008,6 +1042,8 @@ def replace_linear_with_nvfp4_native(model: nn.Module, state_dict: Dict[str, tor
         debug.log(f"NVFP4 layer replacement complete: {replaced_count} replaced (native FP4), "
                  f"{preserved_count} preserved (FP16), {total} total",
                  category="nvfp4")
+    
+    return model
     
     return model
     if checkpoint_path.endswith('.safetensors'):
