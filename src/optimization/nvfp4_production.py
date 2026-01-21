@@ -670,7 +670,14 @@ def replace_with_nvfp4_kernel(model: nn.Module,
         return None, None
     
     def _replace_module(parent: nn.Module, name: str, module: nn.Module, full_path: str = ""):
-        """Recursively replace Linear layers"""
+        """
+        Recursively replace Linear layers with NVFP4LinearKernel.
+        
+        OPTIMIZED FOR 16GB VRAM:
+        - Each layer is moved to GPU individually (not whole model at once)
+        - Memory cleanup after every 50 layers
+        - Avoids peak VRAM spikes during materialization
+        """
         nonlocal replaced_count
         
         if isinstance(module, nn.Linear):
@@ -696,10 +703,19 @@ def replace_with_nvfp4_kernel(model: nn.Module,
                 device=None  # Start on meta device
             )
             
-            # Materialize from meta to real device using to_empty
-            # This allocates real memory without copying data
+            # LAYER-BY-LAYER MATERIALIZATION (prevents OOM)
+            # Move THIS layer to GPU only (not entire model)
             if kernel_layer.weight_quantized.device.type == 'meta':
-                kernel_layer = kernel_layer.to_empty(device=device)
+                # Materialize weight_quantized buffer
+                kernel_layer.weight_quantized = torch.empty_like(
+                    kernel_layer.weight_quantized, device=device
+                )
+            
+            if kernel_layer.weight_scale.device.type == 'meta':
+                # Materialize weight_scale buffer
+                kernel_layer.weight_scale = torch.empty_like(
+                    kernel_layer.weight_scale, device=device
+                )
             
             # Now load quantized weights (after materialization)
             weight_quantized = state_dict[quant_key]
@@ -724,7 +740,7 @@ def replace_with_nvfp4_kernel(model: nn.Module,
                     kernel_layer.bias.data.copy_(state_dict[bias_key].to(device))
                 else:
                     # Copy from original module
-                    if module.bias.device.type != 'meta':
+                    if module.bias is not None and module.bias.device.type != 'meta':
                         if kernel_layer.bias.device.type == 'meta':
                             kernel_layer.bias = nn.Parameter(
                                 torch.empty_like(kernel_layer.bias, device=device)
@@ -733,7 +749,16 @@ def replace_with_nvfp4_kernel(model: nn.Module,
             
             replaced_count += 1
             
-            if debug:
+            # MEMORY CLEANUP: Clear cache every 50 layers
+            if replaced_count % 50 == 0:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    if debug:
+                        allocated = torch.cuda.memory_allocated() / (1024**3)  # GB
+                        debug.log(f"Memory cleanup at layer {replaced_count} - VRAM allocated: {allocated:.2f} GB",
+                                 category="nvfp4")
+            
+            if debug and replaced_count % 50 == 1:
                 dispatch_mode = "KERNEL" if kernel_layer._use_kernel_dispatch else "DEQUANT"
                 debug.log(f"Replaced {param_path} with NVFP4LinearKernel ({dispatch_mode})",
                          category="nvfp4")
@@ -759,25 +784,24 @@ def replace_with_nvfp4_kernel(model: nn.Module,
         debug.log(f"NVFP4 kernel replacement complete: {replaced_count} layers replaced",
                  category="success")
     
-    # CRITICAL: After replacement, ensure entire model is materialized
-    # Check if model still has any meta tensors
-    has_meta = any(p.device.type == 'meta' for p in model.parameters())
-    if not has_meta:
-        for buffer in model.buffers():
-            if buffer.device.type == 'meta':
-                has_meta = True
-                break
+    # OPTIMIZED: Final materialization check (but DO NOT materialize entire model at once)
+    # Count remaining meta tensors
+    meta_param_count = sum(1 for p in model.parameters() if p.device.type == 'meta')
+    meta_buffer_count = sum(1 for b in model.buffers() if b.device.type == 'meta')
     
-    if has_meta:
+    if meta_param_count > 0 or meta_buffer_count > 0:
         if debug:
-            debug.log(f"Materializing remaining meta tensors to {device}", category="nvfp4")
-        
-        # Use to_empty to materialize any remaining meta tensors
-        # This is safe because NVFP4 layers already have their weights loaded
-        model = model.to_empty(device=device)
-        
+            debug.log(f"WARNING: {meta_param_count} parameters and {meta_buffer_count} buffers still on meta device",
+                     category="nvfp4")
+            debug.log("These are likely non-Linear layers that should stay on CPU/meta during loading",
+                     category="nvfp4")
+    
+    # Final memory cleanup
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        allocated = torch.cuda.memory_allocated() / (1024**3)  # GB
         if debug:
-            debug.log("Model fully materialized - no meta tensors remain", category="success")
+            debug.log(f"Final VRAM usage after NVFP4 loading: {allocated:.2f} GB", category="success")
     
     return model, replaced_count
 
