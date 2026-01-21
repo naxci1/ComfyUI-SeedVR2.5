@@ -928,6 +928,12 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                 meta_buffer_count = 0
                 skipped_nvfp4_count = 0
                 
+                # CRITICAL: Force memory cleanup before materialization loop
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
                 # Materialize meta parameters selectively
                 for name, param in model.named_parameters():
                     # CRITICAL: Skip if this parameter belongs to an NVFP4LinearKernel
@@ -959,15 +965,28 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                     # Only materialize if it's on meta device AND not part of NVFP4
                     if param.device.type == 'meta':
                         meta_param_count += 1
-                        # Replace meta parameter with empty tensor on target device
-                        with torch.no_grad():
-                            new_param = torch.empty_like(param, device=target_device)
-                            # Navigate to parent module and replace parameter
-                            module = model
-                            attrs = name.split('.')
-                            for attr in attrs[:-1]:
-                                module = getattr(module, attr)
-                            setattr(module, attrs[-1], torch.nn.Parameter(new_param))
+                        # CRITICAL: Avoid torch.empty_like - use safer allocation
+                        # First create on CPU, then move to GPU to prevent pre-allocation
+                        try:
+                            with torch.no_grad():
+                                # Create tensor on CPU first, then move to target device
+                                new_param = torch.empty(param.shape, dtype=param.dtype, device='cpu')
+                                new_param = new_param.to(target_device)
+                                
+                                # Navigate to parent module and replace parameter
+                                module = model
+                                attrs = name.split('.')
+                                for attr in attrs[:-1]:
+                                    module = getattr(module, attr)
+                                setattr(module, attrs[-1], torch.nn.Parameter(new_param))
+                                
+                                # Force delete the old meta reference
+                                del param
+                        except RuntimeError as e:
+                            # If allocation fails, try smaller allocation or skip
+                            if debug:
+                                debug.log(f"Warning: Could not materialize parameter {name}: {e}",
+                                         category=model_type_lower, force=True)
                 
                 # Materialize meta buffers selectively
                 for name, buffer in model.named_buffers():
@@ -978,15 +997,27 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                     
                     if buffer.device.type == 'meta':
                         meta_buffer_count += 1
-                        # Replace meta buffer with empty tensor on target device
-                        with torch.no_grad():
-                            new_buffer = torch.empty_like(buffer, device=target_device)
-                            # Navigate to parent module and replace buffer
-                            module = model
-                            attrs = name.split('.')
-                            for attr in attrs[:-1]:
-                                module = getattr(module, attr)
-                            module.register_buffer(attrs[-1], new_buffer)
+                        # CRITICAL: Avoid torch.empty_like - use safer allocation
+                        try:
+                            with torch.no_grad():
+                                # Create tensor on CPU first, then move to GPU
+                                new_buffer = torch.empty(buffer.shape, dtype=buffer.dtype, device='cpu')
+                                new_buffer = new_buffer.to(target_device)
+                                
+                                # Navigate to parent module and replace buffer
+                                module = model
+                                attrs = name.split('.')
+                                for attr in attrs[:-1]:
+                                    module = getattr(module, attr)
+                                module.register_buffer(attrs[-1], new_buffer)
+                                
+                                # Force delete the old meta reference
+                                del buffer
+                        except RuntimeError as e:
+                            # If allocation fails, skip this buffer
+                            if debug:
+                                debug.log(f"Warning: Could not materialize buffer {name}: {e}",
+                                         category=model_type_lower, force=True)
                 
                 if skipped_nvfp4_count > 0:
                     debug.log(f"Skipped {skipped_nvfp4_count} parameters belonging to NVFP4LinearKernel (already on GPU)",
