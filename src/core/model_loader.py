@@ -846,7 +846,80 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
     """Load standard (non-GGUF) weights into model."""
     debug.start_timer(f"{model_type_lower}_state_apply")
     
-    # Check if this is an NVFP4 quantized model
+    # Try production-ready NVFP4 kernel implementation first
+    use_production_nvfp4 = False
+    try:
+        from ..optimization.nvfp4_production import (
+            detect_modelopt_quantized_weights,
+            replace_with_nvfp4_kernel,
+            NVFP4Config
+        )
+        use_production_nvfp4 = True
+    except ImportError:
+        pass
+    
+    if use_production_nvfp4:
+        # Detect model-optimizer quantized weights with correct key mapping
+        has_quantized, num_quantized = detect_modelopt_quantized_weights(state)
+        
+        if has_quantized and NVFP4_AVAILABLE:
+            debug.log(f"Detected {num_quantized} model-optimizer quantized layers - preparing kernel-level FP4 execution", 
+                     category=model_type_lower, force=True)
+            
+            # First load the state dict normally
+            model.load_state_dict(state, strict=False, assign=True)
+            
+            # Get target device from state dict
+            target_device = None
+            for tensor in state.values():
+                if isinstance(tensor, torch.Tensor):
+                    target_device = tensor.device
+                    break
+            
+            if target_device is None:
+                target_device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+            
+            # Replace Linear layers with NVFP4LinearKernel for kernel-level execution
+            model, replaced_count = replace_with_nvfp4_kernel(
+                model, 
+                state, 
+                config=NVFP4Config(),
+                device=target_device,
+                debug=debug
+            )
+            
+            # Force materialize all layers to CUDA
+            if used_meta or replaced_count > 0:
+                debug.log(f"Force-materializing {replaced_count} NVFP4 kernel layers to {target_device}", 
+                         category=model_type_lower, force=True)
+                
+                # Ensure model is on target device
+                model = model.to(target_device)
+                
+                # Verify no meta device tensors remain
+                meta_params = []
+                for name, param in model.named_parameters():
+                    if param.device.type == 'meta':
+                        meta_params.append(name)
+                
+                if meta_params:
+                    debug.log(f"ERROR: {len(meta_params)} parameters still on meta device after materialization!", 
+                             level="ERROR", category=model_type_lower, force=True)
+                    for param_name in meta_params[:5]:  # Show first 5
+                        debug.log(f"  - {param_name}", level="ERROR", category=model_type_lower, force=True)
+                else:
+                    debug.log(f"All parameters successfully materialized to {target_device}", 
+                             category="success", force=True)
+            
+            debug.end_timer(f"{model_type_lower}_state_apply", 
+                           f"{model_type} weights loaded with kernel-level NVFP4 execution ({replaced_count} layers)")
+            debug.log(f"{model_type} configured for hardware FP4 execution on Blackwell Tensor Cores", 
+                     category="success", force=True)
+            
+            return model
+    
+    # Fallback: Original NVFP4 implementation or standard loading
+    # Check if this is an NVFP4 quantized model (old format)
     has_nvfp4_weights = any('_nvfp4_data' in k or '_nvfp4_scales' in k for k in state.keys())
     
     if has_nvfp4_weights and NVFP4_AVAILABLE:
