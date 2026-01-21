@@ -930,12 +930,33 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                 
                 # Materialize meta parameters selectively
                 for name, param in model.named_parameters():
-                    # Skip if this parameter belongs to an NVFP4LinearKernel
+                    # CRITICAL: Skip if this parameter belongs to an NVFP4LinearKernel
+                    # Get the parent module to check its type
                     param_module_name = '.'.join(name.split('.')[:-1])  # Remove parameter name
+                    
+                    # Also directly check if parent module is NVFP4LinearKernel
+                    try:
+                        parent_module = model
+                        if param_module_name:
+                            for attr in param_module_name.split('.'):
+                                parent_module = getattr(parent_module, attr)
+                        
+                        # Skip if parent is NVFP4LinearKernel
+                        if isinstance(parent_module, NVFP4LinearKernel):
+                            skipped_nvfp4_count += 1
+                            continue  # SKIP ENTIRELY - already quantized
+                    except AttributeError:
+                        # If we can't navigate to parent, check by name
+                        if param_module_name in nvfp4_modules:
+                            skipped_nvfp4_count += 1
+                            continue
+                    
+                    # Also check by name in case instance check failed
                     if param_module_name in nvfp4_modules:
                         skipped_nvfp4_count += 1
-                        continue
+                        continue  # SKIP ENTIRELY - already quantized
                     
+                    # Only materialize if it's on meta device AND not part of NVFP4
                     if param.device.type == 'meta':
                         meta_param_count += 1
                         # Replace meta parameter with empty tensor on target device
