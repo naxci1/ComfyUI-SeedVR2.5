@@ -908,21 +908,48 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                 debug.log(f"Force-materializing {replaced_count} NVFP4 kernel layers to {target_device}", 
                          category=model_type_lower, force=True)
                 
-                # Check for meta tensors and materialize them first
-                has_meta_tensors = False
-                for param in model.parameters():
-                    if param.device.type == 'meta':
-                        has_meta_tensors = True
-                        break
+                # Selectively materialize only meta tensors (avoids OOM)
+                meta_param_count = 0
+                meta_buffer_count = 0
                 
-                if has_meta_tensors:
-                    # Use to_empty to materialize meta tensors
-                    debug.log(f"Materializing meta tensors with to_empty before device move", 
+                # Materialize meta parameters selectively
+                for name, param in model.named_parameters():
+                    if param.device.type == 'meta':
+                        meta_param_count += 1
+                        # Replace meta parameter with empty tensor on target device
+                        with torch.no_grad():
+                            new_param = torch.empty_like(param, device=target_device)
+                            # Navigate to parent module and replace parameter
+                            module = model
+                            attrs = name.split('.')
+                            for attr in attrs[:-1]:
+                                module = getattr(module, attr)
+                            setattr(module, attrs[-1], torch.nn.Parameter(new_param))
+                
+                # Materialize meta buffers selectively
+                for name, buffer in model.named_buffers():
+                    if buffer.device.type == 'meta':
+                        meta_buffer_count += 1
+                        # Replace meta buffer with empty tensor on target device
+                        with torch.no_grad():
+                            new_buffer = torch.empty_like(buffer, device=target_device)
+                            # Navigate to parent module and replace buffer
+                            module = model
+                            attrs = name.split('.')
+                            for attr in attrs[:-1]:
+                                module = getattr(module, attr)
+                            module.register_buffer(attrs[-1], new_buffer)
+                
+                if meta_param_count > 0 or meta_buffer_count > 0:
+                    debug.log(f"Selectively materialized {meta_param_count} meta parameters and {meta_buffer_count} meta buffers", 
                              category=model_type_lower, force=True)
-                    model = model.to_empty(device=target_device)
-                else:
-                    # Standard device move for already-materialized tensors
+                
+                # Move any remaining non-meta tensors to target device
+                try:
                     model = model.to(target_device)
+                except Exception as e:
+                    debug.log(f"Warning: Some tensors may still be on CPU/meta: {e}", 
+                             category=model_type_lower, force=True)
                 
                 # Verify no meta device tensors remain
                 meta_params = []
