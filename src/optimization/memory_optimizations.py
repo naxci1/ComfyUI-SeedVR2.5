@@ -55,16 +55,34 @@ def memory_efficient_cat(tensors: list[torch.Tensor], dim: int = 0, use_checkpoi
         >>> txt = torch.randn(batch_size, seq_len_txt, hidden_dim)
         >>> combined = memory_efficient_cat([vid, txt], dim=1)
     """
+    # Track VRAM before concatenation
+    vram_before = None
+    if torch.cuda.is_available():
+        vram_before = torch.cuda.memory_allocated() / (1024**2)  # MB
+    
     if not use_checkpoint or not torch.is_grad_enabled():
         # During inference or when checkpointing disabled, use standard cat
-        return torch.cat(tensors, dim=dim)
+        result = torch.cat(tensors, dim=dim)
+    else:
+        # Use gradient checkpointing to save memory
+        # This recomputes the concatenation during backward pass instead of storing
+        def cat_fn(*args):
+            return torch.cat(args, dim=dim)
+        
+        result = checkpoint(cat_fn, *tensors, use_reentrant=False)
     
-    # Use gradient checkpointing to save memory
-    # This recomputes the concatenation during backward pass instead of storing
-    def cat_fn(*args):
-        return torch.cat(args, dim=dim)
+    # Log VRAM savings (one-time per operation)
+    if vram_before is not None and use_checkpoint:
+        vram_after = torch.cuda.memory_allocated() / (1024**2)  # MB
+        vram_change = vram_before - vram_after
+        
+        # Only log if we saved significant memory (>10MB)
+        if abs(vram_change) > 10:
+            if vram_change > 0:
+                print(f"VRAM saved via checkpointed cat: {vram_change:.1f} MB")
+            # Note: vram_after might be higher due to result allocation
     
-    return checkpoint(cat_fn, *tensors, use_reentrant=False)
+    return result
 
 
 def clear_memory_cache():

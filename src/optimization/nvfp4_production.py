@@ -379,6 +379,11 @@ class NVFP4LinearKernel(nn.Module):
         - Dimensions MUST be divisible by 16 for FP8 execution
         - Any mismatch causes fallback to dequantization
         """
+        # Track VRAM before operation (for logging)
+        vram_before = None
+        if torch.cuda.is_available() and not hasattr(self, '_vram_logged'):
+            vram_before = torch.cuda.memory_allocated() / (1024**2)  # MB
+        
         # CRITICAL FIX 2: Check dimension alignment for Blackwell FP4
         # Blackwell's _scaled_mm requires trailing dimensions divisible by 16
         input_last_dim = x.shape[-1]
@@ -411,6 +416,14 @@ class NVFP4LinearKernel(nn.Module):
         # MEMORY OPTIMIZATION: Delete original input to free VRAM
         # This is safe because we've already copied to FP8
         del x
+        
+        # Log VRAM savings from activation cleanup (one-time per layer)
+        if vram_before is not None:
+            vram_after = torch.cuda.memory_allocated() / (1024**2)  # MB
+            vram_saved = vram_before - vram_after
+            if vram_saved > 0:
+                print(f"VRAM saved via activation cleanup: {vram_saved:.1f} MB")
+            self._vram_logged = True
         
         # Get weight scale (already computed during quantization)
         # Ensure it's a single value for Blackwell kernel compatibility
@@ -454,6 +467,21 @@ class NVFP4LinearKernel(nn.Module):
             
             # MEMORY OPTIMIZATION: Clear FP8 tensor after use
             del x_fp8
+            
+            # CONDITIONAL EMPTY_CACHE: Only call if VRAM pressure is high
+            # This avoids slowing down Blackwell tensor cores with unnecessary cache clears
+            if torch.cuda.is_available():
+                # Check VRAM pressure: trigger empty_cache if >85% allocated
+                allocated = torch.cuda.memory_allocated()
+                reserved = torch.cuda.memory_reserved()
+                if reserved > 0:
+                    pressure = allocated / reserved
+                    if pressure > 0.85:
+                        # High VRAM pressure - clear cache to prevent OOM
+                        torch.cuda.empty_cache()
+                        if not hasattr(self, '_cache_cleared_logged'):
+                            print(f"INFO: VRAM pressure high ({pressure*100:.1f}%), cleared cache to prevent OOM")
+                            self._cache_cleared_logged = True
             
             return output
         except Exception as e:
