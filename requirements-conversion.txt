@@ -1,0 +1,20 @@
+# Requirements for Model Conversion Script
+# Install with: pip install -r requirements-conversion.txt
+
+# Core Dependencies (Required)
+torch>=2.3.0                    # PyTorch for tensor operations
+safetensors>=0.4.0             # SafeTensors format support
+huggingface_hub>=0.20.0        # Download models from HuggingFace
+tqdm>=4.65.0                   # Progress bars
+
+# Quantization Support
+bitsandbytes>=0.41.0           # NF4 quantization (works on all modern GPUs)
+
+# Optional: For NVFP4 on Blackwell GPUs (RTX 50-series)
+# Uncomment the line below and run:
+# pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128
+# torch>=2.6.0  # PyTorch nightly with CUDA 12.8 for native NVFP4 support
+
+# Development/Testing (Optional)
+# pytest>=7.0.0               # For running tests
+# black>=23.0.0               # Code formatting
