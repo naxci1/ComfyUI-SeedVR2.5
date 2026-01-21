@@ -96,6 +96,10 @@ def _unpack_4bit_to_fp32(
     scale_idx = offsets // MX_BLOCK_SIZE
     scale = tl.load(scale_ptr + scale_idx, mask=mask, other=1.0)
     
+    # NUMERICAL STABILITY: Clamp scale to prevent extreme values
+    # Epsilon prevents division by zero and extreme quantization artifacts
+    scale = tl.maximum(scale, 1e-5)
+    
     # Apply scale
     fp32_value = base_value * scale
     

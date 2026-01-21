@@ -55,11 +55,21 @@ def pytorch_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q=N
         v_i = v_i.permute(1, 0, 2).unsqueeze(0) # (1, heads, seq_len_k, head_dim)
 
         # Use PyTorch's built-in scaled dot-product attention.
+        # NUMERICAL STABILITY: Force FP32 for softmax computation to prevent artifacts
+        # This is critical when using quantized models (NVFP4/MX4)
+        q_dtype_orig = q_i.dtype
+        q_i_fp32 = q_i.to(torch.float32)
+        k_i_fp32 = k_i.to(torch.float32)
+        v_i_fp32 = v_i.to(torch.float32)
+        
         output_i = F.scaled_dot_product_attention(
-            q_i, k_i, v_i, 
+            q_i_fp32, k_i_fp32, v_i_fp32, 
             dropout_p=dropout_p if not deterministic else 0.0,
             is_causal=causal
         )
+        
+        # Convert back to original dtype
+        output_i = output_i.to(q_dtype_orig)
 
         # Reshape the output back to the original format (seq_len, heads, head_dim)
         output_i = output_i.squeeze(0).permute(1, 0, 2)

@@ -36,10 +36,17 @@ BLACKWELL_ALIGNMENT = 16
 
 @dataclass
 class NVFP4Config:
-    """Configuration for NVFP4 quantization"""
+    """
+    Configuration for NVFP4 quantization
+    
+    NUMERICAL STABILITY NOTES:
+    - act_order=False is assumed for spatial consistency in DiT blocks
+    - LayerNorm, RMSNorm, Identity layers are NEVER quantized (FP32)
+    - This prevents visual artifacts and maintains gradient stability
+    """
     block_size: int = NVFP4_BLOCK_SIZE
     preserve_patterns: Set[str] = None
-    enforce_all_layers: bool = True  # NEW: Force quantization on ALL layers
+    enforce_all_layers: bool = True  # NEW: Force quantization on ALL layers (except critical norms)
     handle_padding: bool = True      # NEW: Handle 16-byte alignment padding
     
     def __post_init__(self):
@@ -752,13 +759,27 @@ def replace_with_nvfp4_kernel(model: nn.Module,
     replaced_count = 0
     
     def _should_preserve(name: str) -> bool:
-        """Check if layer should be preserved in FP16"""
-        # If enforce_all_layers is True, quantize everything
+        """
+        Check if layer should be preserved in FP32/FP16 (NOT quantized).
+        
+        CRITICAL FOR NUMERICAL STABILITY:
+        - LayerNorm, RMSNorm: Must stay FP32 for gradient stability
+        - Identity layers: Final projection layers, keep FP32
+        - Bias terms: Keep FP32 for accuracy
+        """
+        name_lower = name.lower()
+        
+        # CRITICAL: Always preserve normalization layers (prevents artifacts)
+        critical_patterns = ['layernorm', 'rmsnorm', 'groupnorm', 'batchnorm', 
+                            'identity', 'ln', '.norm']
+        if any(pattern in name_lower for pattern in critical_patterns):
+            return True
+        
+        # If enforce_all_layers is True, quantize everything EXCEPT critical layers above
         if config.enforce_all_layers:
             return False
         
         # Otherwise use preserve patterns
-        name_lower = name.lower()
         return any(pattern in name_lower for pattern in config.preserve_patterns)
     
     def _get_quantized_keys(param_path: str) -> Tuple[Optional[str], Optional[str]]:

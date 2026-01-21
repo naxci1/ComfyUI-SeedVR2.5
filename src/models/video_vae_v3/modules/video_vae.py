@@ -921,6 +921,11 @@ class VideoAutoencoderKLWrapper(VideoAutoencoderKL):
         return CausalEncoderOutput(z, None, p)
 
     def decode(self, z) -> CausalDecoderOutput:
+        # NUMERICAL STABILITY: Ensure latents are in clean FP32/BF16, not quantized
+        # This prevents artifacts in VAE decoding
+        if z.dtype not in [torch.float32, torch.bfloat16, torch.float16]:
+            z = z.to(torch.bfloat16)
+        
         if z.ndim == 4:
             z = z.unsqueeze(2)
         x = super().decode(z).sample.squeeze(2)
