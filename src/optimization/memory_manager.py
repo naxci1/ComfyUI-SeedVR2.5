@@ -1079,52 +1079,40 @@ def _move_model_with_nvfp4_support(model: torch.nn.Module, target_device: torch.
         target_device: Target device
         debug: Optional debug instance
     """
-    try:
-        # Try to import NVFP4LinearKernel
-        from .nvfp4_production import NVFP4LinearKernel
-        has_nvfp4_module = True
-    except ImportError:
-        has_nvfp4_module = False
+    # CRITICAL: Check if model has ANY meta tensors
+    # If yes, MUST use to_empty() instead of to()
+    # PyTorch cannot copy data from meta tensors - they have no data!
+    has_meta_tensors = False
     
-    # If NVFP4 module exists, check for NVFP4LinearKernel instances
-    if has_nvfp4_module:
-        nvfp4_modules_found = 0
-        nvfp4_modules_materialized = 0
-        
-        for name, module in model.named_modules():
-            if isinstance(module, NVFP4LinearKernel):
-                nvfp4_modules_found += 1
-                
-                # Check if this module has meta tensors
-                has_meta = any(
-                    hasattr(module, attr) and 
-                    isinstance(getattr(module, attr), torch.Tensor) and
-                    getattr(module, attr).device.type == 'meta'
-                    for attr in ['weight_quantized', 'weight_scale', 'input_scale']
-                )
-                
-                if has_meta:
-                    # Materialize meta tensors to target device
-                    try:
-                        # Use to_empty to allocate memory without copying
-                        module.weight_quantized = torch.empty_like(module.weight_quantized, device=target_device)
-                        module.weight_scale = torch.empty_like(module.weight_scale, device=target_device)
-                        module.input_scale = torch.empty_like(module.input_scale, device=target_device)
-                        module._device = target_device
-                        nvfp4_modules_materialized += 1
-                    except Exception as e:
-                        if debug:
-                            debug.log(f"Warning: Failed to materialize NVFP4 module {name}: {e}", level="warning")
-        
-        if nvfp4_modules_found > 0 and debug:
-            if nvfp4_modules_materialized > 0:
-                debug.log(f"Materialized {nvfp4_modules_materialized}/{nvfp4_modules_found} NVFP4 modules from meta device", 
-                         category="success")
-            else:
-                debug.log(f"Found {nvfp4_modules_found} NVFP4 modules (already materialized)", category="general")
+    for param in model.parameters():
+        if param.device.type == 'meta':
+            has_meta_tensors = True
+            break
     
-    # Now perform standard model movement
-    model.to(target_device)
+    if not has_meta_tensors:
+        for buffer in model.buffers():
+            if buffer.device.type == 'meta':
+                has_meta_tensors = True
+                break
+    
+    # If model has meta tensors, MUST use to_empty() not to()
+    if has_meta_tensors:
+        if debug:
+            debug.log(f"Model contains meta tensors - using to_empty() to materialize to {target_device}", 
+                     category="nvfp4")
+        
+        # Use to_empty to materialize the entire model at once
+        # This allocates real memory for all parameters and buffers WITHOUT copying data
+        model = model.to_empty(device=target_device)
+        
+        if debug:
+            debug.log(f"Model successfully materialized to {target_device} using to_empty()", 
+                     category="success")
+    else:
+        # No meta tensors - safe to use standard .to()
+        if debug:
+            debug.log(f"Moving model to {target_device} (no meta tensors)", category="general")
+        model.to(target_device)
 
 
 def _standard_model_movement(model: torch.nn.Module, current_device: torch.device,

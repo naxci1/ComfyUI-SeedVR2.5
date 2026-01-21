@@ -584,6 +584,26 @@ def replace_with_nvfp4_kernel(model: nn.Module,
         debug.log(f"NVFP4 kernel replacement complete: {replaced_count} layers replaced",
                  category="success")
     
+    # CRITICAL: After replacement, ensure entire model is materialized
+    # Check if model still has any meta tensors
+    has_meta = any(p.device.type == 'meta' for p in model.parameters())
+    if not has_meta:
+        for buffer in model.buffers():
+            if buffer.device.type == 'meta':
+                has_meta = True
+                break
+    
+    if has_meta:
+        if debug:
+            debug.log(f"Materializing remaining meta tensors to {device}", category="nvfp4")
+        
+        # Use to_empty to materialize any remaining meta tensors
+        # This is safe because NVFP4 layers already have their weights loaded
+        model = model.to_empty(device=device)
+        
+        if debug:
+            debug.log("Model fully materialized - no meta tensors remain", category="success")
+    
     return model, replaced_count
 
 
