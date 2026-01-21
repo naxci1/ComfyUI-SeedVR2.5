@@ -53,7 +53,11 @@ class TimeEmbedding(nn.Module):
             flip_sin_to_cos=False,
             downscale_freq_shift=0,
         )
-        emb = emb.to(dtype)
+        
+        # NUMERICAL STABILITY: Keep embeddings in FP32 for temporal consistency
+        # Timestep embeddings control modulation across all 32 layers and 162 frames
+        # Small errors in embeddings compound throughout the network
+        emb = emb.to(torch.float32)
         emb = self.proj_in(emb)
         emb = self.act(emb)
         emb = self.proj_hid(emb)

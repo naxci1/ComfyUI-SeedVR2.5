@@ -1003,9 +1003,12 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                                     module = getattr(module, attr)
                                 setattr(module, attrs[-1], torch.nn.Parameter(new_param))
                                 
-                                # CRITICAL: Force GPU synchronization after each parameter
-                                # This prevents async queue buildup but allows overlapped transfers
-                                if torch.cuda.is_available():
+                                # ASYNC PIPELINE: Ensure materialization stream completes before compute stream uses parameter
+                                # This prevents race conditions where compute tries to use partially-transferred weights
+                                if torch.cuda.is_available() and async_stream is not None:
+                                    # Synchronize async stream to ensure transfer is 100% complete
+                                    async_stream.synchronize()
+                                    # Main stream synchronization ensures no queue buildup
                                     torch.cuda.synchronize()
                                 
                                 # Force delete the old meta reference
@@ -1062,8 +1065,12 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                                     module = getattr(module, attr)
                                 module.register_buffer(attrs[-1], new_buffer)
                                 
-                                # CRITICAL: Force GPU synchronization after each buffer
-                                if torch.cuda.is_available():
+                                # ASYNC PIPELINE: Ensure materialization stream completes before compute stream uses buffer
+                                # This prevents race conditions where compute tries to use partially-transferred buffers
+                                if torch.cuda.is_available() and async_stream is not None:
+                                    # Synchronize async stream to ensure transfer is 100% complete
+                                    async_stream.synchronize()
+                                    # Main stream synchronization ensures no queue buildup
                                     torch.cuda.synchronize()
                                 
                                 # Force delete the old meta reference
