@@ -371,6 +371,11 @@ class NVFP4LinearKernel(nn.Module):
         Direct kernel dispatch using torch._scaled_mm
         
         NO DEQUANTIZATION - weights stay in FP8 E4M3 format.
+        
+        CRITICAL: Blackwell FP4 kernels require strict scaling tensor configuration:
+        - Scales MUST be float32 (not BFloat16/Half)
+        - Scales MUST be singleton tensors or exact shape match
+        - Any mismatch causes fallback to dequantization
         """
         # Compute dynamic input scale for better accuracy
         # Use absmax quantization: scale = max(abs(x)) / fp8_max
@@ -385,21 +390,46 @@ class NVFP4LinearKernel(nn.Module):
         x_fp8 = x.to(torch.float8_e4m3fn)
         
         # Get weight scale (already computed during quantization)
-        weight_scale_val = self.weight_scale if self.weight_scale.numel() == 1 else self.weight_scale.mean()
+        # Ensure it's a single value for Blackwell kernel compatibility
+        if self.weight_scale.numel() == 1:
+            weight_scale_val = self.weight_scale
+        else:
+            # Take mean if multiple scales (should be rare after load_quantized_weights)
+            weight_scale_val = self.weight_scale.mean().reshape(1)
+        
+        # CRITICAL FIX FOR BLACKWELL: Force scales to float32
+        # Blackwell FP4 hardware kernels reject BFloat16/Half scales
+        # Scale tensors must be float32 singleton or exact kernel descriptor
+        if self._is_blackwell():
+            # Ensure both scales are float32 singleton tensors
+            input_scale_dynamic = input_scale_dynamic.to(dtype=torch.float32).reshape(1)
+            weight_scale_val = weight_scale_val.to(dtype=torch.float32).reshape(1)
+        else:
+            # Non-Blackwell: use standard float32
+            input_scale_dynamic = input_scale_dynamic.to(dtype=torch.float32)
+            weight_scale_val = weight_scale_val.to(dtype=torch.float32)
         
         # torch._scaled_mm: Direct hardware kernel dispatch
         # This executes on Blackwell Tensor Cores with native FP8 support
         # Formula: output = (scale_a * A) @ (scale_b * B)
-        output = torch._scaled_mm(
-            x_fp8,                    # Input in FP8 E4M3
-            self.weight_quantized.t(), # Weight in FP8 E4M3 (transposed for matmul)
-            bias=self.bias,           # Bias in FP16 (added after matmul)
-            out_dtype=torch.bfloat16 if x.dtype == torch.bfloat16 else torch.float16,
-            scale_a=input_scale_dynamic,  # Input scale factor
-            scale_b=weight_scale_val      # Weight scale factor
-        )
-        
-        return output
+        try:
+            output = torch._scaled_mm(
+                x_fp8,                    # Input in FP8 E4M3
+                self.weight_quantized.t(), # Weight in FP8 E4M3 (transposed for matmul)
+                bias=self.bias,           # Bias in FP16 (added after matmul)
+                out_dtype=torch.bfloat16 if x.dtype == torch.bfloat16 else torch.float16,
+                scale_a=input_scale_dynamic,  # Input scale (float32, singleton)
+                scale_b=weight_scale_val      # Weight scale (float32, singleton)
+            )
+            return output
+        except Exception as e:
+            # Log the specific error for debugging
+            print(f"torch._scaled_mm failed: {e}")
+            print(f"  scale_a dtype: {input_scale_dynamic.dtype}, shape: {input_scale_dynamic.shape}")
+            print(f"  scale_b dtype: {weight_scale_val.dtype}, shape: {weight_scale_val.shape}")
+            print(f"  x_fp8 dtype: {x_fp8.dtype}, shape: {x_fp8.shape}")
+            print(f"  weight dtype: {self.weight_quantized.dtype}, shape: {self.weight_quantized.shape}")
+            raise
     
     def _fallback_forward(self, x: torch.Tensor) -> torch.Tensor:
         """
