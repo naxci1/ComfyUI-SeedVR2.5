@@ -159,8 +159,23 @@ def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch
                 raise
         
         # Process NVFP4 weights if applicable
-        if is_nvfp4_model:
+        # Check if this is model-optimizer format (not custom NVFP4 format)
+        is_modelopt_format = any('_quantized_weight' in k or '_weight_scale' in k for k in state.keys())
+        
+        if is_nvfp4_model and not is_modelopt_format:
+            # Use old NVFP4 format processing (custom format only)
             state = load_nvfp4_weights(state, config=NVFP4Config(), debug=debug)
+        elif is_modelopt_format and debug:
+            # Model-optimizer format detected - will be handled by production module
+            # Count quantized layers for logging
+            try:
+                from ..optimization.nvfp4_production import detect_modelopt_quantized_weights
+                has_quantized, num_quantized = detect_modelopt_quantized_weights(state)
+                if has_quantized:
+                    debug.log(f"Detected {num_quantized} model-optimizer quantized layers in checkpoint",
+                             category="nvfp4", force=True)
+            except ImportError:
+                pass
             
     elif checkpoint_path.endswith('.gguf'):
         validate_gguf_availability(f"load {os.path.basename(checkpoint_path)}", debug)

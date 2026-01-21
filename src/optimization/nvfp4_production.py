@@ -129,8 +129,11 @@ class NVFP4LinearKernel(nn.Module):
         CRITICAL: This must be called AFTER the module has been moved to a real device
         (not meta device). The module must be materialized first using to_empty().
         
+        Handles 4-bit packing: Model-optimizer packs 2 FP4 weights per byte.
+        If the tensor size doesn't match expected shape, assumes 4-bit packing and unpacks.
+        
         Args:
-            weight_quantized: Quantized weight tensor (FP8 E4M3 or INT8)
+            weight_quantized: Quantized weight tensor (FP8 E4M3, INT8, or 4-bit packed)
             weight_scale: Per-tensor or per-block weight scaling factors
             input_scale: Optional input activation scale
             block_size: Block size for block-wise quantization (default: 8)
@@ -151,6 +154,38 @@ class NVFP4LinearKernel(nn.Module):
         else:
             # Default input scale
             input_scale = torch.ones(1, device=self._device, dtype=torch.float32)
+        
+        # Expected shape for this layer
+        expected_shape = (self.out_features, self.in_features)
+        expected_elements = expected_shape[0] * expected_shape[1]
+        current_elements = weight_quantized.numel()
+        
+        # Check if 4-bit packed (2 weights per byte)
+        # Model-optimizer packs 2 FP4 values into each byte
+        if current_elements * 2 == expected_elements:
+            # 4-BIT UNPACKING LOGIC
+            # Each byte contains 2 weights: lower 4 bits and upper 4 bits
+            # unpacked_tensor[::2] = (packed_tensor & 0x0F)  # Lower 4 bits
+            # unpacked_tensor[1::2] = (packed_tensor >> 4)   # Upper 4 bits
+            
+            # Allocate full buffer on GPU
+            unpacked = torch.empty(expected_elements, dtype=torch.uint8, device=self._device)
+            
+            # Convert to uint8 for bit operations
+            packed_uint8 = weight_quantized.view(torch.uint8).flatten()
+            
+            # Unpack: 2 weights per byte
+            # Even indices get lower 4 bits, odd indices get upper 4 bits
+            unpacked[0::2] = packed_uint8 & 0x0F  # Lower nibble
+            unpacked[1::2] = (packed_uint8 >> 4) & 0x0F  # Upper nibble
+            
+            # Replace weight_quantized with unpacked version
+            weight_quantized = unpacked
+            
+            # Update block_size if needed (4-bit typically uses different block size)
+            # Model-optimizer often uses block_size=16 for 4-bit
+            if block_size == 8:
+                block_size = 16  # Adjust for 4-bit quantization
         
         # Convert to FP8 E4M3 if not already
         if weight_quantized.dtype != torch.float8_e4m3fn:
