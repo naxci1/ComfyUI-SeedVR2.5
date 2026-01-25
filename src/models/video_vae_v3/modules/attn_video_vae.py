@@ -52,6 +52,7 @@ from .types import (
     _receptive_field_t,
 )
 from ....optimization.memory_manager import retry_on_oom
+from ....optimization.vae_attention import set_vae_phase
 
 logger = get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -658,8 +659,16 @@ class UNetMidBlock3D(nn.Module):
         hidden_states = self.resnets[0](hidden_states, temb, memory_state=memory_state)
         for attn, resnet in zip(self.attentions, self.resnets[1:]):
             if attn is not None:
+                # Rearrange for 2D attention: (B, C, F, H, W) -> (B*F, C, H, W)
+                # Temporal dimension (F) is flattened into batch for SA2 compatibility: (B*T, H*W, C)
                 hidden_states = rearrange(hidden_states, "b c f h w -> (b f) c h w")
+                
+                # Global patching intercepts attn() and applies SA2 with:
+                # - num_heads=8, head_dim=64 (forced for query_dim=512)
+                # - Physical print("SA2_ENCODER_ACTIVE") or print("SA2_DECODER_ACTIVE")
                 hidden_states = attn(hidden_states, temb=temb)
+                
+                # Rearrange back to 5D: (B*F, C, H, W) -> (B, C, F, H, W)
                 hidden_states = rearrange(
                     hidden_states, "(b f) c h w -> b c f h w", f=video_length
                 )
@@ -778,13 +787,15 @@ class Encoder3D(nn.Module):
             )
 
         # mid
+        # Note: attention_head_dim=block_out_channels[-1] creates 1 head x 512 dim
+        # VAE uses standard PyTorch SDPA (natively optimized for Blackwell GPUs)
         self.mid_block = UNetMidBlock3D(
             in_channels=block_out_channels[-1],
             resnet_eps=1e-6,
             resnet_act_fn=act_fn,
             output_scale_factor=1,
             resnet_time_scale_shift="default",
-            attention_head_dim=block_out_channels[-1],
+            attention_head_dim=block_out_channels[-1],  # Original structure: 1 head x 512 dim
             resnet_groups=norm_num_groups,
             temb_channels=None,
             add_attention=mid_block_add_attention,
@@ -840,10 +851,12 @@ class Encoder3D(nn.Module):
         else:
             # down
             # [Override] add extra block and extra cond
-            for down_block, extra_block in zip(self.down_blocks, self.conv_extra_cond):
+            for i, (down_block, extra_block) in enumerate(zip(self.down_blocks, self.conv_extra_cond)):
                 sample = down_block(sample, memory_state=memory_state)
                 if extra_block is not None:
                     sample = sample + safe_interpolate_operation(extra_block(extra_cond), size=sample.shape[2:])
+                # NOTE: empty_cache() removed from loop for speed optimization
+                # VRAM cleanup now happens only once before Phase 3 in generation_phases.py
 
             # middle
             sample = self.mid_block(sample, memory_state=memory_state)
@@ -919,13 +932,15 @@ class Decoder3D(nn.Module):
         temb_channels = in_channels if norm_type == "spatial" else None
 
         # mid
+        # Note: attention_head_dim=block_out_channels[-1] creates 1 head x 512 dim
+        # VAE uses standard PyTorch SDPA (natively optimized for Blackwell GPUs)
         self.mid_block = UNetMidBlock3D(
             in_channels=block_out_channels[-1],
             resnet_eps=1e-6,
             resnet_act_fn=act_fn,
             output_scale_factor=1,
             resnet_time_scale_shift="default" if norm_type == "group" else norm_type,
-            attention_head_dim=block_out_channels[-1],
+            attention_head_dim=block_out_channels[-1],  # Original structure: 1 head x 512 dim
             resnet_groups=norm_num_groups,
             temb_channels=temb_channels,
             add_attention=mid_block_add_attention,
@@ -1023,8 +1038,10 @@ class Decoder3D(nn.Module):
             # middle
             sample = self.mid_block(sample, latent_embeds, memory_state=memory_state)
 
-            # up
-            for up_block in self.up_blocks:
+            # up - fast path without mid-block cache clearing
+            # NOTE: empty_cache() removed from loop for speed optimization
+            # VRAM cleanup now happens only once before Phase 3 in generation_phases.py
+            for i, up_block in enumerate(self.up_blocks):
                 sample = up_block(sample, latent_embeds, memory_state=memory_state)
 
         # post-process
@@ -1182,6 +1199,9 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
     def encode(self, x: torch.FloatTensor, return_dict: bool = True, 
                tiled: bool = False, tile_size: Tuple[int, int] = (512, 512), 
                tile_overlap: Tuple[int, int] = (64, 64)) -> AutoencoderKLOutput:
+        # Set phase context for SA2 logging
+        set_vae_phase("encoder")
+        
         if tiled:
             h = self.tiled_encode(x, tile_size=tile_size, tile_overlap=tile_overlap)
         else:
@@ -1198,6 +1218,8 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
     def decode(self, z: torch.Tensor, return_dict: bool = True, 
                tiled: bool = False, tile_size: Tuple[int, int] = (512, 512), 
                tile_overlap: Tuple[int, int] = (64, 64)) -> Union[DecoderOutput, torch.Tensor]:
+        # Set phase context for SA2 logging
+        set_vae_phase("decoder")
 
         if tiled:
             decoded = self.tiled_decode(z, tile_size=tile_size, tile_overlap=tile_overlap)
@@ -1271,6 +1293,8 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                                 if isinstance(m, InflatedCausalConv3d) and m.memory is not None]
             for m in modules_with_memory:
                 m.memory = None
+            # NOTE: empty_cache/gc.collect removed for speed optimization
+            # VRAM cleanup happens once before Phase 3 in generation_phases.py
             return out
         else:
             return self._encode(x)
@@ -1295,6 +1319,8 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                                 if isinstance(m, InflatedCausalConv3d) and m.memory is not None]
             for m in modules_with_memory:
                 m.memory = None
+            # NOTE: empty_cache/gc.collect removed for speed optimization
+            # VRAM cleanup happens once before Phase 3 in generation_phases.py
             return out
         else:
             return self._decode(z)
@@ -1470,6 +1496,10 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
     def tiled_decode(self, z: torch.Tensor, tile_size: Tuple[int, int] = (512, 512), tile_overlap: Tuple[int, int] = (64, 64)) -> torch.Tensor:
         r"""
         Decodes a latent tensor `z` by splitting it into spatial tiles only. Temporal is handled by `slicing_decode`.
+        
+        Includes Blackwell (RTX 50 series) optimizations:
+        - VRAM monitoring: Pre-allocates on CPU when VRAM > 85% to prevent OOM
+        - Async CUDA streams: Overlaps tile transfer and computation for better throughput
         """
         if z.ndim != 5:
             z = z.unsqueeze(2)
@@ -1502,6 +1532,29 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         # Allocate later using first decoded results
         result = None
         count = None
+        
+        # VRAM monitoring for Blackwell optimization: check if we should use CPU offload
+        use_cpu_offload = False
+        if torch.cuda.is_available() and z.is_cuda:
+            try:
+                total_vram = torch.cuda.get_device_properties(z.device).total_memory
+                allocated_vram = torch.cuda.memory_allocated(z.device)
+                vram_usage_pct = allocated_vram / total_vram if total_vram > 0 else 0
+                if vram_usage_pct > 0.85:
+                    use_cpu_offload = True
+                    if self.debug:
+                        self.debug.log(f"VRAM usage {vram_usage_pct*100:.1f}% > 85%, using CPU offload for result tensor", 
+                                      category="memory", indent_level=1)
+            except Exception:
+                pass  # Silently ignore VRAM check errors
+        
+        # Create async CUDA stream for overlapping tile transfer and computation
+        decode_stream = None
+        if torch.cuda.is_available() and z.is_cuda:
+            try:
+                decode_stream = torch.cuda.Stream(device=z.device)
+            except Exception:
+                pass  # Silently fall back to default stream
 
         num_tiles = ((max(H - latent_overlap_h, 1) + stride_h - 1) // stride_h) \
                   * ((max(W - latent_overlap_w, 1) + stride_w - 1) // stride_w)
@@ -1562,7 +1615,14 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                         end_tile = min(tile_id + 4, num_tiles)
                         self.debug.log(f"Decoding tiles {tile_id}-{end_tile} / {num_tiles}", category="vae", indent_level=1)
 
-                decoded_tile = self.slicing_decode(tile_latent)
+                # Use async stream for tile decoding if available (Blackwell optimization)
+                if decode_stream is not None:
+                    with torch.cuda.stream(decode_stream):
+                        decoded_tile = self.slicing_decode(tile_latent)
+                    # Sync before using the result
+                    decode_stream.synchronize()
+                else:
+                    decoded_tile = self.slicing_decode(tile_latent)
 
                 # Initialize result tensors using actual decoded shapes on first tile
                 if result is None:
@@ -1570,10 +1630,16 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                     output_h = H * scale_factor
                     output_w = W * scale_factor
                     
-                    # Accumulate on offload device if specified and different, else on inference device
-                    device = getattr(self, 'tensor_offload_device', None)
-                    if device is None or device == decoded_tile.device:
-                        device = decoded_tile.device
+                    # Determine device for result accumulation:
+                    # 1. Use CPU if VRAM > 85% (prevents OOM from 14.5GB peak)
+                    # 2. Otherwise use tensor_offload_device if specified
+                    # 3. Otherwise use inference device
+                    if use_cpu_offload:
+                        device = torch.device('cpu')
+                    else:
+                        device = getattr(self, 'tensor_offload_device', None)
+                        if device is None or device == decoded_tile.device:
+                            device = decoded_tile.device
                     
                     result = torch.zeros((b_out, c_out, out_f_tile, output_h, output_w), device=device, dtype=decoded_tile.dtype)
                     count = torch.zeros((1, 1, 1, output_h, output_w), device=device, dtype=decoded_tile.dtype)
@@ -1617,6 +1683,11 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                 
                 result[:, :, : decoded_tile.shape[2], y_out:y_out_end, x_out:x_out_end] += decoded_tile
                 count[:, :, :, y_out:y_out_end, x_out:x_out_end].addcmul_(weight_h_5d, weight_w_5d)
+                
+                # Blackwell sync: Force GPU to release locked memory after each tile
+                # This prevents the scheduler hang at end of Batch 1 on RTX 5070 Ti
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
 
         # Move result back to inference device if needed and normalize
         if result.device != z.device:

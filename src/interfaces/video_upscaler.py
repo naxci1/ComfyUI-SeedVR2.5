@@ -345,6 +345,12 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
         attention_mode = dit.get("attention_mode", "sdpa")
         sparsity_threshold = dit.get("sparsity_threshold", 0.5)
         vae_cache = vae.get("cache_model", False)
+        
+        # VAE Blackwell optimization settings
+        vae_sparge_enabled = vae.get("enable_sparge_attention", False)
+        vae_sparsity_threshold = vae.get("vae_sparsity_threshold", 0.5)
+        vae_precision = vae.get("vae_precision", "auto")
+        vae_is_fp8 = vae.get("is_fp8_model", False)
 
         # BlockSwap configuration - construct from individual values
         blocks_to_swap = dit.get("blocks_to_swap", 0)
@@ -374,6 +380,37 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
         decode_tile_size = vae.get("decode_tile_size", 512)
         decode_tile_overlap = vae.get("decode_tile_overlap", 64)
         tile_debug = vae.get("tile_debug", False)
+        
+        # VAE SA2 control per Encoder/Decoder (from UI toggles)
+        # DEBUG: Print raw VAE config to verify UI values are received
+        print(f"[VAE-DEBUG] Raw VAE config keys: {list(vae.keys()) if isinstance(vae, dict) else 'NOT A DICT'}")
+        print(f"[VAE-DEBUG] vae_encoder_sa2 in config: {vae.get('vae_encoder_sa2', 'NOT FOUND')}")
+        print(f"[VAE-DEBUG] vae_decoder_sa2 in config: {vae.get('vae_decoder_sa2', 'NOT FOUND')}")
+        
+        # VAE ATTENTION SETTINGS with AUTO-LOCK LOGIC:
+        # Encoder SA2 defaults to True (SA2 is faster for encoding on Blackwell)
+        # Decoder SA2 follows dependency on tiling to prevent artifacts
+        vae_encoder_sa2 = vae.get("vae_encoder_sa2", True)  # Default True = SA2 for Encoder
+        vae_decoder_sa2_ui = vae.get("vae_decoder_sa2", False)  # User's requested setting
+        force_decoder_sa2_with_tiling = vae.get("force_decoder_sa2_with_tiling", False)  # Override safety check
+        
+        # VAE AUTO-LOCK LOGIC: Strict dependency between Tiling and SA2
+        # IF decode_tiled is TRUE -> FORCE vae_decoder_sa2 = False and DISABLE the option
+        # IF decode_tiled is FALSE -> ALLOW vae_decoder_sa2 to be user-defined (True/False)
+        # OVERRIDE: If force_decoder_sa2_with_tiling is True, allow SA2 even with tiling (may cause artifacts)
+        if decode_tiled and not force_decoder_sa2_with_tiling:
+            vae_decoder_sa2 = False  # FORCED to False when tiling is enabled
+            print(f"[VAE-AUTO] Tiling is ON: Disabling Decoder SA2 to prevent artifacts.")
+        elif decode_tiled and force_decoder_sa2_with_tiling:
+            vae_decoder_sa2 = vae_decoder_sa2_ui  # User forcing SA2 with tiling (risky!)
+            print(f"[VAE-FORCE] WARNING: Tiling + SA2 enabled (force_decoder_sa2_with_tiling=True). May cause artifacts!")
+        else:
+            vae_decoder_sa2 = vae_decoder_sa2_ui  # Respect user setting when tiling is off
+        
+        print(f"[VAE-CTRL] Encoder SA2 = {vae_encoder_sa2} | Decoder SA2 = {vae_decoder_sa2} | Decode Tiled = {decode_tiled}")
+        
+        # RESPECT UI TOGGLES - DO NOT auto-force tiling
+        # User controls encode_tiled and decode_tiled directly
 
         # TorchCompile args (optional connection, can be None)
         dit_torch_compile_args = dit.get("torch_compile_args")
@@ -435,6 +472,10 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 tile_debug=tile_debug,
                 attention_mode=attention_mode,
                 sparsity_threshold=sparsity_threshold,
+                vae_sparge_enabled=vae_sparge_enabled,
+                vae_sparsity_threshold=vae_sparsity_threshold,
+                vae_precision=vae_precision,
+                vae_is_fp8=vae_is_fp8,
                 torch_compile_args_dit=dit_torch_compile_args,
                 torch_compile_args_vae=vae_torch_compile_args
             )
@@ -468,7 +509,54 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             
             debug.start_timer("generation")
             
+            # ══════════════════════════════════════════════════════════
+            # PRE-FLIGHT SYNC: TRUTHFUL LOGGING OF ALL SETTINGS
+            # ══════════════════════════════════════════════════════════
+            print("\n" + "═" * 60)
+            print("PRE-FLIGHT SYNC: ACTUAL SETTINGS PASSED TO MODEL")
+            print("═" * 60)
+            print(f"  DiT Mode        = {attention_mode}")
+            print(f"  Threshold       = {sparsity_threshold}")
+            print(f"  VAE Encoder SA2 = {vae_encoder_sa2}")
+            print(f"  VAE Decoder SA2 = {vae_decoder_sa2}")
+            print(f"  Encode Tiled    = {encode_tiled}")
+            print(f"  Decode Tiled    = {decode_tiled}")
+            print(f"  Encode Tile Size= {encode_tile_size}")
+            print(f"  Decode Tile Size= {decode_tile_size}")
+            print("═" * 60 + "\n")
+            
+            # Configure VAE SA2 settings from UI toggles BEFORE any VAE operations
+            # This sets the global state that the patched Attention.forward() reads dynamically
+            from ..optimization.vae_attention import (
+                configure_vae_sa2, set_vae_phase, end_vae_phase, inject_sparge_into_vae, 
+                update_dit_sparsity_blocks
+            )
+            
+            # Import Truth Monitor for execution summary
+            from ..optimization.truth_monitor import print_execution_summary, reset_truth_monitor
+            
+            # Reset Truth Monitor for this generation
+            reset_truth_monitor()
+            
+            # Only configure SA2 if at least one phase uses it
+            # When both are False, VAE uses native PyTorch SDPA (fastest path)
+            if vae_encoder_sa2 or vae_decoder_sa2:
+                configure_vae_sa2(
+                    encoder_sa2=vae_encoder_sa2, 
+                    decoder_sa2=vae_decoder_sa2,
+                    sparsity_threshold=sparsity_threshold  # Pass UI threshold to VAE SA2
+                )
+                # REAL SA2 INJECTION: Patch VAE AttentionBlock modules
+                patched_count = inject_sparge_into_vae(runner.vae)
+                if patched_count == 0:
+                    print("[VAE-SA2] WARNING: inject_sparge_into_vae returned 0 - SA2 may not be active!")
+            else:
+                print("[VAE-CTRL] VAE: NATIVE SDPA (no SA2 patching - fastest path)")
+            
             # Phase 1: Encode
+            print(f"\n[PHASE 1] Starting VAE Encoding (SA2={vae_encoder_sa2})")
+            # TRUTH MONITOR: Set phase with tiling context for transparency logging
+            set_vae_phase("encoder", tiling_enabled=encode_tiled, force_sa2_with_tiling=force_decoder_sa2_with_tiling)
             ctx = encode_all_batches(
                 runner,
                 ctx=ctx,
@@ -484,11 +572,18 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 input_noise_scale=input_noise_scale,
                 color_correction=color_correction
             )
+            end_vae_phase()  # Finalize encoder telemetry
 
             # MEMORY ISOLATION: Clear CUDA cache and reset kernel counter before DiT phase
             reset_sparge_sage2_verification()
 
             # Phase 2: Upscale
+            print(f"\n[PHASE 2] Starting DiT Upscaling (Mode={attention_mode}, Threshold={sparsity_threshold})")
+            
+            # REAL BLOCK-LEVEL SPARSITY UPDATE: Iterate through ALL DiT blocks
+            # This ensures the UI threshold is ACTUALLY applied to the model
+            update_dit_sparsity_blocks(runner, sparsity_threshold)
+            
             ctx = upscale_all_batches(
                 runner,
                 ctx=ctx,
@@ -500,6 +595,9 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             )
 
             # Phase 3: Decode
+            print(f"\n[PHASE 3] Starting VAE Decoding (SA2={vae_decoder_sa2})")
+            # TRUTH MONITOR: Set phase with tiling context for transparency logging
+            set_vae_phase("decoder", tiling_enabled=decode_tiled, force_sa2_with_tiling=force_decoder_sa2_with_tiling)
             ctx = decode_all_batches(
                 runner,
                 ctx=ctx,
@@ -507,6 +605,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 progress_callback=progress_callback,
                 cache_model=vae_cache
             )
+            end_vae_phase()  # Finalize decoder telemetry
 
             # Phase 4: Post-processing
             ctx = postprocess_all_batches(
@@ -570,6 +669,9 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             if total_execution_time > 0:
                 fps = gen_info['total_frames'] / total_execution_time
                 debug.log(f"Average FPS: {fps:.2f} frames/sec", category="timing", force=True)
+
+            # TRUTH MONITOR: Print GPU telemetry summary
+            print_execution_summary()
 
             # Print footer
             debug.print_footer()
