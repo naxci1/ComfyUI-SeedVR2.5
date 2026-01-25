@@ -53,10 +53,22 @@ class TimeEmbedding(nn.Module):
             flip_sin_to_cos=False,
             downscale_freq_shift=0,
         )
-        emb = emb.to(dtype)
+        
+        # NUMERICAL STABILITY: Keep embeddings in FP32 for temporal consistency
+        # Timestep embeddings control modulation across all 32 layers and 162 frames
+        # Small errors in embeddings compound throughout the network
+        emb = emb.to(torch.float32)
+        
+        # Cast to projection layer dtype before each linear operation to prevent dtype mismatch
+        # This is critical when using NVFP4 quantization (BF16 weights) on Blackwell
+        emb = emb.to(self.proj_in.weight.dtype)
         emb = self.proj_in(emb)
         emb = self.act(emb)
+        
+        emb = emb.to(self.proj_hid.weight.dtype)
         emb = self.proj_hid(emb)
         emb = self.act(emb)
+        
+        emb = emb.to(self.proj_out.weight.dtype)
         emb = self.proj_out(emb)
         return emb

@@ -1061,6 +1061,60 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
         return True
 
 
+def _move_model_with_nvfp4_support(model: torch.nn.Module, target_device: torch.device, 
+                                   debug: Optional['Debug'] = None):
+    """
+    Move model to target device with special handling for NVFP4LinearKernel modules.
+    
+    NVFP4LinearKernel modules may have buffers on meta device that need to be
+    materialized using to_empty() before standard .to() can work.
+    
+    This function:
+    1. Detects NVFP4LinearKernel modules
+    2. Materializes their meta tensor buffers using to_empty()
+    3. Then performs standard model.to(device)
+    
+    Args:
+        model: Model to move
+        target_device: Target device
+        debug: Optional debug instance
+    """
+    # CRITICAL: Check if model has ANY meta tensors
+    # If yes, MUST use to_empty() instead of to()
+    # PyTorch cannot copy data from meta tensors - they have no data!
+    has_meta_tensors = False
+    
+    for param in model.parameters():
+        if param.device.type == 'meta':
+            has_meta_tensors = True
+            break
+    
+    if not has_meta_tensors:
+        for buffer in model.buffers():
+            if buffer.device.type == 'meta':
+                has_meta_tensors = True
+                break
+    
+    # If model has meta tensors, MUST use to_empty() not to()
+    if has_meta_tensors:
+        if debug:
+            debug.log(f"Model contains meta tensors - using to_empty() to materialize to {target_device}", 
+                     category="nvfp4")
+        
+        # Use to_empty to materialize the entire model at once
+        # This allocates real memory for all parameters and buffers WITHOUT copying data
+        model = model.to_empty(device=target_device)
+        
+        if debug:
+            debug.log(f"Model successfully materialized to {target_device} using to_empty()", 
+                     category="success")
+    else:
+        # No meta tensors - safe to use standard .to()
+        if debug:
+            debug.log(f"Moving model to {target_device} (no meta tensors)", category="general")
+        model.to(target_device)
+
+
 def _standard_model_movement(model: torch.nn.Module, current_device: torch.device,
                             target_device: torch.device, target_type: str, model_name: str,
                             debug: Optional['Debug'] = None, reason: Optional[str] = None) -> bool:
@@ -1101,7 +1155,8 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
         debug.start_timer(timer_name)
     
     # Move model and clear gradients
-    model.to(target_device)
+    # Special handling for NVFP4LinearKernel modules to avoid meta tensor errors
+    _move_model_with_nvfp4_support(model, target_device, debug)
     model.zero_grad(set_to_none=True)
     
     # Clear VAE memory buffers when moving to CPU

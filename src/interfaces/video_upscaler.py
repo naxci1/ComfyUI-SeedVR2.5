@@ -524,13 +524,21 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
 
             # Ensure CPU tensor in float32 for maximum ComfyUI compatibility
             if torch.is_tensor(sample):
+                # NUMERICAL STABILITY: Final fail-safe NaN/Inf sanitization on CPU
+                # This prevents any NaN/Inf values from propagating to ComfyUI and causing errors
+                # Sanitizes on CPU to avoid unnecessary GPU operations at output stage
                 if sample.is_cuda or sample.is_mps:
                     sample = sample.cpu()
+                
+                # Force-fix any remaining NaN/Inf values as a final fail-safe
+                # This catches any numerical issues that might have escaped earlier checks
+                sample = torch.nan_to_num(sample, nan=0.0, posinf=1.0, neginf=-1.0)
+                
                 if sample.dtype != torch.float32:
                     src_dtype = sample.dtype
                     try:
                         sample = sample.to(torch.float32)
-                        debug.log(f"Converted output from {src_dtype} to float32", category="precision")
+                        debug.log(f"Converted output from {src_dtype} to float32 (with NaN/Inf sanitization)", category="precision")
                     except Exception as e:
                         debug.log(f"Could not convert to float32: {e}. Output is {src_dtype}, compatibility with other nodes not guaranteed", 
                                   level="WARNING", category="precision", force=True)

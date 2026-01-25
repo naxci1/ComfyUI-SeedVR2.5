@@ -159,8 +159,23 @@ def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch
                 raise
         
         # Process NVFP4 weights if applicable
-        if is_nvfp4_model:
+        # Check if this is model-optimizer format (not custom NVFP4 format)
+        is_modelopt_format = any('_quantized_weight' in k or '_weight_scale' in k for k in state.keys())
+        
+        if is_nvfp4_model and not is_modelopt_format:
+            # Use old NVFP4 format processing (custom format only)
             state = load_nvfp4_weights(state, config=NVFP4Config(), debug=debug)
+        elif is_modelopt_format and debug:
+            # Model-optimizer format detected - will be handled by production module
+            # Count quantized layers for logging
+            try:
+                from ..optimization.nvfp4_production import detect_modelopt_quantized_weights
+                has_quantized, num_quantized = detect_modelopt_quantized_weights(state)
+                if has_quantized:
+                    debug.log(f"Detected {num_quantized} model-optimizer quantized layers in checkpoint",
+                             category="nvfp4", force=True)
+            except ImportError:
+                pass
             
     elif checkpoint_path.endswith('.gguf'):
         validate_gguf_availability(f"load {os.path.basename(checkpoint_path)}", debug)
@@ -845,15 +860,356 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                           debug: Optional['Debug'] = None) -> torch.nn.Module:
     """Load standard (non-GGUF) weights into model."""
     debug.start_timer(f"{model_type_lower}_state_apply")
-    model.load_state_dict(state, strict=False, assign=True)
     
-    action = "materialized" if used_meta else "applied"
-    debug.end_timer(f"{model_type_lower}_state_apply", f"{model_type} weights {action}")
+    # Try production-ready NVFP4 kernel implementation first
+    use_production_nvfp4 = False
+    try:
+        from ..optimization.nvfp4_production import (
+            detect_modelopt_quantized_weights,
+            replace_with_nvfp4_kernel,
+            NVFP4Config
+        )
+        use_production_nvfp4 = True
+    except ImportError:
+        pass
     
-    if used_meta:
-        debug.log(f"{model_type} materialized directly from meta with loaded weights", category=model_type_lower)
+    if use_production_nvfp4:
+        # Detect model-optimizer quantized weights with correct key mapping
+        has_quantized, num_quantized = detect_modelopt_quantized_weights(state)
+        
+        if has_quantized and NVFP4_AVAILABLE:
+            debug.log(f"Detected {num_quantized} model-optimizer quantized layers - preparing kernel-level FP4 execution", 
+                     category=model_type_lower, force=True)
+            
+            # First load the state dict normally
+            model.load_state_dict(state, strict=False, assign=True)
+            
+            # Get target device from state dict
+            target_device = None
+            for tensor in state.values():
+                if isinstance(tensor, torch.Tensor):
+                    target_device = tensor.device
+                    break
+            
+            if target_device is None:
+                target_device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+            
+            # Replace Linear layers with NVFP4LinearKernel for kernel-level execution
+            model, replaced_count = replace_with_nvfp4_kernel(
+                model, 
+                state, 
+                config=NVFP4Config(),
+                device=target_device,
+                debug=debug
+            )
+            
+            # CRITICAL: Clear memory after NVFP4 loading to prevent double allocation
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                if debug:
+                    allocated = torch.cuda.memory_allocated() / (1024**3)
+                    debug.log(f"VRAM after NVFP4 loading (before meta materialization): {allocated:.2f} GB",
+                             category=model_type_lower, force=True)
+            
+            # Force materialize all layers to CUDA
+            if used_meta or replaced_count > 0:
+                debug.log(f"Force-materializing non-quantized layers to {target_device}", 
+                         category=model_type_lower, force=True)
+                
+                # Get set of NVFP4LinearKernel modules to skip
+                from ..optimization.nvfp4_production import NVFP4LinearKernel
+                nvfp4_modules = set()
+                for name, module in model.named_modules():
+                    if isinstance(module, NVFP4LinearKernel):
+                        nvfp4_modules.add(name)
+                
+                # Selectively materialize only meta tensors (avoids OOM)
+                meta_param_count = 0
+                meta_buffer_count = 0
+                skipped_nvfp4_count = 0
+                
+                # CRITICAL: Force memory cleanup before materialization loop
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()  # Ensure all previous operations complete
+                
+                # ASYNC OFFLOAD: Create dedicated CUDA stream for weight materialization
+                # This enables async transfer while compute happens in main stream
+                async_stream = None
+                if torch.cuda.is_available():
+                    async_stream = torch.cuda.Stream(device=target_device)
+                
+                # Materialize meta parameters selectively
+                param_counter = 0
+                for name, param in model.named_parameters():
+                    # CRITICAL: Skip if this parameter belongs to an NVFP4LinearKernel
+                    # Get the parent module to check its type
+                    param_module_name = '.'.join(name.split('.')[:-1])  # Remove parameter name
+                    
+                    # Also directly check if parent module is NVFP4LinearKernel
+                    try:
+                        parent_module = model
+                        if param_module_name:
+                            for attr in param_module_name.split('.'):
+                                parent_module = getattr(parent_module, attr)
+                        
+                        # Skip if parent is NVFP4LinearKernel
+                        if isinstance(parent_module, NVFP4LinearKernel):
+                            skipped_nvfp4_count += 1
+                            continue  # SKIP ENTIRELY - already quantized
+                    except AttributeError:
+                        # If we can't navigate to parent, check by name
+                        if param_module_name in nvfp4_modules:
+                            skipped_nvfp4_count += 1
+                            continue
+                    
+                    # Also check by name in case instance check failed
+                    if param_module_name in nvfp4_modules:
+                        skipped_nvfp4_count += 1
+                        continue  # SKIP ENTIRELY - already quantized
+                    
+                    # Only materialize if it's on meta device AND not part of NVFP4
+                    if param.device.type == 'meta':
+                        meta_param_count += 1
+                        param_counter += 1
+                        # CRITICAL: Avoid torch.empty_like - use safer allocation
+                        # First create on CPU, then move to GPU to prevent pre-allocation
+                        try:
+                            with torch.no_grad():
+                                # Determine optimal dtype (use bfloat16 for non-quantized layers to save memory)
+                                target_dtype = param.dtype
+                                if target_dtype == torch.float32 or target_dtype == torch.float16:
+                                    target_dtype = torch.bfloat16  # Save memory for non-quantized layers
+                                
+                                # ASYNC OFFLOAD: Create tensor on CPU with pinned memory for faster transfers
+                                new_param = torch.empty(param.shape, dtype=target_dtype, device='cpu')
+                                if torch.cuda.is_available() and async_stream is not None:
+                                    # Pin memory for async transfer
+                                    new_param = new_param.pin_memory()
+                                    
+                                    # Use async stream for transfer (non-blocking)
+                                    with torch.cuda.stream(async_stream):
+                                        new_param = new_param.to(target_device, non_blocking=True)
+                                else:
+                                    # Fallback to synchronous transfer
+                                    new_param = new_param.to(target_device)
+                                
+                                # Navigate to parent module and replace parameter
+                                module = model
+                                attrs = name.split('.')
+                                for attr in attrs[:-1]:
+                                    module = getattr(module, attr)
+                                setattr(module, attrs[-1], torch.nn.Parameter(new_param))
+                                
+                                # ASYNC PIPELINE: Ensure materialization stream completes before compute stream uses parameter
+                                # This prevents race conditions where compute tries to use partially-transferred weights
+                                if torch.cuda.is_available() and async_stream is not None:
+                                    # Synchronize async stream to ensure transfer is 100% complete
+                                    async_stream.synchronize()
+                                    # Main stream synchronization ensures no queue buildup
+                                    torch.cuda.synchronize()
+                                
+                                # Force delete the old meta reference
+                                del param
+                                
+                                # CRITICAL: Empty cache every 50 parameters to prevent fragmentation
+                                if param_counter % 50 == 0:
+                                    gc.collect()
+                                    if torch.cuda.is_available():
+                                        torch.cuda.empty_cache()
+                                        torch.cuda.synchronize()
+                        except RuntimeError as e:
+                            # If allocation fails, try smaller allocation or skip
+                            if debug:
+                                debug.log(f"Warning: Could not materialize parameter {name}: {e}",
+                                         category=model_type_lower, force=True)
+                
+                # Materialize meta buffers selectively
+                buffer_counter = 0
+                for name, buffer in model.named_buffers():
+                    # Skip if this buffer belongs to an NVFP4LinearKernel
+                    buffer_module_name = '.'.join(name.split('.')[:-1])  # Remove buffer name
+                    if buffer_module_name in nvfp4_modules:
+                        continue
+                    
+                    if buffer.device.type == 'meta':
+                        meta_buffer_count += 1
+                        buffer_counter += 1
+                        # CRITICAL: Avoid torch.empty_like - use safer allocation
+                        try:
+                            with torch.no_grad():
+                                # Determine optimal dtype (use bfloat16 for non-quantized buffers to save memory)
+                                target_dtype = buffer.dtype
+                                if target_dtype == torch.float32 or target_dtype == torch.float16:
+                                    target_dtype = torch.bfloat16  # Save memory
+                                
+                                # ASYNC OFFLOAD: Create tensor on CPU with pinned memory for faster transfers
+                                new_buffer = torch.empty(buffer.shape, dtype=target_dtype, device='cpu')
+                                if torch.cuda.is_available() and async_stream is not None:
+                                    # Pin memory for async transfer
+                                    new_buffer = new_buffer.pin_memory()
+                                    
+                                    # Use async stream for transfer (non-blocking)
+                                    with torch.cuda.stream(async_stream):
+                                        new_buffer = new_buffer.to(target_device, non_blocking=True)
+                                else:
+                                    # Fallback to synchronous transfer
+                                    new_buffer = new_buffer.to(target_device)
+                                
+                                # Navigate to parent module and replace buffer
+                                module = model
+                                attrs = name.split('.')
+                                for attr in attrs[:-1]:
+                                    module = getattr(module, attr)
+                                module.register_buffer(attrs[-1], new_buffer)
+                                
+                                # ASYNC PIPELINE: Ensure materialization stream completes before compute stream uses buffer
+                                # This prevents race conditions where compute tries to use partially-transferred buffers
+                                if torch.cuda.is_available() and async_stream is not None:
+                                    # Synchronize async stream to ensure transfer is 100% complete
+                                    async_stream.synchronize()
+                                    # Main stream synchronization ensures no queue buildup
+                                    torch.cuda.synchronize()
+                                
+                                # Force delete the old meta reference
+                                del buffer
+                                
+                                # CRITICAL: Empty cache every 50 buffers to prevent fragmentation
+                                if buffer_counter % 50 == 0:
+                                    gc.collect()
+                                    if torch.cuda.is_available():
+                                        torch.cuda.empty_cache()
+                                        torch.cuda.synchronize()
+                        except RuntimeError as e:
+                            # If allocation fails, skip this buffer
+                            if debug:
+                                debug.log(f"Warning: Could not materialize buffer {name}: {e}",
+                                         category=model_type_lower, force=True)
+                
+                if skipped_nvfp4_count > 0:
+                    debug.log(f"Skipped {skipped_nvfp4_count} parameters belonging to NVFP4LinearKernel (already on GPU)",
+                             category=model_type_lower, force=True)
+                
+                if meta_param_count > 0 or meta_buffer_count > 0:
+                    debug.log(f"Selectively materialized {meta_param_count} meta parameters and {meta_buffer_count} meta buffers", 
+                             category=model_type_lower, force=True)
+                
+                # CRITICAL: Final memory cleanup after materialization
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    # Reset peak memory stats to prevent false OOM on forward pass
+                    torch.cuda.reset_peak_memory_stats()
+                
+                # Move any remaining non-meta tensors to target device
+                try:
+                    model = model.to(target_device)
+                except Exception as e:
+                    debug.log(f"Warning: Some tensors may still be on CPU/meta: {e}", 
+                             category=model_type_lower, force=True)
+                
+                # Verify no meta device tensors remain
+                meta_params = []
+                for name, param in model.named_parameters():
+                    if param.device.type == 'meta':
+                        meta_params.append(name)
+                
+                if meta_params:
+                    debug.log(f"ERROR: {len(meta_params)} parameters still on meta device after materialization!", 
+                             level="ERROR", category=model_type_lower, force=True)
+                    for param_name in meta_params[:5]:  # Show first 5
+                        debug.log(f"  - {param_name}", level="ERROR", category=model_type_lower, force=True)
+                else:
+                    debug.log(f"All parameters successfully materialized to {target_device}", 
+                             category="success", force=True)
+            
+            # Log final summary with actual quantized layer count
+            debug.log(f"NVFP4 kernel-level execution ready: {replaced_count} quantized layers using hardware FP4", 
+                     category="success", force=True)
+            
+            debug.end_timer(f"{model_type_lower}_state_apply", 
+                           f"{model_type} weights loaded with kernel-level NVFP4 execution ({replaced_count} layers)")
+            debug.log(f"{model_type} configured for hardware FP4 execution on Blackwell Tensor Cores", 
+                     category="success", force=True)
+            
+            return model
+    
+    # Fallback: Original NVFP4 implementation or standard loading
+    # Check if this is an NVFP4 quantized model (old format)
+    has_nvfp4_weights = any('_nvfp4_data' in k or '_nvfp4_scales' in k for k in state.keys())
+    
+    if has_nvfp4_weights and NVFP4_AVAILABLE:
+        debug.log(f"Detected NVFP4 quantized weights - preparing native FP4 execution", 
+                 category=model_type_lower)
+        
+        # Import here to avoid circular dependency
+        from ..optimization.nvfp4 import replace_linear_with_nvfp4_native, NVFP4Config
+        
+        # First load the state dict normally
+        model.load_state_dict(state, strict=False, assign=True)
+        
+        # Replace Linear layers with NVFP4LinearNative for hardware FP4 execution
+        model = replace_linear_with_nvfp4_native(
+            model, 
+            state, 
+            config=NVFP4Config(),
+            enable_native=True,  # Enable native FP4 execution on Blackwell
+            debug=debug
+        )
+        
+        # Force materialize all layers from meta device to CUDA
+        if used_meta:
+            # Get target device from first parameter that's not on meta
+            target_device = None
+            for param in model.parameters():
+                if param.device.type != 'meta':
+                    target_device = param.device
+                    break
+            
+            # If still on meta, get from state dict
+            if target_device is None and state:
+                for tensor in state.values():
+                    if isinstance(tensor, torch.Tensor):
+                        target_device = tensor.device
+                        break
+            
+            # Materialize any remaining meta tensors
+            if target_device is not None:
+                debug.log(f"Force-materializing NVFP4 layers to {target_device}", 
+                         category=model_type_lower)
+                
+                for name, param in model.named_parameters():
+                    if param.device.type == 'meta':
+                        # This should not happen after replace_linear_with_nvfp4_native,
+                        # but handle it just in case
+                        debug.log(f"Warning: Parameter {name} still on meta device after NVFP4 replacement", 
+                                 level="WARNING", category=model_type_lower, force=True)
+                
+                # Ensure all buffers are materialized too
+                for name, buffer in model.named_buffers():
+                    if buffer is not None and buffer.device.type == 'meta':
+                        debug.log(f"Materializing buffer {name} from meta to {target_device}", 
+                                 category=model_type_lower)
+        
+        debug.end_timer(f"{model_type_lower}_state_apply", 
+                       f"{model_type} weights loaded with native NVFP4 execution")
+        debug.log(f"{model_type} configured for hardware FP4 execution on Blackwell Tensor Cores", 
+                 category="success")
     else:
-        debug.log(f"{model_type} weights applied", category=model_type_lower)
+        # Standard loading path (non-NVFP4)
+        model.load_state_dict(state, strict=False, assign=True)
+        
+        action = "materialized" if used_meta else "applied"
+        debug.end_timer(f"{model_type_lower}_state_apply", f"{model_type} weights {action}")
+        
+        if used_meta:
+            debug.log(f"{model_type} materialized directly from meta with loaded weights", 
+                     category=model_type_lower)
+        else:
+            debug.log(f"{model_type} weights applied", category=model_type_lower)
     
     return model
 

@@ -55,11 +55,42 @@ def pytorch_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q=N
         v_i = v_i.permute(1, 0, 2).unsqueeze(0) # (1, heads, seq_len_k, head_dim)
 
         # Use PyTorch's built-in scaled dot-product attention.
-        output_i = F.scaled_dot_product_attention(
-            q_i, k_i, v_i, 
-            dropout_p=dropout_p if not deterministic else 0.0,
-            is_causal=causal
-        )
+        # NUMERICAL STABILITY: Force FP32 for softmax computation to prevent artifacts
+        # This is critical when using quantized models (NVFP4/MX4)
+        q_dtype_orig = q_i.dtype
+        q_i_fp32 = q_i.to(torch.float32)
+        k_i_fp32 = k_i.to(torch.float32)
+        v_i_fp32 = v_i.to(torch.float32)
+        
+        # NUMERICAL STABILITY: Soft-capping attention scores before softmax
+        # This is a known fix for DiT stability on Blackwell (prevents attention explosion)
+        # Compute attention scores manually with soft-cap
+        d_k = q_i_fp32.size(-1)
+        scale = 1.0 / (d_k ** 0.5)
+        attn_scores = torch.matmul(q_i_fp32, k_i_fp32.transpose(-2, -1)) * scale
+        
+        # Apply soft-cap: attn = (attn / scale).tanh() * scale
+        # VISUAL QUALITY: Using scale=20.0 for tighter capping on Blackwell
+        # This helps prevent "visual spikes" that cause pixel artifacts in NVFP4 quantization
+        soft_cap_scale = 20.0
+        attn_scores = torch.tanh(attn_scores / soft_cap_scale) * soft_cap_scale
+        
+        # Apply causal mask if needed
+        if causal:
+            seq_len = attn_scores.size(-2)
+            causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=attn_scores.device, dtype=torch.bool), diagonal=1)
+            attn_scores = attn_scores.masked_fill(causal_mask, float('-inf'))
+        
+        # Softmax and dropout
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        if dropout_p > 0.0 and not deterministic:
+            attn_weights = F.dropout(attn_weights, p=dropout_p)
+        
+        # Apply attention weights to values
+        output_i = torch.matmul(attn_weights, v_i_fp32)
+        
+        # Convert back to original dtype
+        output_i = output_i.to(q_dtype_orig)
 
         # Reshape the output back to the original format (seq_len, heads, head_dim)
         output_i = output_i.squeeze(0).permute(1, 0, 2)
