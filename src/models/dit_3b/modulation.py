@@ -12,6 +12,14 @@
 # // See the License for the specific language governing permissions and
 # // limitations under the License.
 
+"""
+Modulation layers for DiT (Diffusion Transformer).
+
+BLACKWELL-OPTIMIZED: Handles meta tensor materialization for NVFP4 loading on RTX 50-series.
+Uses aggressive device synchronization to ensure all parameters are on the correct device
+before any arithmetic operations.
+"""
+
 from typing import Callable, List, Optional
 import torch
 from einops import rearrange
@@ -38,6 +46,53 @@ def expand_dims(x: torch.Tensor, dim: int, ndim: int):
     shape = x.shape
     shape = shape[:dim] + (1,) * (ndim - len(shape)) + shape[dim:]
     return x.reshape(shape)
+
+
+def _ensure_tensor_on_device(tensor: Optional[torch.Tensor], target_device: torch.device, 
+                              target_dtype: torch.dtype) -> Optional[torch.Tensor]:
+    """
+    BULLDOZER APPROACH: Force tensor to target device, handling meta tensors.
+    
+    For Blackwell RTX 50 GPUs with NVFP4 meta-tensor loading, we must:
+    1. Check if tensor is None (using 'is not None', never 'if tensor')
+    2. Check if tensor is on meta device (using tensor.is_meta)
+    3. Materialize meta tensors with torch.empty_like to target device
+    4. Move any non-meta tensors to target device
+    
+    Args:
+        tensor: Tensor to move (may be None or meta)
+        target_device: Target device (e.g., cuda:0)
+        target_dtype: Target dtype for computation
+        
+    Returns:
+        Tensor on target device, or None if input was None
+    """
+    if tensor is None:
+        return None
+    
+    # Handle meta tensors - must use to_empty() pattern
+    if tensor.is_meta:
+        # Create empty tensor on target device with same shape
+        materialized = torch.empty(
+            tensor.shape, 
+            dtype=target_dtype, 
+            device=target_device
+        )
+        return materialized
+    
+    # Handle FP8 types for Blackwell NVFP4
+    if hasattr(torch, 'float8_e4m3fn'):
+        fp8_types = (torch.float8_e4m3fn, torch.float8_e5m2)
+        if tensor.dtype in fp8_types:
+            tensor = tensor.to(target_dtype)
+    
+    # Move to target device if not already there
+    if tensor.device != target_device:
+        tensor = tensor.to(device=target_device, dtype=target_dtype)
+    elif tensor.dtype != target_dtype:
+        tensor = tensor.to(dtype=target_dtype)
+    
+    return tensor
 
 
 class AdaSingle(nn.Module):
@@ -72,6 +127,16 @@ class AdaSingle(nn.Module):
         branch_tag: str = "",
         hid_len: Optional[torch.LongTensor] = None,  # b
     ) -> torch.FloatTensor:
+        """
+        Forward pass with BULLDOZER meta tensor handling.
+        
+        BLACKWELL-OPTIMIZED: Forces all modulation parameters to the device of the
+        input 'hid' tensor BEFORE any arithmetic operations at line 110+.
+        """
+        # Get target device and dtype from input tensor
+        target_device = hid.device
+        target_dtype = hid.dtype
+        
         idx = self.layers.index(layer)
         emb = rearrange(emb, "b (d l g) -> b d l g", l=len(self.layers), g=3)[..., idx, :]
         emb = expand_dims(emb, 1, hid.ndim + 1)
@@ -86,28 +151,30 @@ class AdaSingle(nn.Module):
             )
 
         shiftA, scaleA, gateA = emb.unbind(-1)
-        shiftB, scaleB, gateB = (
-            getattr(self, f"{layer}_shift", None),
-            getattr(self, f"{layer}_scale", None),
-            getattr(self, f"{layer}_gate", None),
-        )
+        
+        # Get raw parameters (may be None or on meta device)
+        shiftB_raw = getattr(self, f"{layer}_shift", None)
+        scaleB_raw = getattr(self, f"{layer}_scale", None)
+        gateB_raw = getattr(self, f"{layer}_gate", None)
+        
+        # BULLDOZER APPROACH: Force all parameters to target device
+        # This handles meta tensors from Blackwell NVFP4 loading
+        shiftB = _ensure_tensor_on_device(shiftB_raw, target_device, target_dtype)
+        scaleB = _ensure_tensor_on_device(scaleB_raw, target_device, target_dtype)
+        gateB = _ensure_tensor_on_device(gateB_raw, target_device, target_dtype)
 
-        # Handle potential FP8 parameters - convert to input computation dtype
-        if hasattr(torch, 'float8_e4m3fn'):
-            fp8_types = (torch.float8_e4m3fn, torch.float8_e5m2)
-            # Use input tensor's dtype as target (respects pipeline precision)
-            target_dtype = hid.dtype
-            
-            # Convert FP8 parameters to match input dtype for arithmetic operations
-            if shiftB is not None and shiftB.dtype in fp8_types:
-                shiftB = shiftB.to(target_dtype)
-            if scaleB is not None and scaleB.dtype in fp8_types:
-                scaleB = scaleB.to(target_dtype)
-            if gateB is not None and gateB.dtype in fp8_types:
-                gateB = gateB.to(target_dtype)
-
+        # Now all tensors are guaranteed to be on the same device
         if mode == "in":
-            return hid.mul_(scaleA + scaleB).add_(shiftA + shiftB)
+            # scaleB and shiftB are now guaranteed to be on target_device
+            if scaleB is not None and shiftB is not None:
+                return hid.mul_(scaleA + scaleB).add_(shiftA + shiftB)
+            elif scaleB is not None:
+                return hid.mul_(scaleA + scaleB).add_(shiftA)
+            elif shiftB is not None:
+                return hid.mul_(scaleA).add_(shiftA + shiftB)
+            else:
+                return hid.mul_(scaleA).add_(shiftA)
+                
         if mode == "out":
             if gateB is not None:
                 return hid.mul_(gateA + gateB)

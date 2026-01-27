@@ -50,6 +50,7 @@ MODEL_REGISTRY = {
     
     # VAE models
     "ema_vae_fp16.safetensors": ModelInfo(category="vae", precision="fp16", sha256="20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1"),
+    "ema_vae_fp8.safetensors": ModelInfo(category="vae", precision="fp8_e4m3fn", sha256=None),  # User-provided FP8 VAE
 }
 
 # Note: NVFP4 models (e.g., seedvr2_ema_3b_nvfp4.safetensors) will be discovered automatically
@@ -90,6 +91,20 @@ def get_available_dit_models() -> List[str]:
     return model_list
 
 def get_available_vae_models() -> List[str]:
-    """Get all available VAE models from the registry"""
+    """Get all available VAE models including those discovered on disk"""
     model_list = get_default_models("vae")
-    return model_list
+    
+    try:
+        # Get all model files from all paths
+        model_files = get_all_model_files()
+        
+        # Add VAE files not in registry (e.g., user-provided ema_vae_fp8.safetensors)
+        for filename in model_files:
+            if filename not in MODEL_REGISTRY:
+                # Check if it looks like a VAE file (contains 'vae' in name)
+                if 'vae' in filename.lower():
+                    model_list.append(filename)
+    except:
+        pass
+    
+    return sorted(list(set(model_list)))  # Remove duplicates and sort

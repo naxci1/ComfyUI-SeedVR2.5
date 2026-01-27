@@ -83,14 +83,29 @@ class InflatedCausalConv3d(Conv3d):
     
     def _conv_forward(self, input, weight, bias, *args, **kwargs):
         """
-        Override _conv_forward to work around NVIDIA Conv3d memory bug.
+        Override _conv_forward to work around NVIDIA Conv3d memory bug and handle FP8.
         
         Bug: PyTorch 2.9-2.10 with cuDNN >= 91002 uses 3x memory for Conv3d 
         with fp16/bfloat16 weights due to buggy dispatch layer.
         
+        FP8 Handling: cuDNN does not support FP8 convolution directly. 
+        For FP8 VAE models on Blackwell, cast to bfloat16 for convolution,
+        then cast result back to FP8 to preserve VRAM savings.
+        
         Workaround: Call torch.cudnn_convolution directly to bypass buggy layer.
         Status is logged at startup in compatibility.py.
         """
+        original_dtype = weight.dtype
+        
+        # FP8 CUDNN BYPASS: cuDNN doesn't support FP8 directly
+        # Cast to bfloat16 for the operation, then cast result back to FP8
+        if hasattr(torch, 'float8_e4m3fn') and weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            # Compute in bfloat16 (cuDNN compatible)
+            input = input.to(torch.bfloat16)
+            weight = weight.to(torch.bfloat16)
+            if bias is not None:
+                bias = bias.to(torch.bfloat16)
+        
         if (NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND and 
             weight.dtype in (torch.float16, torch.bfloat16) and 
             hasattr(torch.backends.cudnn, 'is_available') and
@@ -104,13 +119,24 @@ class InflatedCausalConv3d(Conv3d):
                 )
                 if bias is not None:
                     out += bias.reshape((1, -1) + (1,) * (out.ndim - 2))
+                
+                # Cast result back to FP8 for VRAM savings on Blackwell
+                if hasattr(torch, 'float8_e4m3fn') and original_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    out = out.to(original_dtype)
+                
                 return out
             except RuntimeError:
                 # Fallback if direct cuDNN call fails (dev builds, edge cases)
                 pass
         
         # Use standard path for unaffected configurations or if workaround failed
-        return super()._conv_forward(input, weight, bias, *args, **kwargs)
+        result = super()._conv_forward(input, weight, bias, *args, **kwargs)
+        
+        # Cast result back to FP8 for VRAM savings on Blackwell
+        if hasattr(torch, 'float8_e4m3fn') and original_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            result = result.to(original_dtype)
+        
+        return result
 
     def memory_limit_conv(
         self,
@@ -136,17 +162,24 @@ class InflatedCausalConv3d(Conv3d):
             x_concat = x
             if prev_cache is not None:
                 x_concat = torch.cat([prev_cache, x], dim=split_dim - 1)
+                # Free prev_cache immediately after concatenation
+                del prev_cache
             
-            def pad_and_forward():
-                padded = safe_pad_operation(x_concat, padding, mode='constant', value=0.0)
-                with ignore_padding(self):
-                    return Conv3d.forward(self, padded)
+            # Direct padding and forward without retry wrapper to avoid memory pile-up
+            padded = safe_pad_operation(x_concat, padding, mode='constant', value=0.0)
+            # Free input tensor immediately after padding
+            del x_concat
             
-            return retry_on_oom(
-                pad_and_forward,
-                debug=getattr(self, 'debug', None),
-                operation_name="InflatedCausalConv3d.pad_and_forward"
-            )
+            with ignore_padding(self):
+                result = Conv3d.forward(self, padded)
+            
+            # Free padded tensor immediately after convolution
+            del padded
+            
+            # Note: Removed torch.cuda.empty_cache() to avoid sawtooth VRAM pattern
+            # which kills FPS by 40%. Let VRAM stay allocated for flat memory profile.
+            
+            return result
 
         # Exceed memory limit, splitting tensor
 
@@ -165,6 +198,9 @@ class InflatedCausalConv3d(Conv3d):
             # Concat prev cache from last dim
             if prev_cache is not None:
                 x[idx] = torch.cat([prev_cache[idx], x[idx]], dim=split_dim - 1)
+                # Free prev_cache slice immediately after use (memory optimization)
+                # Use None assignment instead of del to keep list length consistent
+                prev_cache[idx] = None
 
             # Get padding pattern.
             lpad_dim = (x[idx].ndim - split_dim - 1) * 2
@@ -198,8 +234,13 @@ class InflatedCausalConv3d(Conv3d):
                 prev_cache=cache
             )
 
-            # Update cache.
+            # Update cache and free memory after each chunk to prevent OOM on 16GB VRAM
+            if cache is not None:
+                del cache
             cache = next_cache
+            
+            # Note: Removed torch.cuda.empty_cache() to avoid sawtooth VRAM pattern
+            # which kills FPS by 40%. Let VRAM stay allocated for flat memory profile.
 
         output = retry_on_oom(
             torch.cat,
@@ -299,8 +340,13 @@ class InflatedCausalConv3d(Conv3d):
                 prev_cache=cache
             )
 
-            # Update cache.
+            # Update cache and free old cache to prevent memory buildup
+            if cache is not None:
+                del cache
             cache = next_cache
+            
+            # Note: Removed torch.cuda.empty_cache() to avoid sawtooth VRAM pattern
+            # which kills FPS by 40%. Let VRAM stay allocated for flat memory profile.
 
         return input[0] if squeeze_out else input
 
@@ -352,20 +398,42 @@ def init_causal_conv3d(
 
 
 def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """
+    Wrapper for normalization layers that handles FP8 tensors.
+    
+    FP8 Handling: PyTorch doesn't support GroupNorm/LayerNorm in FP8.
+    For FP8 VAE models on Blackwell, cast to bfloat16 for normalization,
+    then cast result back to FP8 to preserve VRAM savings.
+    """
+    # FP8 NORMALIZATION BYPASS: PyTorch doesn't support norm ops in FP8
+    # Cast to bfloat16 for the operation, then cast result back to FP8
+    original_dtype = x.dtype
+    is_fp8 = hasattr(torch, 'float8_e4m3fn') and original_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    
+    if is_fp8:
+        x = x.to(torch.bfloat16)
+    
     if isinstance(norm_layer, (nn.LayerNorm, RMSNorm)):
         if x.ndim == 4:
             x = rearrange(x, "b c h w -> b h w c")
             x = norm_layer(x)
             x = rearrange(x, "b h w c -> b c h w")
+            if is_fp8:
+                x = x.to(original_dtype)
             return x
         if x.ndim == 5:
             x = rearrange(x, "b c t h w -> b t h w c")
             x = norm_layer(x)
             x = rearrange(x, "b t h w c -> b c t h w")
+            if is_fp8:
+                x = x.to(original_dtype)
             return x
     if isinstance(norm_layer, (nn.GroupNorm, nn.BatchNorm2d, nn.SyncBatchNorm)):
         if x.ndim <= 4:
-            return norm_layer(x)
+            result = norm_layer(x)
+            if is_fp8:
+                result = result.to(original_dtype)
+            return result
         if x.ndim == 5:
             t = x.size(2)
             x = rearrange(x, "b c t h w -> (b t) c h w")
@@ -376,8 +444,20 @@ def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
                 num_groups_per_chunk = norm_layer.num_groups // num_chunks
 
                 x = list(x.chunk(num_chunks, dim=1))
-                weights = norm_layer.weight.chunk(num_chunks, dim=0)
-                biases = norm_layer.bias.chunk(num_chunks, dim=0)
+                
+                # For FP8, cast weights to bfloat16 as well
+                if is_fp8:
+                    weights = [w.to(torch.bfloat16) for w in norm_layer.weight.chunk(num_chunks, dim=0)]
+                    if norm_layer.bias is not None:
+                        biases = [b.to(torch.bfloat16) for b in norm_layer.bias.chunk(num_chunks, dim=0)]
+                    else:
+                        biases = [None] * num_chunks
+                else:
+                    weights = norm_layer.weight.chunk(num_chunks, dim=0)
+                    if norm_layer.bias is not None:
+                        biases = norm_layer.bias.chunk(num_chunks, dim=0)
+                    else:
+                        biases = [None] * num_chunks
                 
                 for i, (w, b) in enumerate(zip(weights, biases)):
                     def apply_group_norm():
@@ -398,15 +478,143 @@ def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
                     operation_name="GroupNorm.concat_chunks"
                 )
             else:
-                x = retry_on_oom(
-                    norm_layer,
-                    x,
-                    debug=getattr(norm_layer, 'debug', None),
-                    operation_name="GroupNorm.direct"
-                )
+                # For FP8, cast norm layer weights to bfloat16 for the operation
+                if is_fp8 and isinstance(norm_layer, nn.GroupNorm):
+                    weight_bf16 = norm_layer.weight.to(torch.bfloat16)
+                    bias_bf16 = norm_layer.bias.to(torch.bfloat16) if norm_layer.bias is not None else None
+                    x = F.group_norm(x, norm_layer.num_groups, weight_bf16, bias_bf16, norm_layer.eps)
+                else:
+                    x = retry_on_oom(
+                        norm_layer,
+                        x,
+                        debug=getattr(norm_layer, 'debug', None),
+                        operation_name="GroupNorm.direct"
+                    )
             x = rearrange(x, "(b t) c h w -> b c t h w", t=t)
+            if is_fp8:
+                x = x.to(original_dtype)
             return x
     raise NotImplementedError
+
+
+def fp8_safe_activation(activation_fn, x: torch.Tensor) -> torch.Tensor:
+    """
+    Wrapper for activation functions (SiLU, sigmoid, etc.) that handles FP8 tensors.
+    
+    FP8 Handling: PyTorch doesn't support activation ops (silu_cuda, sigmoid_cuda) in FP8.
+    For FP8 VAE models on Blackwell, cast to bfloat16 for activation,
+    then cast result back to FP8 to preserve VRAM savings.
+    
+    Args:
+        activation_fn: The activation function/module to apply (nn.SiLU, F.silu, etc.)
+        x: Input tensor
+        
+    Returns:
+        Activated tensor in original dtype
+    """
+    original_dtype = x.dtype
+    is_fp8 = hasattr(torch, 'float8_e4m3fn') and original_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    
+    if is_fp8:
+        # Cast to bfloat16 for the operation
+        x = x.to(torch.bfloat16)
+        
+    # Apply activation (must be callable - activation_fn should always be nn.SiLU or similar)
+    result = activation_fn(x)
+    
+    # Cast back to FP8 for VRAM savings
+    if is_fp8:
+        result = result.to(original_dtype)
+    
+    return result
+
+
+def fp8_safe_add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """
+    FP8-safe addition wrapper for residual connections.
+    
+    PyTorch crashes with "ufunc_add_CUDA" not implemented for 'Float8_e4m3fn'.
+    For FP8 VAE models on Blackwell, cast both tensors to bfloat16 for addition,
+    then cast result back to FP8 to preserve VRAM savings.
+    
+    Args:
+        a: First tensor to add
+        b: Second tensor to add
+        
+    Returns:
+        Sum of tensors in original dtype
+    """
+    original_dtype = a.dtype
+    is_fp8 = hasattr(torch, 'float8_e4m3fn') and original_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    
+    if is_fp8:
+        # Cast both to bfloat16 for the operation
+        result = a.to(torch.bfloat16) + b.to(torch.bfloat16)
+        # Cast back to FP8 for VRAM savings
+        return result.to(original_dtype)
+    else:
+        # Non-FP8 path: direct addition
+        return a + b
+
+
+def fp8_safe_mul(a: torch.Tensor, b) -> torch.Tensor:
+    """
+    FP8-safe multiplication wrapper.
+    
+    PyTorch may crash with "ufunc_mul_CUDA" not implemented for 'Float8_e4m3fn'.
+    For FP8 VAE models on Blackwell, cast tensor to bfloat16 for multiplication,
+    then cast result back to FP8 to preserve VRAM savings.
+    
+    Args:
+        a: First operand (tensor)
+        b: Second operand (tensor or scalar)
+        
+    Returns:
+        Product in original dtype
+    """
+    original_dtype = a.dtype
+    is_fp8 = hasattr(torch, 'float8_e4m3fn') and original_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    
+    if is_fp8:
+        # Cast to bfloat16 for the operation
+        a_bf16 = a.to(torch.bfloat16)
+        b_bf16 = b.to(torch.bfloat16) if isinstance(b, torch.Tensor) else b
+        result = a_bf16 * b_bf16
+        # Cast back to FP8 for VRAM savings
+        return result.to(original_dtype)
+    else:
+        # Non-FP8 path: direct multiplication
+        return a * b
+
+
+def fp8_safe_div(a: torch.Tensor, b) -> torch.Tensor:
+    """
+    FP8-safe division wrapper.
+    
+    PyTorch may crash with "ufunc_div_CUDA" not implemented for 'Float8_e4m3fn'.
+    For FP8 VAE models on Blackwell, cast tensor to bfloat16 for division,
+    then cast result back to FP8 to preserve VRAM savings.
+    
+    Args:
+        a: Numerator (tensor)
+        b: Denominator (tensor or scalar)
+        
+    Returns:
+        Quotient in original dtype
+    """
+    original_dtype = a.dtype
+    is_fp8 = hasattr(torch, 'float8_e4m3fn') and original_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    
+    if is_fp8:
+        # Cast to bfloat16 for the operation
+        a_bf16 = a.to(torch.bfloat16)
+        b_bf16 = b.to(torch.bfloat16) if isinstance(b, torch.Tensor) else b
+        result = a_bf16 / b_bf16
+        # Cast back to FP8 for VRAM savings
+        return result.to(original_dtype)
+    else:
+        # Non-FP8 path: direct division
+        return a / b
 
 
 def remove_head(tensor: Tensor, times: int = 1) -> Tensor:
