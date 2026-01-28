@@ -5,9 +5,14 @@ Configure VAE (Variational Autoencoder) model with tiling support and GGUF loadi
 
 from comfy_api.latest import io
 from comfy_execution.utils import get_executing_context
-from typing import Dict, Any, Tuple
-from ..utils.model_registry import get_available_vae_models, DEFAULT_VAE
+from typing import Dict, Any, Tuple, Optional
+import torch
+import os
+from ..utils.model_registry import get_available_vae_models, DEFAULT_VAE, get_model_repo
+from ..utils.constants import find_model_file
 from ..optimization.memory_manager import get_device_list
+from ..models.video_vae_v3.modules.attn_video_vae import VideoAutoencoderKLWrapper
+from ..optimization.vae_optimizer import optimize_3d_vae_for_blackwell
 
 
 class SeedVR2LoadVAEModel(io.ComfyNode):
@@ -187,7 +192,7 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                      cache_model: bool = False, torch_compile_args: Dict[str, Any] = None
                      ) -> io.NodeOutput:
         """
-        Create VAE model configuration for SeedVR2 main node with GGUF support
+        Load VAE model and apply Blackwell optimizations immediately
         
         Args:
             vae_name: Model filename to load (supports .safetensors and .gguf)
@@ -205,7 +210,7 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
             torch_compile_args: Optional torch.compile configuration from settings node
             
         Returns:
-            NodeOutput containing configuration dictionary for SeedVR2 main node
+            NodeOutput containing loaded and optimized VAE model with configuration
             
         Raises:
             ValueError: If cache_model is enabled but offload_device is invalid
@@ -222,8 +227,37 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
         # Detect if this is a GGUF model
         is_gguf = vae_name.endswith('.gguf')
         
+        # LOAD THE VAE MODEL NOW (not later)
+        vae_model = cls._load_vae_model(vae_name, device, is_gguf)
+        
+        # FORCE BLACKWELL OPTIMIZATION IMMEDIATELY
+        if is_gguf and enable_blackwell_optimization:
+            print("\n" + "="*60)
+            print("[BLACKWELL_ENGINE] !!! FORCING SM_120 FP8 OPTIMIZATION !!!")
+            print("="*60)
+            
+            # Apply Blackwell optimization RIGHT NOW
+            vae_model = optimize_3d_vae_for_blackwell(
+                vae_model,
+                device="cuda",  # Force CUDA device
+                vram_gb=16.0,   # RTX 5070 Ti target
+                enable_fp8=True,
+                enable_channels_last_3d=True,
+                enable_flash_attention=True,
+                enable_cuda_graphs=True,
+                verbose=True
+            )
+            
+            # Force larger tile size for 16GB VRAM
+            if decode_tiled:
+                decode_tile_size = max(decode_tile_size, 1280)
+                print(f"[BLACKWELL_ENGINE] Tile size boosted to {decode_tile_size} for RTX 5070 Ti")
+            
+            print("="*60 + "\n")
+        
         config = {
-            "model": vae_name,
+            "model": vae_model,  # Return the actual loaded model, not just name
+            "model_name": vae_name,
             "device": device,
             "offload_device": offload_device,
             "cache_model": cache_model,
@@ -236,25 +270,55 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
             "tile_debug": tile_debug,
             "torch_compile_args": torch_compile_args,
             "node_id": get_executing_context().node_id,
-            # GGUF-specific configuration
             "is_gguf": is_gguf,
-            "enable_blackwell_optimization": enable_blackwell_optimization and is_gguf,
-            "blackwell_vram_gb": 16.0,  # Target RTX 5070 Ti with 16GB VRAM
-            "blackwell_target_vram_usage": 0.8125,  # 13GB of 16GB (81.25%)
+            "is_optimized": is_gguf and enable_blackwell_optimization,
         }
         
-        # Log GGUF detection and optimization status
-        if is_gguf:
-            import logging
-            logger = logging.getLogger(__name__)
-            if enable_blackwell_optimization:
-                logger.info(f"[BLACKWELL_ENGINE] GGUF VAE detected: {vae_name}")
-                logger.info(f"[BLACKWELL_ENGINE] Blackwell sm_120 optimizations will be applied on load:")
-                logger.info(f"[BLACKWELL_ENGINE]   - FP8 native inference (torch.float8_e4m3fn)")
-                logger.info(f"[BLACKWELL_ENGINE]   - Smart dynamic tiling (13GB VRAM target)")
-                logger.info(f"[BLACKWELL_ENGINE]   - Channels Last 3D memory format")
-                logger.info(f"[BLACKWELL_ENGINE]   - CUDA Graph capture for Windows")
-            else:
-                logger.info(f"[BLACKWELL_ENGINE] GGUF VAE detected but optimization disabled: {vae_name}")
-        
         return io.NodeOutput(config)
+    
+    @classmethod
+    def _load_vae_model(cls, vae_name: str, device: str, is_gguf: bool) -> Any:
+        """
+        Load VAE model from file
+        
+        Args:
+            vae_name: Model filename
+            device: Target device
+            is_gguf: Whether this is a GGUF model
+            
+        Returns:
+            Loaded VAE model
+        """
+        # Get model path
+        model_path = find_model_file(vae_name)
+        
+        # Check if file exists
+        if not os.path.exists(model_path):
+            # Try to download from HuggingFace
+            repo = get_model_repo(vae_name)
+            print(f"[VAE Loader] Downloading {vae_name} from {repo}...")
+            # This will download automatically via VideoAutoencoderKLWrapper
+        
+        print(f"[VAE Loader] Loading VAE model: {vae_name}")
+        print(f"[VAE Loader] Path: {model_path}")
+        print(f"[VAE Loader] Device: {device}")
+        print(f"[VAE Loader] Format: {'GGUF' if is_gguf else 'SafeTensors'}")
+        
+        # Load the model using VideoAutoencoderKLWrapper
+        try:
+            vae = VideoAutoencoderKLWrapper.from_pretrained(
+                model_path if os.path.exists(model_path) else get_model_repo(vae_name),
+                subfolder="vae" if not os.path.exists(model_path) else None,
+                torch_dtype=torch.bfloat16 if not is_gguf else None,  # Will be converted to FP8 later
+            )
+            
+            # Move to device
+            if device != "cpu":
+                vae = vae.to(device)
+            
+            print(f"[VAE Loader] ✓ Model loaded successfully")
+            return vae
+            
+        except Exception as e:
+            print(f"[VAE Loader] ✗ Error loading model: {e}")
+            raise
