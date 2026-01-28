@@ -4,22 +4,24 @@ Optimized for Windows + RTX 50xx Blackwell Architecture
 
 Key Optimizations:
 - Channels Last memory format for 2D convolutions
-- FP8 precision support for Blackwell Tensor Cores
+- FP8 precision support for Blackwell Tensor Cores (preparatory)
 - CuDNN auto-tuner enabled
 - Fused activation functions (F.silu, F.gelu)
 - Optimized reparameterization with minimal CPU-GPU sync
 - Mixed precision with autocast
 - Efficient upsampling with nearest-exact mode
 - No torch.compile (Windows compatible)
+
+Note: Global CuDNN settings are configured at module import.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, List
-import platform
 
 # Enable CuDNN auto-tuner for optimal conv performance on Blackwell
+# Note: These are global settings that affect all models in the process
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.allow_tf32 = True  # Enable TF32 for Ampere+ GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -454,10 +456,17 @@ class Wan2_1_VAE(nn.Module):
     def enable_fp8(self):
         """
         Enable FP8 precision for Blackwell 50xx GPUs
-        Note: Requires PyTorch with FP8 support
+        
+        Note: This is preparatory code. Full FP8 support requires:
+        - PyTorch with FP8 support (experimental as of PyTorch 2.4+)
+        - Blackwell GPU (RTX 50xx series)
+        - Manual conversion of model weights to FP8 format
+        
+        Currently only sets flag for future implementation.
         """
         self.use_fp8 = True
-        # FP8 conversion will be applied during forward pass with autocast
+        # TODO: Implement actual FP8 conversion when PyTorch support stabilizes
+        # This would involve converting conv weights to torch.float8_e4m3fn
         return self
     
     def encode(self, x: torch.Tensor, use_amp: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -473,11 +482,10 @@ class Wan2_1_VAE(nn.Module):
         if self.use_channels_last and x.dim() == 4:
             x = x.to(memory_format=torch.channels_last)
         
-        # Use autocast for mixed precision
-        if use_amp and torch.cuda.is_available():
-            with torch.cuda.amp.autocast(enabled=True):
-                mean, logvar = self.encoder(x)
-        else:
+        # Use autocast context if needed
+        autocast_ctx = torch.cuda.amp.autocast(enabled=True) if (use_amp and torch.cuda.is_available()) else torch.no_grad()
+        
+        with autocast_ctx:
             mean, logvar = self.encoder(x)
         
         return mean, logvar
@@ -495,11 +503,10 @@ class Wan2_1_VAE(nn.Module):
         if self.use_channels_last and z.dim() == 4:
             z = z.to(memory_format=torch.channels_last)
         
-        # Use autocast for mixed precision
-        if use_amp and torch.cuda.is_available():
-            with torch.cuda.amp.autocast(enabled=True):
-                x_recon = self.decoder(z)
-        else:
+        # Use autocast context if needed
+        autocast_ctx = torch.cuda.amp.autocast(enabled=True) if (use_amp and torch.cuda.is_available()) else torch.no_grad()
+        
+        with autocast_ctx:
             x_recon = self.decoder(z)
         
         return x_recon
@@ -540,24 +547,10 @@ class Wan2_1_VAE(nn.Module):
         if self.use_channels_last and x.dim() == 4:
             x = x.to(memory_format=torch.channels_last)
         
-        # Use autocast for mixed precision
-        if use_amp and torch.cuda.is_available():
-            with torch.cuda.amp.autocast(enabled=True):
-                # Encode
-                mean, logvar = self.encoder(x)
-                
-                # Reparameterize
-                z = self.encoder.reparameterize(mean, logvar)
-                
-                # Decode
-                x_recon = self.decoder(z)
-                
-                if return_loss:
-                    # KL divergence loss (computed in float32 for stability)
-                    kl_loss = -0.5 * torch.sum(1 + logvar - mean.pow(2) - logvar.exp(), dim=1)
-                    kl_loss = kl_loss.mean()
-                    return x_recon, kl_loss
-        else:
+        # Use autocast context if needed
+        autocast_ctx = torch.cuda.amp.autocast(enabled=True) if (use_amp and torch.cuda.is_available()) else torch.no_grad()
+        
+        with autocast_ctx:
             # Encode
             mean, logvar = self.encoder(x)
             
@@ -568,7 +561,7 @@ class Wan2_1_VAE(nn.Module):
             x_recon = self.decoder(z)
             
             if return_loss:
-                # KL divergence loss
+                # KL divergence loss (computed in float32 for stability)
                 kl_loss = -0.5 * torch.sum(1 + logvar - mean.pow(2) - logvar.exp(), dim=1)
                 kl_loss = kl_loss.mean()
                 return x_recon, kl_loss

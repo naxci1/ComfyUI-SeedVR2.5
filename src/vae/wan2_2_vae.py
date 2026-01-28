@@ -4,7 +4,7 @@ Optimized for Windows + RTX 50xx Blackwell Architecture
 
 Key Optimizations:
 - Channels Last memory format for 2D convolutions
-- FP8 precision support for Blackwell Tensor Cores
+- FP8 precision support for Blackwell Tensor Cores (preparatory)
 - CuDNN auto-tuner enabled
 - Fused activation functions
 - Optimized upsampling with nearest-exact mode
@@ -12,6 +12,8 @@ Key Optimizations:
 
 Includes patchify/unpatchify operations, spatial downsampling/upsampling,
 and the main Wan2_2_VAE wrapper class with proper normalization.
+
+Note: Global CuDNN settings are configured at module import.
 """
 
 import torch
@@ -21,6 +23,7 @@ from typing import Tuple, Optional, Dict, Any
 import numpy as np
 
 # Enable CuDNN optimizations for Blackwell
+# Note: These are global settings that affect all models in the process
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -349,23 +352,10 @@ class Wan2_2_VAE(nn.Module):
         if self.use_channels_last and x.dim() == 4:
             x = x.to(memory_format=torch.channels_last)
         
-        # Use autocast for mixed precision
-        if use_amp and torch.cuda.is_available():
-            with torch.cuda.amp.autocast(enabled=True):
-                # Pass through VAE encoder
-                if hasattr(self.vae_model, 'encode'):
-                    posterior = self.vae_model.encode(x)
-                    latent = posterior.sample() if hasattr(posterior, 'sample') else posterior
-                else:
-                    latent = self.vae_model(x)
-                
-                # Apply quantization if enabled
-                if self.use_quant and hasattr(self, 'quant_conv'):
-                    latent = self.quant_conv(latent)
-                
-                # Normalize
-                latent = self.normalize(latent)
-        else:
+        # Use autocast context if needed
+        autocast_ctx = torch.cuda.amp.autocast(enabled=True) if (use_amp and torch.cuda.is_available()) else torch.no_grad()
+        
+        with autocast_ctx:
             # Pass through VAE encoder
             if hasattr(self.vae_model, 'encode'):
                 posterior = self.vae_model.encode(x)
@@ -408,22 +398,10 @@ class Wan2_2_VAE(nn.Module):
         if self.use_channels_last and latent.dim() == 4:
             latent = latent.to(memory_format=torch.channels_last)
         
-        # Use autocast for mixed precision
-        if use_amp and torch.cuda.is_available():
-            with torch.cuda.amp.autocast(enabled=True):
-                # Denormalize
-                latent = self.denormalize(latent)
-                
-                # Apply post-quantization conv if enabled
-                if self.use_quant and hasattr(self, 'post_quant_conv'):
-                    latent = self.post_quant_conv(latent)
-                
-                # Pass through VAE decoder
-                if hasattr(self.vae_model, 'decode'):
-                    sample = self.vae_model.decode(latent)
-                else:
-                    sample = self.vae_model(latent)
-        else:
+        # Use autocast context if needed
+        autocast_ctx = torch.cuda.amp.autocast(enabled=True) if (use_amp and torch.cuda.is_available()) else torch.no_grad()
+        
+        with autocast_ctx:
             # Denormalize
             latent = self.denormalize(latent)
             

@@ -19,17 +19,19 @@ This document describes the optimizations applied to the Wan2.1 and Wan2.2 VAE i
 
 ### 2. RTX 50xx (Blackwell) Architecture Tuning
 
-#### FP8 Precision Support
+#### FP8 Precision Support (Preparatory)
 - **Implementation**: 
   - Added `use_fp8` parameter to VAE classes
-  - Enables FP8 precision (`torch.float8_e4m3fn`) for weights and activations
-  - Leverages Blackwell's enhanced Tensor Cores for FP8 operations
+  - Infrastructure in place for FP8 precision (`torch.float8_e4m3fn`)
+  - Designed to leverage Blackwell's enhanced Tensor Cores for FP8 operations
+  - **Status**: Preparatory code - full implementation pending PyTorch FP8 API stabilization
 - **Usage**:
   ```python
-  model = create_wan2_1_vae(use_fp8=True)
-  model.enable_fp8()
+  model = create_wan2_1_vae(use_fp8=True)  # Sets flag for future use
+  model.enable_fp8()  # Prepares model for FP8 (not fully functional yet)
   ```
-- **Benefit**: Up to 2x faster compute compared to FP16 on Blackwell GPUs
+- **Note**: PyTorch FP8 support is experimental as of PyTorch 2.4+. Full implementation will be completed when the API stabilizes.
+- **Expected Benefit**: Up to 2x faster compute compared to FP16 on Blackwell GPUs (when fully implemented)
 
 #### Channels Last Memory Format
 - **Implementation**:
@@ -126,10 +128,11 @@ This document describes the optimizations applied to the Wan2.1 and Wan2.2 VAE i
 
 ### Inference Speed Improvements (vs. baseline)
 - **Channels Last**: +10-30% faster
-- **FP8 on Blackwell**: Up to +100% faster (2x)
+- **FP8 on Blackwell**: Up to +100% faster (2x) - when fully implemented
 - **Fused Operations**: +5-15% faster
 - **Optimized Attention**: +20-40% faster
-- **Combined**: Expected 2-3x faster overall on RTX 50xx
+- **Combined (without FP8)**: Expected 1.5-2x faster overall
+- **Combined (with FP8)**: Expected 2-3x faster overall on RTX 50xx (future)
 
 ### Memory Usage
 - **FP8**: ~50% reduction compared to FP16
@@ -203,7 +206,8 @@ for batch in dataloader:
 - **Recommended VRAM**: 12GB+ for typical workloads
 
 ### Software Requirements
-- PyTorch 2.3.0+ (for scaled_dot_product_attention and better AMP support)
+- PyTorch 2.0+ (for scaled_dot_product_attention support)
+- PyTorch 2.3.0+ recommended (for improved AMP and stability)
 - CUDA 12.1+ (for Blackwell optimizations)
 - Windows 10/11 with latest NVIDIA drivers
 
