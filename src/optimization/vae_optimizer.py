@@ -403,27 +403,7 @@ def apply_fp8_to_model(model: nn.Module, verbose: bool = True) -> int:
     return count
 
 
-def calculate_optimal_tile_size(vram_gb: float, base_tile_size: int = 736) -> int:
-    """
-    Calculate optimal tile size based on available VRAM.
-    
-    RTX 5070 Ti has 16GB VRAM, allowing larger tiles than default 736.
-    
-    Args:
-        vram_gb: Available VRAM in GB
-        base_tile_size: Base tile size (default 736)
-    
-    Returns:
-        Optimal tile size
-    """
-    if vram_gb >= 16.0:
-        return 1152  # 16GB VRAM: boost to 1152
-    elif vram_gb >= 12.0:
-        return 960   # 12GB VRAM: boost to 960
-    elif vram_gb >= 8.0:
-        return 832   # 8GB VRAM: boost to 832
-    else:
-        return base_tile_size  # Keep default
+
 
 
 def optimize_3d_vae_for_blackwell(
@@ -434,7 +414,6 @@ def optimize_3d_vae_for_blackwell(
     enable_cudnn_benchmark_flag: bool = True,
     enable_fp8: bool = True,
     device: Optional[torch.device] = None,
-    vram_gb: float = 16.0,
     verbose: bool = True,
 ) -> nn.Module:
     """
@@ -446,7 +425,9 @@ def optimize_3d_vae_for_blackwell(
     3. Flash Attention (SDP) for attention blocks
     4. TF32 for matrix operations
     5. cuDNN benchmark mode
-    6. Dynamic tile size optimization based on VRAM
+    
+    NOTE: Tile sizes are automatically determined by the VAE's internal logic based
+    on input video dimensions. This optimizer does NOT override tile sizes.
     
     Args:
         model: 3D VAE model to optimize
@@ -456,7 +437,6 @@ def optimize_3d_vae_for_blackwell(
         enable_cudnn_benchmark_flag: Enable cuDNN benchmark mode
         enable_fp8: Convert weights to FP8 (float8_e4m3fn)
         device: Target device (default: cuda if available)
-        vram_gb: Available VRAM in GB (for tile size optimization)
         verbose: Print optimization status
     
     Returns:
@@ -465,7 +445,7 @@ def optimize_3d_vae_for_blackwell(
     Example:
         >>> from src.models.video_vae_v3.modules.video_vae import VideoAutoencoderKL
         >>> vae = VideoAutoencoderKL(...)
-        >>> vae = optimize_3d_vae_for_blackwell(vae, vram_gb=16.0)
+        >>> vae = optimize_3d_vae_for_blackwell(vae)
         >>> vae.eval()
         >>> # VAE is now in FP8 - ready for 2x faster decoding!
     """
@@ -520,14 +500,10 @@ def optimize_3d_vae_for_blackwell(
         if fp8_count > 0 and verbose:
             print(f"[BLACKWELL OPTIMIZER] ✓ FP8 NATIVE PRECISION ACTIVE ({fp8_count} params)")
     
-    # 6. Calculate optimal tile size
-    optimal_tile = calculate_optimal_tile_size(vram_gb)
-    if verbose:
-        print(f"[BLACKWELL OPTIMIZER] ✓ Optimal tile size: {optimal_tile}x{optimal_tile} (VRAM: {vram_gb}GB)")
-    
     if verbose:
         print("=" * 70)
         print("[BLACKWELL OPTIMIZER] sm_120 FP8 Engine: READY")
+        print("[BLACKWELL OPTIMIZER] Tile sizes: Using VAE's internal dynamic logic")
         print("=" * 70 + "\n")
     
     return model
@@ -548,7 +524,6 @@ __all__ = [
     'apply_channels_last_3d',
     'enable_flash_attention_for_attention_blocks',
     'optimize_3d_vae_for_blackwell',
-    # FP8 and tile optimization
+    # FP8 optimization
     'apply_fp8_to_model',
-    'calculate_optimal_tile_size',
 ]

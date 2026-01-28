@@ -535,8 +535,7 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torc
     if not is_dit and hasattr(runner, '_vae_enable_blackwell') and runner._vae_enable_blackwell:
         try:
             from ..optimization.vae_optimizer import optimize_3d_vae_for_blackwell
-            vram_gb = getattr(runner, '_vae_blackwell_vram_gb', 16.0)
-            debug.log(f"Applying Blackwell sm_120 FP8 optimization (VRAM: {vram_gb}GB)", category="vae", force=True)
+            debug.log(f"Applying Blackwell sm_120 FP8 optimization", category="vae", force=True)
             model = optimize_3d_vae_for_blackwell(
                 model,
                 enable_channels_last_3d=True,
@@ -545,7 +544,6 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torc
                 enable_cudnn_benchmark_flag=True,
                 enable_fp8=True,
                 device=target_device,
-                vram_gb=vram_gb,
                 verbose=True
             )
         except Exception as e:
