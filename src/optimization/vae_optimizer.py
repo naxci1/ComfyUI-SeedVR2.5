@@ -90,9 +90,17 @@ def optimize_for_windows_blackwell(
     # Enable cuDNN auto-tuner
     enable_cudnn_benchmark()
     
-    # Set device
+    # Set device with robust type handling
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    elif isinstance(device, str):
+        device = torch.device(device)
+    elif isinstance(device, bool):
+        # Defensive guard: never allow boolean as device
+        raise TypeError(f"Device parameter cannot be boolean. Got: {device}")
+    elif not isinstance(device, torch.device):
+        # Try to convert to torch.device
+        device = torch.device(str(device))
     
     model = model.to(device)
     
@@ -397,9 +405,17 @@ def optimize_3d_vae_for_blackwell(
         logger.info("Optimizing 3D VAE for Windows + Blackwell (RTX 50xx)")
         logger.info("=" * 70)
     
-    # Set device
+    # Set device with robust type handling
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    elif isinstance(device, str):
+        device = torch.device(device)
+    elif isinstance(device, bool):
+        # Defensive guard: never allow boolean as device
+        raise TypeError(f"Device parameter cannot be boolean. Got: {device}")
+    elif not isinstance(device, torch.device):
+        # Try to convert to torch.device
+        device = torch.device(str(device))
     
     if device.type != 'cuda':
         logger.warning("⚠ CUDA not available. Most optimizations require GPU.")
