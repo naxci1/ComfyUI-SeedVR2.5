@@ -147,7 +147,6 @@ class VAEConfigManager:
             encoding_type=VAEEncodingType.ADVANCED,
             precision="fp32",
             use_tiling=False,
-            enable_flash_attention=True,
         ),
         checkpoint_hash=None,
         enable_flash_attention=True,
