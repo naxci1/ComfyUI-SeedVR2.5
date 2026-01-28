@@ -25,46 +25,19 @@ def optimize_3d_vae_for_blackwell(
     **kwargs
 ) -> nn.Module:
     """
-    Ultra-minimal Blackwell sm_120 FP8 optimization.
-    
-    NO DOUBLE CONVERSION - Direct to FP8
-    NO TILE OVERRIDE - Model handles tiling
-    NO BF16 OVERHEAD - Skip intermediate precision
-    NO VRAM SPIKES - Pre-emptive cache clearing
-    
-    Args:
-        model: 3D VAE model to optimize
-        device: Target device (default: "cuda")
-        **kwargs: Ignored (for compatibility)
-    
-    Returns:
-        Optimized model with native FP8 precision
+    Ultra-lean Blackwell sm_120 FP8 optimizer.
+    NO OVERHEAD - Direct FP8 conversion with cuDNN benchmark disabled.
     """
-    # Pre-optimization cleanup (PREVENT OOM)
     torch.cuda.empty_cache()
     
-    # Enable Blackwell precision without extra memory buffers
+    # Direct-to-FP8 with no intermediate buffers
+    model.to(device=device, dtype=torch.float8_e4m3fn)
+    
+    # Use TF32 for speed but save VRAM
     torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = False
     
-    # DIRECT CONVERSION TO FP8 (Bypassing the BF16 bottleneck)
-    # We move it to CUDA and cast to FP8 in ONE atomic step
-    try:
-        model = model.to(device=device, dtype=torch.float8_e4m3fn)
-    except Exception as e:
-        # Fallback if FP8 not available
-        print(f"[BLACKWELL] FP8 not available: {e}")
-        model = model.to(device=device)
-    
-    # Memory Layout optimization for Blackwell Tensor Cores
-    if hasattr(model, 'to'):
-        try:
-            model = model.to(memory_format=torch.channels_last_3d)
-        except Exception:
-            # Silently continue if channels_last_3d not supported
-            pass
-    
-    print("[BLACKWELL] NATIVE CUDA FP8 ACTIVE | BF16 BYPASSED | VRAM SPIKE ELIMINATED")
-    
+    print("[BLACKWELL] ZERO-OVERHEAD FP8 ENABLED")
     return model
 
 
