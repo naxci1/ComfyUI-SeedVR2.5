@@ -377,6 +377,10 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
         dit_torch_compile_args = dit.get("torch_compile_args")
         vae_torch_compile_args = vae.get("torch_compile_args")
         
+        # Blackwell optimization flags (from VAE config)
+        enable_blackwell_optimization = vae.get("enable_blackwell_optimization", False)
+        blackwell_vram_gb = vae.get("blackwell_vram_gb", 16.0)
+        
         # Print header
         debug.print_header()
 
@@ -433,7 +437,9 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 tile_debug=tile_debug,
                 attention_mode=attention_mode,
                 torch_compile_args_dit=dit_torch_compile_args,
-                torch_compile_args_vae=vae_torch_compile_args
+                torch_compile_args_vae=vae_torch_compile_args,
+                enable_blackwell_optimization=enable_blackwell_optimization,
+                blackwell_vram_gb=blackwell_vram_gb,
             )
 
             # Store cache context in ctx for use in generation phases

@@ -749,7 +749,9 @@ def configure_runner(
     tile_debug: str = "false",
     attention_mode: str = 'sdpa',
     torch_compile_args_dit: Optional[Dict[str, Any]] = None,
-    torch_compile_args_vae: Optional[Dict[str, Any]] = None
+    torch_compile_args_vae: Optional[Dict[str, Any]] = None,
+    enable_blackwell_optimization: bool = False,
+    blackwell_vram_gb: float = 16.0,
 ) -> Tuple[VideoDiffusionInfer, Dict[str, Any]]:
     """
     Configure VideoDiffusionInfer runner with model loading and settings.
@@ -824,6 +826,12 @@ def configure_runner(
         torch_compile_args_dit, torch_compile_args_vae,
         block_swap_config, debug
     )
+    
+    # Set Blackwell optimization flags for VAE
+    if enable_blackwell_optimization:
+        runner._vae_enable_blackwell = True
+        runner._vae_blackwell_vram_gb = blackwell_vram_gb
+        debug.log(f"Blackwell FP8 optimization enabled for VAE (VRAM: {blackwell_vram_gb}GB)", category="vae", force=True)
     
     # Phase 4: Setup models (load from cache or create new)
     _setup_models(
