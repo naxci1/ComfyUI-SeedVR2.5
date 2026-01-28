@@ -78,24 +78,24 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                     tooltip="Enable tiled encoding to reduce VRAM usage during the encoding phase"
                 ),
                 io.Int.Input("encode_tile_size",
-                    default=1024,
-                    min=64,
+                    default=512,
+                    min=32,
                     step=32,
                     optional=True,
                     tooltip=(
-                        "Encoding tile size in pixels (default: 1024).\n"
+                        "Encoding tile size in pixels (default: 512).\n"
                         "Applied to both height and width.\n"
                         "Lower values reduce VRAM usage but may increase processing time.\n"
                         "Only used when encode_tiled is enabled."
                     )
                 ),
                 io.Int.Input("encode_tile_overlap",
-                    default=128,
+                    default=64,
                     min=0,
                     step=32,
                     optional=True,
                     tooltip=(
-                        "Pixel overlap between encoding tiles (default: 128).\n"
+                        "Pixel overlap between encoding tiles (default: 64).\n"
                         "Reduces visible seams between tiles through blending.\n"
                         "Higher values improve quality but slow processing.\n"
                         "Only used when encode_tiled is enabled."
@@ -107,24 +107,24 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                     tooltip="Enable tiled decoding to reduce VRAM usage during the decoding phase"
                 ),
                 io.Int.Input("decode_tile_size",
-                    default=1024,
-                    min=64,
+                    default=512,
+                    min=32,
                     step=32,
                     optional=True,
                     tooltip=(
-                        "Decoding tile size in pixels (default: 1024).\n"
+                        "Decoding tile size in pixels (default: 512).\n"
                         "Applied to both height and width.\n"
                         "Lower values reduce VRAM usage but may increase processing time.\n"
                         "Only used when decode_tiled is enabled."
                     )
                 ),
                 io.Int.Input("decode_tile_overlap",
-                    default=128,
+                    default=64,
                     min=0,
                     step=32,
                     optional=True,
                     tooltip=(
-                        "Pixel overlap between decoding tiles (default: 128).\n"
+                        "Pixel overlap between decoding tiles (default: 64).\n"
                         "Reduces visible seams between tiles through blending.\n"
                         "Higher values improve quality but slow processing.\n"
                         "Only used when decode_tiled is enabled."
@@ -180,11 +180,11 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
     
     @classmethod
     def execute(cls, vae_name: str, device: str, enable_blackwell_optimization: bool = True,
-                     offload_device: str = "none", cache_model: bool = False, 
                      encode_tiled: bool = False, encode_tile_size: int = 512, 
                      encode_tile_overlap: int = 64, decode_tiled: bool = False, 
                      decode_tile_size: int = 512, decode_tile_overlap: int = 64, 
-                     tile_debug: str = "false", torch_compile_args: Dict[str, Any] = None
+                     tile_debug: str = "false", offload_device: str = "none", 
+                     cache_model: bool = False, torch_compile_args: Dict[str, Any] = None
                      ) -> io.NodeOutput:
         """
         Create VAE model configuration for SeedVR2 main node with GGUF support
