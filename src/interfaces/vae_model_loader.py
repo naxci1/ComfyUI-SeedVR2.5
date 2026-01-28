@@ -8,7 +8,7 @@ from comfy_execution.utils import get_executing_context
 from typing import Dict, Any, Tuple, Optional
 import torch
 import os
-from ..utils.model_registry import get_available_vae_models, DEFAULT_VAE, get_model_repo
+from ..utils.model_registry import get_available_vae_models, DEFAULT_VAE
 from ..utils.constants import find_model_file
 from ..optimization.memory_manager import get_device_list
 from ..models.video_vae_v3.modules.attn_video_vae import VideoAutoencoderKLWrapper
@@ -287,47 +287,80 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
         Returns:
             Loaded VAE model
         """
-        # Get model path
+        # Get model path (local only, no downloads)
         model_path = find_model_file(vae_name)
         
-        # Check if file exists
+        # Check if file exists - NO INTERNET FALLBACK
         if not os.path.exists(model_path):
-            # Try to download from HuggingFace
-            repo = get_model_repo(vae_name)
-            print(f"[VAE Loader] Downloading {vae_name} from {repo}...")
-            # This will download automatically via VideoAutoencoderKLWrapper
+            raise FileNotFoundError(
+                f"VAE model file not found: {vae_name}\n"
+                f"Expected path: {model_path}\n"
+                f"Please ensure the model file exists locally."
+            )
         
         print(f"[VAE Loader] Loading VAE model: {vae_name}")
         print(f"[VAE Loader] Path: {model_path}")
         print(f"[VAE Loader] Device: {device}")
         print(f"[VAE Loader] Format: {'GGUF' if is_gguf else 'SafeTensors'}")
         
-        # Load the model
+        # Load the model - NO HUGGINGFACE, NO INTERNET
         try:
+            # Default VAE configuration (from SeedVR2)
+            vae_config = {
+                "in_channels": 3,
+                "out_channels": 3,
+                "down_block_types": ("DownEncoderBlock3D", "DownEncoderBlock3D", "DownEncoderBlock3D", "DownEncoderBlock3D"),
+                "up_block_types": ("UpDecoderBlock3D", "UpDecoderBlock3D", "UpDecoderBlock3D", "UpDecoderBlock3D"),
+                "block_out_channels": (128, 256, 512, 512),
+                "layers_per_block": 2,
+                "act_fn": "silu",
+                "latent_channels": 16,
+                "norm_num_groups": 32,
+                "sample_size": 256,
+                "scaling_factor": 0.18215,
+                "force_upcast": True,
+                "attention": True,
+                "temporal_scale_num": 4,
+                "slicing_up_num": 0,
+                "gradient_checkpoint": False,
+                "inflation_mode": "tail",
+                "time_receptive_field": "full",
+                "slicing_sample_min_size": 32,
+                "use_quant_conv": True,
+                "use_post_quant_conv": True,
+                # Wrapper-specific params
+                "spatial_downsample_factor": 8,
+                "temporal_downsample_factor": 4,
+                "freeze_encoder": False,
+            }
+            
             if is_gguf:
-                # GGUF: Load as binary file using safetensors
-                print(f"[VAE Loader] Loading GGUF as binary file...")
-                from safetensors.torch import load_file
+                # GGUF: Create model from config, then load binary weights
+                print(f"[VAE Loader] Creating VAE model from config (no internet)...")
+                vae = VideoAutoencoderKLWrapper(**vae_config)
                 
-                # Create model instance first
-                vae = VideoAutoencoderKLWrapper.from_pretrained(
-                    get_model_repo(vae_name),
-                    subfolder="vae",
-                    torch_dtype=torch.bfloat16,
-                )
-                
-                # Load GGUF weights as binary
+                # Load GGUF weights as binary using safetensors
                 if os.path.exists(model_path):
+                    print(f"[VAE Loader] Loading GGUF weights from: {model_path}")
+                    from safetensors.torch import load_file
                     state_dict = load_file(model_path)
                     vae.load_state_dict(state_dict, strict=False)
                     print(f"[VAE Loader] ✓ Loaded {len(state_dict)} tensors from GGUF file")
+                else:
+                    raise FileNotFoundError(f"GGUF file not found: {model_path}")
             else:
-                # Regular safetensors: Use standard loading
-                vae = VideoAutoencoderKLWrapper.from_pretrained(
-                    model_path if os.path.exists(model_path) else get_model_repo(vae_name),
-                    subfolder="vae" if not os.path.exists(model_path) else None,
-                    torch_dtype=torch.bfloat16,
-                )
+                # Regular safetensors: Load directly from local file
+                if os.path.exists(model_path):
+                    print(f"[VAE Loader] Creating VAE model from config (no internet)...")
+                    vae = VideoAutoencoderKLWrapper(**vae_config)
+                    
+                    print(f"[VAE Loader] Loading safetensors weights from: {model_path}")
+                    from safetensors.torch import load_file
+                    state_dict = load_file(model_path)
+                    vae.load_state_dict(state_dict, strict=False)
+                    print(f"[VAE Loader] ✓ Loaded {len(state_dict)} tensors from safetensors file")
+                else:
+                    raise FileNotFoundError(f"Model file not found: {model_path}")
             
             # Move to device
             if device != "cpu":
