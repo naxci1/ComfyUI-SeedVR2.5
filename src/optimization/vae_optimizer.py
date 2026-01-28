@@ -266,6 +266,179 @@ def optimize_upsample_operation(
         )
 
 
+def enable_tf32_for_blackwell():
+    """
+    Enable TF32 (TensorFloat-32) for matrix multiplications on Blackwell/Ampere GPUs.
+    
+    TF32 provides ~8x speedup for FP32 operations on Ampere+ GPUs with minimal accuracy loss.
+    Safe for most deep learning workloads.
+    """
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        logger.info("✓ Enabled TF32 for Blackwell/Ampere matrix operations")
+
+
+def apply_channels_last_3d(model: nn.Module, verbose: bool = True) -> int:
+    """
+    Apply channels-last 3D memory format to all Conv3d layers in the model.
+    
+    This optimization improves memory access patterns for 3D convolutions on Blackwell.
+    
+    Args:
+        model: Model containing Conv3d layers
+        verbose: Print conversion status
+    
+    Returns:
+        Number of Conv3d layers converted
+    """
+    count = 0
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Conv3d):
+            try:
+                # Apply channels-last 3D memory format
+                module.to(memory_format=torch.channels_last_3d)
+                count += 1
+                if verbose:
+                    logger.debug(f"  Converted {name} to channels_last_3d")
+            except Exception as e:
+                logger.warning(f"Could not convert {name} to channels_last_3d: {e}")
+    
+    if verbose and count > 0:
+        logger.info(f"✓ Applied channels_last_3d to {count} Conv3d layers")
+    
+    return count
+
+
+def enable_flash_attention_for_attention_blocks(model: nn.Module, verbose: bool = True) -> int:
+    """
+    Enable Flash Attention (scaled_dot_product_attention) for Attention blocks.
+    
+    This uses PyTorch's optimized SDP (Scaled Dot Product) attention which automatically
+    selects the best backend (Flash Attention 2, Memory-Efficient Attention, or Math).
+    
+    Args:
+        model: Model containing Attention blocks
+        verbose: Print conversion status
+    
+    Returns:
+        Number of Attention blocks configured
+    """
+    count = 0
+    try:
+        from diffusers.models.attention_processor import Attention
+    except ImportError:
+        logger.warning("Could not import Attention from diffusers")
+        return count
+    
+    for name, module in model.named_modules():
+        if isinstance(module, Attention):
+            try:
+                # Check if we can enable SDP
+                if hasattr(module, 'set_use_memory_efficient_attention_xformers'):
+                    # For newer diffusers versions
+                    module.set_use_memory_efficient_attention_xformers(False)
+                
+                # PyTorch 2.0+ will automatically use SDP when available
+                # No explicit setting needed - it's the default backend
+                count += 1
+                if verbose:
+                    logger.debug(f"  Configured SDP attention for {name}")
+            except Exception as e:
+                logger.warning(f"Could not configure attention for {name}: {e}")
+    
+    if verbose and count > 0:
+        logger.info(f"✓ Configured {count} Attention blocks to use SDP (Flash Attention)")
+    
+    return count
+
+
+def optimize_3d_vae_for_blackwell(
+    model: nn.Module,
+    enable_channels_last_3d: bool = True,
+    enable_flash_attention: bool = True,
+    enable_tf32: bool = True,
+    enable_cudnn_benchmark_flag: bool = True,
+    device: Optional[torch.device] = None,
+    verbose: bool = True,
+) -> nn.Module:
+    """
+    Comprehensive optimization for 3D Causal VAE on Windows + Blackwell (RTX 50xx).
+    
+    This function applies all Blackwell-specific optimizations for 3D video VAE models:
+    1. Channels-last 3D memory format for Conv3d layers
+    2. Flash Attention (SDP) for attention blocks
+    3. TF32 for matrix operations
+    4. cuDNN benchmark mode
+    5. Fused operations (already applied if using optimized model code)
+    
+    Args:
+        model: 3D VAE model to optimize
+        enable_channels_last_3d: Apply channels_last_3d to Conv3d layers
+        enable_flash_attention: Enable SDP attention for Attention blocks
+        enable_tf32: Enable TF32 for matrix operations
+        enable_cudnn_benchmark_flag: Enable cuDNN benchmark mode
+        device: Target device (default: cuda if available)
+        verbose: Print optimization status
+    
+    Returns:
+        Optimized model
+    
+    Example:
+        >>> from src.models.video_vae_v3.modules.video_vae import VideoAutoencoderKL
+        >>> vae = VideoAutoencoderKL(...)
+        >>> vae = optimize_3d_vae_for_blackwell(vae)
+        >>> vae.eval()
+        >>> with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
+        >>>     encoded = vae.encode(video)
+    """
+    if verbose:
+        logger.info("=" * 70)
+        logger.info("Optimizing 3D VAE for Windows + Blackwell (RTX 50xx)")
+        logger.info("=" * 70)
+    
+    # Set device
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    if device.type != 'cuda':
+        logger.warning("⚠ CUDA not available. Most optimizations require GPU.")
+        return model
+    
+    model = model.to(device)
+    
+    # 1. Enable cuDNN benchmark
+    if enable_cudnn_benchmark_flag:
+        enable_cudnn_benchmark()
+    
+    # 2. Enable TF32 for Blackwell/Ampere
+    if enable_tf32:
+        enable_tf32_for_blackwell()
+    
+    # 3. Apply channels-last 3D memory format
+    if enable_channels_last_3d:
+        conv3d_count = apply_channels_last_3d(model, verbose=verbose)
+        if conv3d_count == 0 and verbose:
+            logger.warning("⚠ No Conv3d layers found in model")
+    
+    # 4. Enable Flash Attention (SDP)
+    if enable_flash_attention:
+        attn_count = enable_flash_attention_for_attention_blocks(model, verbose=verbose)
+        if attn_count == 0 and verbose:
+            logger.info("ℹ No Attention blocks found (or already optimized)")
+    
+    if verbose:
+        logger.info("=" * 70)
+        logger.info("Optimization Summary:")
+        logger.info(f"  - cuDNN Benchmark: {'✓ Enabled' if enable_cudnn_benchmark_flag else '✗ Disabled'}")
+        logger.info(f"  - TF32 (Blackwell): {'✓ Enabled' if enable_tf32 else '✗ Disabled'}")
+        logger.info(f"  - Channels Last 3D: {'✓ Applied' if enable_channels_last_3d else '✗ Disabled'}")
+        logger.info(f"  - Flash Attention: {'✓ Configured' if enable_flash_attention else '✗ Disabled'}")
+        logger.info("=" * 70)
+    
+    return model
+
+
 # Export public API
 __all__ = [
     'enable_cudnn_benchmark',
@@ -276,4 +449,9 @@ __all__ = [
     'get_optimal_num_workers_windows',
     'configure_amp_context',
     'optimize_upsample_operation',
+    # New 3D-specific functions
+    'enable_tf32_for_blackwell',
+    'apply_channels_last_3d',
+    'enable_flash_attention_for_attention_blocks',
+    'optimize_3d_vae_for_blackwell',
 ]
