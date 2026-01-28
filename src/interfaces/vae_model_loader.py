@@ -12,7 +12,6 @@ from ..utils.model_registry import get_available_vae_models, DEFAULT_VAE, get_mo
 from ..utils.constants import find_model_file
 from ..optimization.memory_manager import get_device_list
 from ..models.video_vae_v3.modules.attn_video_vae import VideoAutoencoderKLWrapper
-from ..optimization.vae_optimizer import optimize_3d_vae_for_blackwell
 
 
 class SeedVR2LoadVAEModel(io.ComfyNode):
@@ -236,23 +235,22 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
             print("[BLACKWELL_ENGINE] !!! FORCING SM_120 FP8 OPTIMIZATION !!!")
             print("="*60)
             
-            # Apply Blackwell optimization RIGHT NOW
-            vae_model = optimize_3d_vae_for_blackwell(
-                vae_model,
-                device="cuda",  # Force CUDA device
-                vram_gb=16.0,   # RTX 5070 Ti target
-                enable_fp8=True,
-                enable_channels_last_3d=True,
-                enable_flash_attention=True,
-                enable_cuda_graphs=True,
-                verbose=True
-            )
+            # Enable Blackwell backends
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+            torch.backends.cudnn.benchmark = True
+            print("[BLACKWELL_ENGINE] ✓ TF32 and cuDNN benchmark enabled")
             
-            # Force larger tile size for 16GB VRAM
-            if decode_tiled:
-                decode_tile_size = max(decode_tile_size, 1280)
-                print(f"[BLACKWELL_ENGINE] Tile size boosted to {decode_tile_size} for RTX 5070 Ti")
+            # Convert weights to FP8 for Blackwell sm_120
+            print("[BLACKWELL_ENGINE] Converting weights to FP8 (torch.float8_e4m3fn)...")
+            param_count = 0
+            for param in vae_model.parameters():
+                if param.dtype in [torch.float16, torch.float32, torch.bfloat16]:
+                    param.data = param.data.to(torch.float8_e4m3fn)
+                    param_count += 1
+            print(f"[BLACKWELL_ENGINE] ✓ Converted {param_count} parameters to FP8")
             
+            print("[BLACKWELL_ENGINE] Dynamic tiling: PRESERVED (user-controlled)")
             print("="*60 + "\n")
         
         config = {
@@ -304,13 +302,32 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
         print(f"[VAE Loader] Device: {device}")
         print(f"[VAE Loader] Format: {'GGUF' if is_gguf else 'SafeTensors'}")
         
-        # Load the model using VideoAutoencoderKLWrapper
+        # Load the model
         try:
-            vae = VideoAutoencoderKLWrapper.from_pretrained(
-                model_path if os.path.exists(model_path) else get_model_repo(vae_name),
-                subfolder="vae" if not os.path.exists(model_path) else None,
-                torch_dtype=torch.bfloat16 if not is_gguf else None,  # Will be converted to FP8 later
-            )
+            if is_gguf:
+                # GGUF: Load as binary file using safetensors
+                print(f"[VAE Loader] Loading GGUF as binary file...")
+                from safetensors.torch import load_file
+                
+                # Create model instance first
+                vae = VideoAutoencoderKLWrapper.from_pretrained(
+                    get_model_repo(vae_name),
+                    subfolder="vae",
+                    torch_dtype=torch.bfloat16,
+                )
+                
+                # Load GGUF weights as binary
+                if os.path.exists(model_path):
+                    state_dict = load_file(model_path)
+                    vae.load_state_dict(state_dict, strict=False)
+                    print(f"[VAE Loader] ✓ Loaded {len(state_dict)} tensors from GGUF file")
+            else:
+                # Regular safetensors: Use standard loading
+                vae = VideoAutoencoderKLWrapper.from_pretrained(
+                    model_path if os.path.exists(model_path) else get_model_repo(vae_name),
+                    subfolder="vae" if not os.path.exists(model_path) else None,
+                    torch_dtype=torch.bfloat16,
+                )
             
             # Move to device
             if device != "cpu":
