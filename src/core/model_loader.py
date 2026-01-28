@@ -531,6 +531,24 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torc
     from .model_configuration import apply_model_specific_config
     model = apply_model_specific_config(model, runner, config, is_dit, debug)
     
+    # Apply Blackwell FP8 optimization for VAE if GGUF model
+    if not is_dit and hasattr(runner, '_vae_enable_blackwell') and runner._vae_enable_blackwell:
+        try:
+            from ..optimization.vae_optimizer import optimize_3d_vae_for_blackwell
+            debug.log(f"Applying Blackwell sm_120 FP8 optimization", category="vae", force=True)
+            model = optimize_3d_vae_for_blackwell(
+                model,
+                enable_channels_last_3d=True,
+                enable_flash_attention=True,
+                enable_tf32=True,
+                enable_cudnn_benchmark_flag=True,
+                enable_fp8=True,
+                device=target_device,
+                verbose=True
+            )
+        except Exception as e:
+            debug.log(f"Warning: Blackwell optimization failed: {e}", level="WARNING", category="vae", force=True)
+    
     debug.end_timer(f"{model_type}_materialize", f"{model_type_upper} materialized")
     
     # Clean up checkpoint paths (no longer needed after weights are loaded)

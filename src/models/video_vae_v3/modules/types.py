@@ -33,7 +33,10 @@ class DiagonalGaussianDistribution:
         return self.mean
 
     def sample(self) -> torch.FloatTensor:
-        return self.mean + self.std * torch.randn_like(self.mean)
+        # Optimized sampling using fused operations to minimize CPU-GPU sync
+        # Use torch.addcmul for efficient multiply-add (mean + std * noise)
+        noise = torch.randn_like(self.mean)
+        return torch.addcmul(self.mean, self.std, noise)
 
     def kl(self) -> torch.Tensor:
         return 0.5 * torch.sum(

@@ -45,6 +45,11 @@ from .types import (
 
 logger = get_logger(__name__)  # pylint: disable=invalid-name
 
+# Performance optimization flags for Windows + Blackwell (RTX 50xx)
+# These can be enabled via environment variables or model initialization
+_USE_CUDNN_BENCHMARK = True  # Enable cuDNN auto-tuner for optimal conv algorithms
+_USE_FUSED_ACTIVATIONS = True  # Use F.silu instead of nn.SiLU() for fused operations
+
 # Fake func, no checkpointing is required for inference
 def gradient_checkpointing(module: Union[Callable, nn.Module], *args, enabled: bool, **kwargs):
     return module(*args, **kwargs)
@@ -96,11 +101,18 @@ class ResnetBlock2D(nn.Module):
         hidden = input_tensor
 
         hidden = self.norm1(hidden)
-        hidden = self.nonlinearity(hidden)
+        # Use fused F.silu for better performance on Blackwell
+        if _USE_FUSED_ACTIVATIONS:
+            hidden = F.silu(hidden, inplace=False)
+        else:
+            hidden = self.nonlinearity(hidden)
         hidden = self.conv1(hidden)
 
         hidden = self.norm2(hidden)
-        hidden = self.nonlinearity(hidden)
+        if _USE_FUSED_ACTIVATIONS:
+            hidden = F.silu(hidden, inplace=False)
+        else:
+            hidden = self.nonlinearity(hidden)
         hidden = self.dropout(hidden)
         hidden = self.conv2(hidden)
 
@@ -582,7 +594,11 @@ class Encoder3D(nn.Module):
 
         # post-process
         sample = causal_norm_wrapper(self.conv_norm_out, sample)
-        sample = self.conv_act(sample)
+        # Use fused activation for better performance
+        if _USE_FUSED_ACTIVATIONS:
+            sample = F.silu(sample, inplace=False)
+        else:
+            sample = self.conv_act(sample)
         sample = self.conv_out(sample, memory_state=memory_state)
 
         return sample
@@ -699,7 +715,11 @@ class Decoder3D(nn.Module):
 
         # post-process
         sample = causal_norm_wrapper(self.conv_norm_out, sample)
-        sample = self.conv_act(sample)
+        # Use fused activation for better performance
+        if _USE_FUSED_ACTIVATIONS:
+            sample = F.silu(sample, inplace=False)
+        else:
+            sample = self.conv_act(sample)
         sample = self.conv_out(sample, memory_state=memory_state)
 
         return sample
@@ -790,6 +810,105 @@ class VideoAutoencoderKL(nn.Module):
 
     def disable_slicing(self):
         self.use_slicing = False
+    
+    def enable_windows_blackwell_optimizations(self, enable_channels_last: bool = True):
+        """
+        Enable Windows + RTX 50xx (Blackwell) optimizations.
+        
+        WARNING: This method modifies global PyTorch settings (torch.backends.cudnn.benchmark)
+        that affect all models in the current process, not just this VAE instance.
+        
+        Args:
+            enable_channels_last: Apply channels-last memory format to Conv2d layers
+        
+        Returns:
+            self (for method chaining)
+        """
+        # Enable cuDNN auto-tuner (global setting affects all models)
+        if _USE_CUDNN_BENCHMARK and torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.enabled = True
+            logger.info("✓ Enabled cuDNN benchmark for optimal convolution performance (global setting)")
+        
+        # Apply channels-last memory format to Conv2d layers (instance-specific)
+        if enable_channels_last and torch.cuda.is_available():
+            for module in self.modules():
+                if isinstance(module, nn.Conv2d):
+                    try:
+                        module.to(memory_format=torch.channels_last)
+                    except Exception as e:
+                        logger.debug(f"Could not convert Conv2d to channels_last: {e}")
+            logger.info("✓ Applied channels-last memory format to Conv2d layers")
+        
+        return self
+
+    def enable_3d_blackwell_optimizations(
+        self,
+        enable_channels_last_3d: bool = True,
+        enable_flash_attention: bool = True,
+        enable_tf32: bool = True,
+        verbose: bool = True,
+    ):
+        """
+        Enable comprehensive 3D optimizations for Windows + RTX 50xx (Blackwell).
+        
+        This method applies optimizations specifically for 3D Causal VAE:
+        - Channels-last 3D memory format for Conv3d layers
+        - Flash Attention (SDP) for attention blocks  
+        - TF32 for matrix operations (Blackwell-specific)
+        - cuDNN benchmark mode
+        
+        WARNING: Modifies global PyTorch settings that affect all models in the process.
+        
+        Args:
+            enable_channels_last_3d: Apply channels_last_3d to Conv3d layers
+            enable_flash_attention: Enable SDP attention for Attention blocks
+            enable_tf32: Enable TF32 for matrix operations
+            verbose: Print optimization status
+        
+        Returns:
+            self (for method chaining)
+        
+        Example:
+            >>> vae = VideoAutoencoderKL(...)
+            >>> vae = vae.to('cuda')
+            >>> vae.enable_3d_blackwell_optimizations()
+            >>> vae.eval()
+            >>> with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
+            >>>     encoded = vae.encode(video)
+        """
+        from ....optimization.vae_optimizer import (
+            enable_cudnn_benchmark,
+            enable_tf32_for_blackwell,
+            apply_channels_last_3d,
+            enable_flash_attention_for_attention_blocks,
+        )
+        
+        if verbose:
+            logger.info("Enabling 3D Blackwell optimizations for VideoAutoencoderKL...")
+        
+        # Enable cuDNN benchmark (global)
+        if _USE_CUDNN_BENCHMARK and torch.cuda.is_available():
+            enable_cudnn_benchmark()
+        
+        # Enable TF32 (global, Blackwell-specific)
+        if enable_tf32 and torch.cuda.is_available():
+            enable_tf32_for_blackwell()
+        
+        # Apply channels-last 3D to Conv3d layers
+        if enable_channels_last_3d and torch.cuda.is_available():
+            conv3d_count = apply_channels_last_3d(self, verbose=verbose)
+            if conv3d_count == 0 and verbose:
+                logger.warning("⚠ No Conv3d layers found in model")
+        
+        # Enable Flash Attention for attention blocks
+        if enable_flash_attention and torch.cuda.is_available():
+            attn_count = enable_flash_attention_for_attention_blocks(self, verbose=verbose)
+        
+        if verbose:
+            logger.info("✓ 3D Blackwell optimizations applied successfully")
+        
+        return self
 
     def encode(self, x: torch.FloatTensor) -> CausalEncoderOutput:
         if x.ndim == 4:

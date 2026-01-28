@@ -8,6 +8,7 @@ from comfy_execution.utils import get_executing_context
 from typing import Dict, Any, Tuple
 from ..utils.model_registry import get_available_vae_models, DEFAULT_VAE
 from ..optimization.memory_manager import get_device_list
+import torch
 
 
 class SeedVR2LoadVAEModel(io.ComfyNode):
@@ -201,6 +202,9 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                 "(e.g., 'cpu' or another device). Set cache_model=False if you don't want to cache the model."
             )
         
+        # Check if GGUF model for Blackwell optimization
+        is_gguf = model.lower().endswith('.gguf')
+        
         config = {
             "model": model,
             "device": device,
@@ -215,5 +219,8 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
             "tile_debug": tile_debug,
             "torch_compile_args": torch_compile_args,
             "node_id": get_executing_context().node_id,
+            # Blackwell sm_120 optimization flag for GGUF models
+            "enable_blackwell_optimization": is_gguf,
+            "blackwell_vram_gb": 16.0,
         }
         return io.NodeOutput(config)
