@@ -815,16 +815,22 @@ class VideoAutoencoderKL(nn.Module):
         """
         Enable Windows + RTX 50xx (Blackwell) optimizations.
         
+        WARNING: This method modifies global PyTorch settings (torch.backends.cudnn.benchmark)
+        that affect all models in the current process, not just this VAE instance.
+        
         Args:
             enable_channels_last: Apply channels-last memory format to Conv2d layers
+        
+        Returns:
+            self (for method chaining)
         """
-        # Enable cuDNN auto-tuner
+        # Enable cuDNN auto-tuner (global setting affects all models)
         if _USE_CUDNN_BENCHMARK and torch.cuda.is_available():
             torch.backends.cudnn.benchmark = True
             torch.backends.cudnn.enabled = True
-            logger.info("✓ Enabled cuDNN benchmark for optimal convolution performance")
+            logger.info("✓ Enabled cuDNN benchmark for optimal convolution performance (global setting)")
         
-        # Apply channels-last memory format to Conv2d layers
+        # Apply channels-last memory format to Conv2d layers (instance-specific)
         if enable_channels_last and torch.cuda.is_available():
             for module in self.modules():
                 if isinstance(module, nn.Conv2d):

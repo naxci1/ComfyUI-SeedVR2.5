@@ -1,5 +1,5 @@
 # Copyright (c) 2025 ComfyUI-SeedVR2.5 Contributors
-# SPDX-License-Identifier: Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
 #
 # VAE Optimization for Windows + RTX 50xx (Blackwell Architecture)
 # Optimized for native CUDA efficiency without torch.compile
@@ -49,13 +49,19 @@ def disable_cudnn_benchmark():
 
 def is_fp8_available() -> bool:
     """
-    Check if FP8 (float8) support is available.
-    RTX 50xx (Blackwell) has native FP8 Tensor Core support.
+    Check if FP8 (float8) support is available in PyTorch.
+    
+    Note: This only checks PyTorch API support, not hardware capability.
+    RTX 50xx (Blackwell) has native FP8 Tensor Core support, but you also
+    need a compatible PyTorch version (2.1+) with float8 types.
+    
+    Returns:
+        True if torch.float8_e4m3fn is available, False otherwise.
     """
     try:
         # Check PyTorch version supports float8
         return hasattr(torch, 'float8_e4m3fn')
-    except:
+    except Exception:
         return False
 
 
@@ -139,7 +145,7 @@ def create_optimized_dataloader(
     Create optimized DataLoader for Windows.
     
     Args:
-        dataset: Dataset to load
+        dataset: Dataset to load (must be a torch.utils.data.Dataset)
         batch_size: Batch size
         shuffle: Whether to shuffle data
         num_workers: Number of worker processes (auto-configured for Windows)
@@ -147,7 +153,17 @@ def create_optimized_dataloader(
     
     Returns:
         Optimized DataLoader
+    
+    Raises:
+        TypeError: If dataset is not a valid Dataset instance
     """
+    # Validate dataset
+    if not isinstance(dataset, torch.utils.data.Dataset):
+        raise TypeError(
+            f"dataset must be a torch.utils.data.Dataset instance, "
+            f"got {type(dataset).__name__}"
+        )
+    
     # Windows-specific worker configuration
     if num_workers is None:
         import os
@@ -169,64 +185,6 @@ def create_optimized_dataloader(
     
     logger.info(f"DataLoader config: workers={num_workers}, pin_memory={pin_memory}")
     return dataloader
-
-
-class OptimizedDiagonalGaussianDistribution:
-    """
-    Optimized reparameterization for VAE with minimal CPU-GPU sync.
-    """
-    
-    def __init__(self, mean: torch.Tensor, logvar: torch.Tensor):
-        self.mean = mean
-        # Clamp in-place to avoid extra memory allocation
-        self.logvar = torch.clamp(logvar, -30.0, 20.0)
-        
-        # Compute std and var on-demand to reduce memory
-        self._std = None
-        self._var = None
-    
-    @property
-    def std(self) -> torch.Tensor:
-        if self._std is None:
-            self._std = torch.exp(0.5 * self.logvar)
-        return self._std
-    
-    @property
-    def var(self) -> torch.Tensor:
-        if self._var is None:
-            self._var = torch.exp(self.logvar)
-        return self._var
-    
-    def mode(self) -> torch.Tensor:
-        """Return mode (mean) of the distribution."""
-        return self.mean
-    
-    def sample(self, generator: Optional[torch.Generator] = None) -> torch.Tensor:
-        """
-        Sample from the distribution with optimized GPU operations.
-        Uses fused operations to minimize CPU-GPU synchronization.
-        """
-        # Generate noise directly on the same device as mean
-        noise = torch.randn_like(self.mean, generator=generator)
-        # Fused multiply-add operation
-        return torch.addcmul(self.mean, self.std, noise)
-    
-    def kl(self) -> torch.Tensor:
-        """
-        Compute KL divergence with standard normal.
-        Optimized to use fused operations.
-        """
-        # mean^2 + var - 1 - logvar
-        # Use fused operations where possible
-        kl_div = torch.addcmul(
-            self.mean.pow(2) + self.var - 1.0,
-            torch.tensor(-1.0, device=self.mean.device),
-            self.logvar
-        )
-        return 0.5 * torch.sum(
-            kl_div,
-            dim=list(range(1, self.mean.ndim)),
-        )
 
 
 def get_optimal_num_workers_windows() -> int:
@@ -290,14 +248,22 @@ def optimize_upsample_operation(
     Returns:
         Upsampled tensor
     """
-    # Use nearest-exact for speed and determinism on Blackwell
-    return torch.nn.functional.interpolate(
-        hidden_states,
-        scale_factor=scale_factor,
-        mode=mode,
-        # Don't align corners for 'nearest' modes
-        align_corners=None if 'nearest' in mode else False,
-    )
+    # Use appropriate parameters based on mode
+    if mode in ['nearest', 'nearest-exact']:
+        # Nearest modes don't support align_corners
+        return torch.nn.functional.interpolate(
+            hidden_states,
+            scale_factor=scale_factor,
+            mode=mode,
+        )
+    else:
+        # Bilinear and other modes support align_corners
+        return torch.nn.functional.interpolate(
+            hidden_states,
+            scale_factor=scale_factor,
+            mode=mode,
+            align_corners=False,
+        )
 
 
 # Export public API
@@ -307,7 +273,6 @@ __all__ = [
     'is_fp8_available',
     'optimize_for_windows_blackwell',
     'create_optimized_dataloader',
-    'OptimizedDiagonalGaussianDistribution',
     'get_optimal_num_workers_windows',
     'configure_amp_context',
     'optimize_upsample_operation',
