@@ -86,6 +86,22 @@ def get_available_dit_models() -> List[str]:
     return model_list
 
 def get_available_vae_models() -> List[str]:
-    """Get all available VAE models from the registry"""
+    """Get all available VAE models including those discovered on disk"""
     model_list = get_default_models("vae")
+    
+    try:
+        # Get all model files from all paths
+        model_files = get_all_model_files()
+        
+        # Add files not in registry
+        discovered_models = [
+            filename for filename in model_files
+            if filename not in MODEL_REGISTRY and not filename.startswith("seedvr2_ema_")
+        ]
+        
+        # Add discovered models to the list
+        model_list.extend(sorted(discovered_models))
+    except:
+        pass
+    
     return model_list
