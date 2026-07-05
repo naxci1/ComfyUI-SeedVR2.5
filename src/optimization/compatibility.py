@@ -230,7 +230,8 @@ def _get_gpu_compute_capability():
     return (0, 0)
 
 _GPU_COMPUTE_CAP = _get_gpu_compute_capability()
-# Turing (SM75) and below: compute capability major < 8
+# Pre-Ampere GPUs (compute capability major < 8): includes Turing (SM75), Volta (SM70), Pascal (SM60), etc.
+# Flash Attention 2 requires SM80+ (Ampere); on these GPUs SA1 is preferred over FA2 when available.
 TURING_OR_OLDER_GPU = _GPU_COMPUTE_CAP[0] < 8 and _GPU_COMPUTE_CAP[0] > 0
 
 # 6. SpargeAttn / Sage2 (Block-sparse attention for Blackwell optimization)
@@ -367,12 +368,13 @@ def validate_attention_mode(requested_mode: str, debug=None) -> str:
     """
     Validate attention mode availability with automatic fallback.
     
-    Fallback chain (best to most compatible):
+    General fallback chain (highest to most compatible):
       SpargeAttn/Sage2 → SageAttention 3 → SageAttention 2 → SageAttention 1
       → Flash Attention 2 → PyTorch SDPA
     
-    On Turing (SM75) and older GPUs (compute capability < 8.0), SA2/SA3 and
-    Flash Attention 2 may not be optimal; SA1 or SDPA are preferred instead.
+    On pre-Ampere GPUs (Turing SM75, Volta SM70, Pascal SM60, compute capability < 8.0),
+    Flash Attention 2 (which requires SM80+) is skipped in automatic fallbacks and
+    SageAttention 1 is preferred when available.
     
     Args:
         requested_mode: 'sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_1',
@@ -414,12 +416,12 @@ def validate_attention_mode(requested_mode: str, debug=None) -> str:
     if requested_mode == 'flash_attn_2':
         if FLASH_ATTN_2_AVAILABLE:
             return requested_mode
-        # On Turing/older GPUs where FA2 is unavailable, prefer sageattn_1 over sdpa
+        # On pre-Ampere GPUs (SM75/Turing and older) where FA2 is unavailable, prefer sageattn_1 over sdpa
         if TURING_OR_OLDER_GPU and SAGE_ATTN_1_AVAILABLE:
             if debug:
                 debug.log(
                     "Cannot use 'flash_attn_2': Flash Attention 2 is not installed.\n"
-                    "Turing (SM75) GPU detected — falling back to SageAttention 1.",
+                    "Pre-Ampere GPU detected (SM75/Turing or older) — falling back to SageAttention 1.",
                     level="WARNING", category="setup", force=True
                 )
             return 'sageattn_1'
@@ -1407,7 +1409,7 @@ if not os.environ.get("SEEDVR2_OPTIMIZATIONS_LOGGED"):
     if sa_versions:
         print(f"   └─ SageAttention variants available: {', '.join(sa_versions)}")
     if TURING_OR_OLDER_GPU and not SAGE_ATTN_1_AVAILABLE:
-        print(f"💡 Turing (SM75) GPU detected — install SageAttention for acceleration: pip install sageattention")
+        print(f"💡 Pre-Ampere GPU detected (SM{_GPU_COMPUTE_CAP[0]}{_GPU_COMPUTE_CAP[1]}, e.g. Turing/Volta/Pascal) — install SageAttention for acceleration: pip install sageattention")
     
     # SpargeAttn/Sage2 status (Blackwell block-sparse optimization)
     if SPARGE_SAGE2_AVAILABLE:
