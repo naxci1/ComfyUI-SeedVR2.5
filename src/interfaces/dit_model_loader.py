@@ -102,7 +102,7 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
                     )
                 ),
                 io.Combo.Input("attention_mode",
-                    options=["sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3", "sparge_sage2"],
+                    options=["sdpa", "flash_attn_2", "flash_attn_3", "sageattn_1", "sageattn_2", "sageattn_3", "sparge_sage2"],
                     default="sdpa",
                     optional=True,
                     tooltip=(
@@ -110,13 +110,15 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
                         "• sdpa: PyTorch scaled_dot_product_attention (default, stable, always available)\n"
                         "• flash_attn_2: Flash Attention 2 (Ampere+, requires flash-attn package)\n"
                         "• flash_attn_3: Flash Attention 3 (Hopper+, requires flash-attn with FA3 support)\n"
+                        "• sageattn_1: SageAttention 1 (Turing/SM75+, recommended for RTX 20xx / GTX 16xx)\n"
                         "• sageattn_2: SageAttention 2 (requires sageattention package)\n"
                         "• sageattn_3: SageAttention 3 (Blackwell/RTX 50xx only, requires sageattn3 package)\n"
                         "• sparge_sage2: SpargeAttn/Sage2 block-sparse attention (Blackwell optimized, Triton JIT)\n"
                         "\n"
                         "SDPA is recommended - stable and works everywhere.\n"
                         "Flash Attention and SageAttention provide speedup through optimized CUDA kernels on compatible GPUs.\n"
-                        "SpargeAttn provides block-sparse attention with configurable sparsity for Blackwell GPUs."
+                        "SpargeAttn provides block-sparse attention with configurable sparsity for Blackwell GPUs.\n"
+                        "For RTX 20xx / GTX 16xx (Turing) GPUs, sageattn_1 is the recommended accelerated backend."
                     )
                 ),
                 io.Combo.Input("performance_mode",
@@ -197,7 +199,7 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
             cache_model: Whether to keep model loaded between runs
             blocks_to_swap: Number of transformer blocks to swap (requires offload_device != device)
             swap_io_components: Whether to offload I/O components (requires offload_device != device)
-            attention_mode: Attention computation backend ('sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3')
+            attention_mode: Attention computation backend ('sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_1', 'sageattn_2', or 'sageattn_3')
             performance_mode: Performance tuning for sparge_sage2 ('Fast', 'Balanced', 'High Quality')
             torch_compile_args: Optional torch.compile configuration from settings node
             enable_nvfp4: Enable NVFP4 quantization for Blackwell GPUs (default: True)

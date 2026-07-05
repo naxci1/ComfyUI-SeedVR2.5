@@ -22,7 +22,7 @@ logger = logging.getLogger("SeedVR2.Attention")
 # Import flash/sage attn with automatic fallback from compatibility layer
 from ...optimization.compatibility import (
     call_flash_attn_2_varlen, call_flash_attn_3_varlen,
-    call_sage_attn_2_varlen, call_sage_attn_3_varlen,
+    call_sage_attn_1_varlen, call_sage_attn_2_varlen, call_sage_attn_3_varlen,
     call_sparge_sage2_varlen
 )
 
@@ -90,6 +90,7 @@ class FlashAttentionVarlen(nn.Module):
     - sdpa: PyTorch SDPA (fully compilable, always available)
     - flash_attn_2: Flash Attention 2 (Ampere+)
     - flash_attn_3: Flash Attention 3 (Hopper+)
+    - sageattn_1: SageAttention 1 (Turing/SM75+, recommended for RTX 20xx / GTX 16xx)
     - sageattn_2: SageAttention 2
     - sageattn_3: SageAttention 3 (Blackwell/RTX 50xx)
     - sparge_sage2: SpargeAttn/Sage2 block-sparse attention (Blackwell optimized)
@@ -103,7 +104,8 @@ class FlashAttentionVarlen(nn.Module):
         Initialize with specified attention backend.
         
         Args:
-            attention_mode: 'sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', 'sageattn_3', or 'sparge_sage2'
+            attention_mode: 'sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_1',
+                            'sageattn_2', 'sageattn_3', or 'sparge_sage2'
             compute_dtype: Compute dtype for attention (set by pipeline, defaults to None for auto-detection)
             sparsity_threshold: Sparsity threshold for sparge_sage2 mode (0.0-1.0, default 0.5)
                                Maps to performance modes: Fast=0.3, Balanced=0.5, High Quality=0.7
@@ -142,6 +144,11 @@ class FlashAttentionVarlen(nn.Module):
             )
         elif self.attention_mode == 'sageattn_3':
             return call_sage_attn_3_varlen(
+                q, k, v, cu_seqlens_q, cu_seqlens_k,
+                max_seqlen_q, max_seqlen_k, **kwargs
+            )
+        elif self.attention_mode == 'sageattn_1':
+            return call_sage_attn_1_varlen(
                 q, k, v, cu_seqlens_q, cu_seqlens_k,
                 max_seqlen_q, max_seqlen_k, **kwargs
             )

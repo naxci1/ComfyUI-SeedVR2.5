@@ -182,7 +182,17 @@ except (ImportError, AttributeError, OSError):
 
 FLASH_ATTN_AVAILABLE = FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE
 
-# 3. SageAttention 2 (varlen support)
+# 3. SageAttention 1 (Turing/SM75+, batched attention only - no native varlen)
+sageattn_func = None
+SAGE_ATTN_1_AVAILABLE = False
+try:
+    from sageattention import sageattn as _sa1_func
+    sageattn_func = _sa1_func
+    SAGE_ATTN_1_AVAILABLE = True
+except (ImportError, AttributeError, OSError):
+    pass
+
+# 4. SageAttention 2 (varlen support)
 sageattn_varlen = None
 SAGE_ATTN_2_AVAILABLE = False
 try:
@@ -192,7 +202,7 @@ try:
 except (ImportError, AttributeError, OSError):
     pass
 
-# 4. SageAttention 3 / Blackwell (RTX 50xx only, batched attention)
+# 5. SageAttention 3 / Blackwell (RTX 50xx only, batched attention)
 sageattn_blackwell = None
 SAGE_ATTN_3_AVAILABLE = False
 try:
@@ -207,9 +217,23 @@ except (ImportError, AttributeError, OSError):
     except (ImportError, AttributeError, OSError):
         pass
 
-SAGE_ATTN_AVAILABLE = SAGE_ATTN_2_AVAILABLE or SAGE_ATTN_3_AVAILABLE
+SAGE_ATTN_AVAILABLE = SAGE_ATTN_1_AVAILABLE or SAGE_ATTN_2_AVAILABLE or SAGE_ATTN_3_AVAILABLE
 
-# 5. SpargeAttn / Sage2 (Block-sparse attention for Blackwell optimization)
+# GPU architecture detection helper
+def _get_gpu_compute_capability():
+    """Return (major, minor) compute capability of the first CUDA device, or (0, 0) if unavailable."""
+    try:
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_capability(0)
+    except Exception:
+        pass
+    return (0, 0)
+
+_GPU_COMPUTE_CAP = _get_gpu_compute_capability()
+# Turing (SM75) and below: compute capability major < 8
+TURING_OR_OLDER_GPU = _GPU_COMPUTE_CAP[0] < 8 and _GPU_COMPUTE_CAP[0] > 0
+
+# 6. SpargeAttn / Sage2 (Block-sparse attention for Blackwell optimization)
 # Provides spas_sage2_attn_meansim_topk_cuda for plug-and-play SDPA replacement
 # and block_sparse_sage2_attn_cuda for custom block-sparse patterns
 # Uses local vendored implementation with Triton JIT compilation (no global install required)
@@ -343,8 +367,16 @@ def validate_attention_mode(requested_mode: str, debug=None) -> str:
     """
     Validate attention mode availability with automatic fallback.
     
+    Fallback chain (best to most compatible):
+      SpargeAttn/Sage2 → SageAttention 3 → SageAttention 2 → SageAttention 1
+      → Flash Attention 2 → PyTorch SDPA
+    
+    On Turing (SM75) and older GPUs (compute capability < 8.0), SA2/SA3 and
+    Flash Attention 2 may not be optimal; SA1 or SDPA are preferred instead.
+    
     Args:
-        requested_mode: 'sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', 'sageattn_3', or 'sparge_sage2'
+        requested_mode: 'sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_1',
+                        'sageattn_2', 'sageattn_3', or 'sparge_sage2'
         debug: Optional debug instance for logging
         
     Returns:
@@ -382,6 +414,15 @@ def validate_attention_mode(requested_mode: str, debug=None) -> str:
     if requested_mode == 'flash_attn_2':
         if FLASH_ATTN_2_AVAILABLE:
             return requested_mode
+        # On Turing/older GPUs where FA2 is unavailable, prefer sageattn_1 over sdpa
+        if TURING_OR_OLDER_GPU and SAGE_ATTN_1_AVAILABLE:
+            if debug:
+                debug.log(
+                    "Cannot use 'flash_attn_2': Flash Attention 2 is not installed.\n"
+                    "Turing (SM75) GPU detected — falling back to SageAttention 1.",
+                    level="WARNING", category="setup", force=True
+                )
+            return 'sageattn_1'
         error_msg = (
             "Cannot use 'flash_attn_2' attention mode: Flash Attention 2 is not installed.\n"
             "\n"
@@ -410,6 +451,21 @@ def validate_attention_mode(requested_mode: str, debug=None) -> str:
                     level="WARNING", category="setup", force=True
                 )
             return 'sageattn_2'
+        if SAGE_ATTN_1_AVAILABLE:
+            if debug:
+                debug.log(
+                    "SageAttention 3 (Blackwell) not available and SageAttention 2 not found.\n"
+                    "Falling back to SageAttention 1.",
+                    level="WARNING", category="setup", force=True
+                )
+            return 'sageattn_1'
+        if FLASH_ATTN_2_AVAILABLE and not TURING_OR_OLDER_GPU:
+            if debug:
+                debug.log(
+                    "SageAttention not available. Falling back to Flash Attention 2.",
+                    level="WARNING", category="setup", force=True
+                )
+            return 'flash_attn_2'
         error_msg = (
             "Cannot use 'sageattn_3' attention mode: SageAttention is not installed.\n"
             "\n"
@@ -431,6 +487,20 @@ def validate_attention_mode(requested_mode: str, debug=None) -> str:
     if requested_mode == 'sageattn_2':
         if SAGE_ATTN_2_AVAILABLE:
             return requested_mode
+        if SAGE_ATTN_1_AVAILABLE:
+            if debug:
+                debug.log(
+                    "SageAttention 2 not available. Falling back to SageAttention 1.",
+                    level="WARNING", category="setup", force=True
+                )
+            return 'sageattn_1'
+        if FLASH_ATTN_2_AVAILABLE and not TURING_OR_OLDER_GPU:
+            if debug:
+                debug.log(
+                    "SageAttention not available. Falling back to Flash Attention 2.",
+                    level="WARNING", category="setup", force=True
+                )
+            return 'flash_attn_2'
         error_msg = (
             "Cannot use 'sageattn_2' attention mode: SageAttention is not installed.\n"
             "\n"
@@ -447,11 +517,32 @@ def validate_attention_mode(requested_mode: str, debug=None) -> str:
             debug.log(error_msg, level="WARNING", category="setup", force=True)
         return 'sdpa'
     
+    # SageAttention 1 (Turing/SM75+)
+    if requested_mode == 'sageattn_1':
+        if SAGE_ATTN_1_AVAILABLE:
+            return requested_mode
+        error_msg = (
+            "Cannot use 'sageattn_1' attention mode: SageAttention is not installed.\n"
+            "\n"
+            "SageAttention 1 provides quantized attention acceleration on Turing (SM75) and newer GPUs.\n"
+            "It is the recommended quantized attention backend for RTX 20xx / GTX 16xx GPUs.\n"
+            "Falling back to PyTorch SDPA (scaled dot-product attention).\n"
+            "\n"
+            "To fix this issue:\n"
+            "  1. Install SageAttention: pip install sageattention\n"
+            "  2. OR change attention_mode to 'sdpa' (default, always available)\n"
+            "\n"
+            "For more info: https://github.com/thu-ml/SageAttention"
+        )
+        if debug:
+            debug.log(error_msg, level="WARNING", category="setup", force=True)
+        return 'sdpa'
+    
     # SpargeAttn / Sage2 (Block-sparse attention for Blackwell)
     if requested_mode == 'sparge_sage2':
         if SPARGE_SAGE2_AVAILABLE:
             return requested_mode
-        # Fallback chain: sageattn_3 -> sageattn_2 -> sdpa
+        # Fallback chain: sageattn_3 -> sageattn_2 -> sageattn_1 -> sdpa
         if SAGE_ATTN_3_AVAILABLE:
             if debug:
                 debug.log(
@@ -468,6 +559,14 @@ def validate_attention_mode(requested_mode: str, debug=None) -> str:
                     level="WARNING", category="setup", force=True
                 )
             return 'sageattn_2'
+        if SAGE_ATTN_1_AVAILABLE:
+            if debug:
+                debug.log(
+                    "SpargeAttn/Sage2 not available and SA2/SA3 not found.\n"
+                    "Falling back to SageAttention 1.",
+                    level="WARNING", category="setup", force=True
+                )
+            return 'sageattn_1'
         error_msg = (
             "Cannot use 'sparge_sage2' attention mode: SpargeAttn is not installed.\n"
             "\n"
@@ -647,6 +746,113 @@ def call_sage_attn_2_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
         max_seqlen_q, max_seqlen_k,
         is_causal, sm_scale
     )
+    
+    return out.to(out_dtype) if out.dtype != out_dtype else out
+
+
+@torch._dynamo.disable
+def call_sage_attn_1_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs):
+    """
+    Wrapper for SageAttention 1 that converts varlen format to batched/sequential format.
+    
+    SageAttention 1 provides quantized attention acceleration on Turing (SM75) and newer GPUs.
+    It targets RTX 20xx / GTX 16xx users who lack Flash Attention 2 support.
+    SageAttention 1 uses a batched API (no native varlen), so this wrapper handles the
+    conversion: for uniform-length batches it reshapes to (batch, heads, seq, dim); for
+    variable-length batches it processes each sequence individually.
+    
+    This function is excluded from torch.compile because:
+    1. SageAttention is a C++ extension that can't be compiled anyway
+    2. The varlen-to-batched conversion involves dynamic shapes
+    3. Disabling compilation here keeps the rest of the model compilable
+    
+    Args:
+        q: Query tensor (total_seq, heads, head_dim)
+        k: Key tensor (total_seq, heads, head_dim)
+        v: Value tensor (total_seq, heads, head_dim)
+        cu_seqlens_q: Cumulative sequence lengths for queries
+        cu_seqlens_k: Cumulative sequence lengths for keys
+        max_seqlen_q: Maximum query sequence length (can be tensor or int)
+        max_seqlen_k: Maximum key sequence length (can be tensor or int)
+        **kwargs: Additional arguments (causal supported)
+        
+    Returns:
+        Attention output tensor (total_seq, heads, head_dim)
+    """
+    if not SAGE_ATTN_1_AVAILABLE:
+        raise ImportError("SageAttention 1 is not available")
+    
+    # Convert tensor max_seqlen to Python int if needed
+    if torch.is_tensor(max_seqlen_q):
+        max_seqlen_q = int(max_seqlen_q.item())
+    if torch.is_tensor(max_seqlen_k):
+        max_seqlen_k = int(max_seqlen_k.item())
+    
+    # SageAttention requires half precision (fp16/bf16)
+    out_dtype = q.dtype
+    half_dtypes = (torch.float16, torch.bfloat16)
+    
+    if not (q.dtype == k.dtype == v.dtype):
+        k = k.to(q.dtype)
+        v = v.to(q.dtype)
+    
+    if q.dtype not in half_dtypes:
+        q = q.to(torch.bfloat16)
+        k = k.to(torch.bfloat16)
+        v = v.to(torch.bfloat16)
+    
+    is_causal = kwargs.get('causal', False)
+    sm_scale = 1.0 / (q.shape[-1] ** 0.5)
+    
+    # Check if all sequences have uniform length (preferred path for SA1 batched API)
+    seq_lens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+    seq_lens_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+    uniform_q = (seq_lens_q == seq_lens_q[0]).all()
+    uniform_k = (seq_lens_k == seq_lens_k[0]).all()
+    
+    heads = q.shape[1]
+    dim = q.shape[2]
+    
+    if uniform_q and uniform_k:
+        # Batched path: reshape (total_seq, heads, dim) -> (batch, heads, seq, dim)
+        batch_size = len(cu_seqlens_q) - 1
+        seq_len_q = int(seq_lens_q[0].item())
+        seq_len_k = int(seq_lens_k[0].item())
+        
+        q_batched = q.view(batch_size, seq_len_q, heads, dim).transpose(1, 2)  # (B, H, S, D)
+        k_batched = k.view(batch_size, seq_len_k, heads, dim).transpose(1, 2)
+        v_batched = v.view(batch_size, seq_len_k, heads, dim).transpose(1, 2)
+        
+        out = sageattn_func(q_batched, k_batched, v_batched, is_causal=is_causal, sm_scale=sm_scale)
+        
+        # Reshape back to varlen format (total_seq, heads, dim)
+        out = out.transpose(1, 2).reshape(-1, heads, dim).contiguous()
+    else:
+        # Variable-length path: process each sequence individually
+        batch_size = len(cu_seqlens_q) - 1
+        outputs = []
+        for i in range(batch_size):
+            start_q = int(cu_seqlens_q[i].item())
+            end_q = int(cu_seqlens_q[i + 1].item())
+            start_k = int(cu_seqlens_k[i].item())
+            end_k = int(cu_seqlens_k[i + 1].item())
+            
+            qi = q[start_q:end_q]  # (seq_q, heads, dim)
+            ki = k[start_k:end_k]
+            vi = v[start_k:end_k]
+            
+            # SA1 expects (batch=1, heads, seq, dim)
+            qi = qi.transpose(0, 1).unsqueeze(0)  # (1, H, S, D)
+            ki = ki.transpose(0, 1).unsqueeze(0)
+            vi = vi.transpose(0, 1).unsqueeze(0)
+            
+            oi = sageattn_func(qi, ki, vi, is_causal=is_causal, sm_scale=sm_scale)
+            
+            # Back to (seq, heads, dim)
+            oi = oi.squeeze(0).transpose(0, 1)
+            outputs.append(oi)
+        
+        out = torch.cat(outputs, dim=0)
     
     return out.to(out_dtype) if out.dtype != out_dtype else out
 
@@ -1189,6 +1395,19 @@ if not os.environ.get("SEEDVR2_OPTIMIZATIONS_LOGGED"):
             missing.append("triton")
         if missing:
             print(f"💡 Optional: pip install {' '.join(missing)}")
+    
+    # SageAttention version breakdown (SA1/SA2/SA3)
+    sa_versions = []
+    if SAGE_ATTN_1_AVAILABLE:
+        sa_versions.append("SA1")
+    if SAGE_ATTN_2_AVAILABLE:
+        sa_versions.append("SA2")
+    if SAGE_ATTN_3_AVAILABLE:
+        sa_versions.append("SA3")
+    if sa_versions:
+        print(f"   └─ SageAttention variants available: {', '.join(sa_versions)}")
+    if TURING_OR_OLDER_GPU and not SAGE_ATTN_1_AVAILABLE:
+        print(f"💡 Turing (SM75) GPU detected — install SageAttention for acceleration: pip install sageattention")
     
     # SpargeAttn/Sage2 status (Blackwell block-sparse optimization)
     if SPARGE_SAGE2_AVAILABLE:
